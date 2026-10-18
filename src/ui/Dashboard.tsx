@@ -26,11 +26,11 @@ const LEGEND: Record<string, string> = {
   cleanup: 'Audio after noise/echo cleanup: what VAD and ASR hear. Small ticks under it: AEC double talk or the RNNoise gate closing. Hover for levels.',
   vad: 'Speech probability per frame (line) against the start and stop thresholds (dashed). Shaded: detected speech.',
   asr:
-    'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: grey ticks are partial results arriving, purple ticks are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
+    'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
   turn: 'Floor state: thinking (amber) and speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.',
-  llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT, chunks and chars/s. Bottom: each streamed chunk at the moment it arrived.',
-  tts: 'One bar per sentence, from its request until its audio finished arriving. Ticks at the bottom: requests sent.',
-  speaker: 'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Ticks at the top: sentence starts; at the bottom: word boundaries.',
+  llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT, chunks and chars/s. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
+  tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
+  speaker: 'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries.',
 };
 
 const AXIS = 20;
@@ -298,6 +298,23 @@ export function Dashboard({
       g.lineTo(px, ly0 + (ly1 - ly0) * to);
       g.stroke();
     };
+    /** A point-in-time marker: dots for things arriving, diamonds for things sent or starting. */
+    const mark = (lane: string, t: number, color: string, at: number, shape: 'dot' | 'diamond', r = 3) => {
+      const [ly0, ly1] = laneY[lane];
+      const px = x(t);
+      const py = ly0 + (ly1 - ly0) * at;
+      g.fillStyle = color;
+      g.beginPath();
+      if (shape === 'dot') g.arc(px, py, r, 0, Math.PI * 2);
+      else {
+        g.moveTo(px, py - r - 0.5);
+        g.lineTo(px + r + 0.5, py);
+        g.lineTo(px, py + r + 0.5);
+        g.lineTo(px - r - 0.5, py);
+        g.closePath();
+      }
+      g.fill();
+    };
     const head = Math.max(m?.duration ?? 0, running && now ? now() : 0);
     /** Attach the events (and user audio) behind the item just added to `hits`. */
     const tag = (seqs: number[], audio?: [number, number]) => {
@@ -438,7 +455,7 @@ export function Dashboard({
       }
       for (const a of m.asrArrivals) {
         if (a.t < t0 || a.t > t1) continue;
-        vline('asr', a.t, a.final ? col.asr : col.muted, a.final ? 0.68 : 0.74, 0.96);
+        mark('asr', a.t, a.final ? col.asr : col.muted, 0.82, 'dot', a.final ? 3.5 : 2.5);
         const [ly0, ly1] = laneY.asr;
         hits.push({
           lane: 'asr',
@@ -487,7 +504,7 @@ export function Dashboard({
           const cx = x(c.t);
           const nx = i + 1 < l.chunks.length ? x(l.chunks[i + 1].t) : x(end) + 200;
           if (nx < LABEL_W || cx > W) return;
-          vline('llm', c.t, col.llm, 0.46, 0.56);
+          mark('llm', c.t, col.llm, 0.5, 'dot', 2.5);
           if (nx - cx > 8) {
             g.save();
             g.beginPath();
@@ -504,7 +521,7 @@ export function Dashboard({
       // TTS: request sent, then audio streaming per sentence
       for (const r of m.ttsRequests) {
         if (r.t < t0 || r.t > t1) continue;
-        vline('tts', r.t, col.muted, 0.75, 1);
+        mark('tts', r.t, col.muted, 0.86, 'diamond');
         const [ly0, ly1] = laneY.tts;
         hits.push({ lane: 'tts', x0: x(r.t) - 3, x1: x(r.t) + 3, y0: ly0 + (ly1 - ly0) * 0.72, y1: ly1, text: 'request sent to the TTS provider', seqs: [r.seq] });
       }
@@ -542,10 +559,10 @@ export function Dashboard({
       }
       for (const s of m.playbackSegments) {
         if (s.t < t0 || s.t > t1) continue;
-        vline('speaker', s.t, col.text, 0, 0.3);
+        mark('speaker', s.t, col.text, 0.14, 'diamond');
         hits.push({ lane: 'speaker', x0: x(s.t) - 3, x1: x(s.t) + 60, text: s.text, seqs: [s.seq] });
       }
-      for (const b of m.boundaries) if (b >= t0 && b <= t1) vline('speaker', b, col.sink, 0.7, 1);
+      for (const b of m.boundaries) if (b >= t0 && b <= t1) mark('speaker', b, col.sink, 0.88, 'dot', 2);
 
       for (const err of m.errors) {
         const lane = laneY[err.node] ? err.node : 'mic';
