@@ -137,6 +137,8 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 .event-log-body { flex: 1; overflow: auto; font: 11.5px/1.5 var(--mono); }
 .ev { display: grid; grid-template-columns: 70px 60px 70px 150px 1fr; gap: 8px; padding: 0 10px; white-space: nowrap; cursor: pointer; }
 .ev:hover, .ev.sel { background: var(--bg); }
+.ev.focus { box-shadow: inset 3px 0 0 var(--accent); }
+.ev.sel { outline: 1px solid var(--accent); outline-offset: -1px; }
 .ev .t { text-align: right; color: var(--muted); }
 .ev .seq { color: var(--muted); }
 .ev .data { overflow: hidden; text-overflow: ellipsis; }

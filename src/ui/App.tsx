@@ -99,6 +99,8 @@ export function App() {
   const [layout, setLayout] = useLayout();
   const [activity, setActivity] = useState<Activity>(NO_ACTIVITY);
   const [paused, setPaused] = useState(false);
+  /** Events of the timeline item last clicked, to show in the event log. */
+  const [focus, setFocus] = useState<{ seqs: number[]; n: number } | null>(null);
   const stopActivity = useRef<() => void>(() => {});
   const runtimeRef = useRef<Runtime | null>(null);
   const schedRef = useRef<Scheduler | null>(null);
@@ -388,9 +390,9 @@ export function App() {
   const missingKeys = health ? requiredUpstreams(config).filter((k) => !health[k]) : [];
   // The Playback lane belongs to the TTS stage when the browser speaks for itself.
   /** Selecting a stage shows its settings, so it opens a collapsed side panel. */
-  const selectStage = (id: StageId | null) => {
+  const selectStage = (id: StageId | null, reveal = true) => {
     setSelected(id);
-    if (id && !layout.sideOpen) setLayout({ ...layout, sideOpen: true });
+    if (reveal && id && !layout.sideOpen) setLayout({ ...layout, sideOpen: true });
   };
   const stageOf = (lane: string | null): StageId | null =>
     lane === null ? null : activeStages(config).some((s) => s.id === lane) ? (lane as StageId) : 'tts';
@@ -455,8 +457,9 @@ export function App() {
           running={!!running}
           now={() => schedRef.current?.now() ?? 0}
           selected={selected}
-          onSelect={(lane) => selectStage(stageOf(lane))}
+          onSelect={(lane, item) => selectStage(stageOf(lane), !item)}
           transport={transport}
+          onFocusEvents={(seqs) => setFocus((f) => ({ seqs, n: (f?.n ?? 0) + 1 }))}
         />
       </section>
 
@@ -552,7 +555,7 @@ export function App() {
 
       <section className="log">
         {layout.logOpen && <Splitter layout={layout} onChange={setLayout} field="log" axis="y" sign={-1} max={() => window.innerHeight - 260} />}
-        <EventLog trajectory={current?.traj} live={!!running} open={layout.logOpen} onToggle={() => setLayout({ ...layout, logOpen: !layout.logOpen })} />
+        <EventLog trajectory={current?.traj} live={!!running} focus={focus} open={layout.logOpen} onToggle={() => setLayout({ ...layout, logOpen: !layout.logOpen })} />
       </section>
     </div>
   );

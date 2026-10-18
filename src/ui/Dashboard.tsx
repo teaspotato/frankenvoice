@@ -109,6 +109,7 @@ export function Dashboard({
   now,
   selected,
   onSelect,
+  onFocusEvents,
   transport,
 }: {
   trajectory?: Trajectory;
@@ -116,7 +117,10 @@ export function Dashboard({
   /** Current session time while running (between events). */
   now?: () => number;
   selected: string | null;
-  onSelect(lane: string | null): void;
+  /** A lane was clicked; `item` when the click was on one of its items rather than empty space. */
+  onSelect(lane: string | null, item?: boolean): void;
+  /** An item was clicked: the events behind it. */
+  onFocusEvents(seqs: number[]): void;
   /** Play/pause/stop for the shown session. */
   transport: ReactNode;
 }) {
@@ -716,10 +720,19 @@ export function Dashboard({
     drag.current = null;
     if (moved) return;
     const rect = canvasRef.current!.getBoundingClientRect();
+    const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
     let y = AXIS;
     for (const l of LANES) {
-      if (py >= y && py < y + l.height) return onSelect(l.id === selected ? null : l.id);
+      if (py >= y && py < y + l.height) {
+        // An item: select its stage and show its events. Empty lane space toggles the stage.
+        const h = px > LABEL_W ? hitAt(hitsRef.current, l.id, px, py) : undefined;
+        if (h?.seqs?.length) {
+          onFocusEvents(h.seqs);
+          return onSelect(l.id, true);
+        }
+        return onSelect(l.id === selected ? null : l.id);
+      }
       y += l.height;
     }
   };

@@ -29,9 +29,12 @@ export function EventLog({
   live,
   open,
   onToggle,
+  focus,
 }: {
   trajectory?: Trajectory;
   live: boolean;
+  /** Events of a clicked timeline item: scroll to and select the first, mark the rest. `n` changes on every click. */
+  focus?: { seqs: number[]; n: number } | null;
   /** Collapsed, only the header bar shows and live updates are skipped. */
   open: boolean;
   onToggle(): void;
@@ -43,6 +46,22 @@ export function EventLog({
   const [selected, setSelected] = useState<TrajEvent | null>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  const scrollTo = useRef<number | null>(null);
+  const focusSet = useMemo(() => new Set(focus?.seqs ?? []), [focus]);
+
+  // Jump to a clicked timeline item's events, clearing filters that would hide them.
+  useEffect(() => {
+    if (!focus || !open || !trajectory) return;
+    const first = trajectory.events.find((e) => e.seq === focus.seqs[0]);
+    if (!first) return;
+    setNode('');
+    setFilter('');
+    if (NOISY(first)) setHideNoisy(false);
+    setSelected(first);
+    stick.current = false;
+    scrollTo.current = first.seq;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus?.n]);
 
   useEffect(() => {
     if (!trajectory || !live || !open) return;
@@ -63,10 +82,19 @@ export function EventLog({
     : events.filter(
         (e) => (!hideNoisy || !NOISY(e)) && (!node || e.node === node) && (!filter || `${e.kind} ${e.port ?? ''} ${JSON.stringify(e.data)}`.includes(filter)),
       );
-  const visible = shown.slice(-600);
+  // The newest 600 rows, or 600 around the selected event when it is older.
+  const selIdx = selected ? shown.indexOf(selected) : -1;
+  const visible = selIdx >= 0 && selIdx < shown.length - 600 ? shown.slice(Math.max(0, selIdx - 300), selIdx + 300) : shown.slice(-600);
 
   useEffect(() => {
-    if (stick.current && bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+    if (scrollTo.current !== null && bodyRef.current) {
+      // The row may only appear on the next render, once cleared filters apply.
+      const row = bodyRef.current.querySelector(`[data-seq="${scrollTo.current}"]`);
+      if (row) {
+        row.scrollIntoView({ block: 'center' });
+        scrollTo.current = null;
+      }
+    } else if (stick.current && bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
   });
 
   return (
@@ -102,7 +130,12 @@ export function EventLog({
           }}
         >
           {visible.map((e) => (
-            <div key={e.seq} className={`ev k-${e.kind.replace('.', '-')}${selected?.seq === e.seq ? ' sel' : ''}`} onClick={() => setSelected(e)}>
+            <div
+              key={e.seq}
+              data-seq={e.seq}
+              className={`ev k-${e.kind.replace('.', '-')}${selected?.seq === e.seq ? ' sel' : ''}${focusSet.has(e.seq) ? ' focus' : ''}`}
+              onClick={() => setSelected(e)}
+            >
               <span className="t">{e.t.toFixed(1)}</span>
               <span className="seq">#{e.seq}</span>
               <span className="node">{e.node}</span>
