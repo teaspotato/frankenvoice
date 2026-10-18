@@ -60,6 +60,9 @@ input, select, textarea { background: var(--bg); border: 1px solid var(--border)
 .inspector h3 { margin: 4px 0 8px; font-size: 13px; }
 .inspector { grid-area: inspector; overflow: auto; padding: 10px; border-left: 1px solid var(--border); background: var(--panel); }
 .inspector h3 small { color: var(--muted); font-weight: 400; font-family: var(--mono); }
+fieldset.params { border: 0; margin: 0; padding: 0; min-width: 0; }
+fieldset.params:disabled { opacity: 0.55; }
+.locked-note { color: var(--warn, #b7791f); font-size: 12px; margin: 0 0 8px; }
 .param { display: grid; grid-template-columns: 1fr; gap: 2px; margin-bottom: 8px; }
 .param span { color: var(--muted); font-size: 12px; }
 .param input[type='checkbox'] { justify-self: start; }

@@ -233,6 +233,7 @@ export function App() {
   const importFile = async (f: File) => {
     try {
       if (f.name.endsWith('.json')) {
+        if (running) throw new Error('Stop the run before loading a config: stage settings are locked while it runs.');
         const j = JSON.parse(await f.text()) as { format?: string };
         if (j.format === CONFIG_FORMAT) setConfig(normalizeConfig((j as { stages: PipelineConfig }).stages));
         else if (j.format === GRAPH_FORMAT) setConfig(configFromGraph(j as GraphSpec));
@@ -280,7 +281,7 @@ export function App() {
         <button disabled={!!running || !current} onClick={newSession} title="Clear the dashboard; past sessions stay in the list">
           New session
         </button>
-        <button onClick={() => confirm('Reset every stage to its default settings?') && setConfig(defaultConfig())}>Reset config</button>
+        <button disabled={!!running} onClick={() => confirm('Reset every stage to its default settings?') && setConfig(defaultConfig())}>Reset config</button>
         <span className="spacer" />
         {health === null ? (
           <span className="warn">proxy not reachable: run `pnpm dev`</span>

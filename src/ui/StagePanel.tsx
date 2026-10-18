@@ -39,7 +39,8 @@ export function StagePanel({
         {def.label} <small>{node.type}</small>
       </h3>
       <p className="muted">{node.description}</p>
-      {disabled && <p className="muted">Changes apply to the next run.</p>}
+      {disabled && <p className="locked-note">Locked while running. Stop to change settings.</p>}
+      <fieldset className="params" disabled={disabled}>
       {variants.length > 1 && (
         <label className="param">
           <span>Implementation</span>
@@ -81,6 +82,7 @@ export function StagePanel({
             </label>
           );
         })}
+      </fieldset>
       {def.managed && <p className="muted">Browser echo cancellation, noise suppression and gain are set by the Noise / echo stage.</p>}
       {state && (
         <>
