@@ -9,7 +9,7 @@ import { decodeBundle, encodeBundle } from '../core/bundle';
 import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
 import type { Json } from '../core/types';
-import { browserDrivers } from '../drivers';
+import { browserDrivers, setOutputPaused } from '../drivers';
 import {
   CONFIG_FORMAT,
   activeStages,
@@ -98,6 +98,7 @@ export function App() {
   const autosaveRef = useRef(autosave);
   const [layout, setLayout] = useLayout();
   const [activity, setActivity] = useState<Activity>(NO_ACTIVITY);
+  const [paused, setPaused] = useState(false);
   const stopActivity = useRef<() => void>(() => {});
   const runtimeRef = useRef<Runtime | null>(null);
   const schedRef = useRef<Scheduler | null>(null);
@@ -169,6 +170,7 @@ export function App() {
     setCurrent(s);
     setRunning(null);
     stopActivity.current();
+    setPaused(false);
     if (rt.trajectory.meta.mode === 'live' && autosaveRef.current) await saveSession(s);
   };
 
@@ -205,6 +207,8 @@ export function App() {
   const stop = () => {
     if (running === 'replay') {
       simRef.current?.stop();
+      setOutputPaused(false);
+      setPaused(false);
       return;
     }
     const rt = runtimeRef.current;
@@ -236,6 +240,50 @@ export function App() {
     if (rt.isRunning) rt.stop();
     await finishSession(rt, source, stoppedAt);
   };
+
+  /** Pause or resume a realtime replay: the session clock and the audio already scheduled both freeze. */
+  const togglePause = () => {
+    const sim = simRef.current;
+    if (running !== 'replay' || !sim) return;
+    if (sim.isPaused) sim.resume();
+    else sim.pause();
+    setOutputPaused(sim.isPaused);
+    setPaused(sim.isPaused);
+  };
+
+  const transport = (
+    <span className="transport">
+      {running === 'replay' ? (
+        <button onClick={togglePause} disabled={!replayOpts.realtime} title={paused ? 'Resume (space)' : 'Pause (space)'}>
+          {paused ? '▶' : '❚❚'}
+        </button>
+      ) : (
+        <button
+          onClick={() => current && replay(current.traj)}
+          disabled={!!running || !current}
+          title={running === 'live' ? "A live session can't be paused" : 'Replay this session (space)'}
+        >
+          ▶
+        </button>
+      )}
+      <button onClick={stop} disabled={!running} title="Stop">
+        ■
+      </button>
+    </span>
+  );
+
+  // Space plays, pauses or resumes, unless typing somewhere.
+  const spaceRef = useRef(() => {});
+  spaceRef.current = () => (running === 'replay' ? togglePause() : !running && current && replay(current.traj));
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || (e.target as HTMLElement).closest('input, textarea, select, button, [contenteditable]')) return;
+      e.preventDefault();
+      spaceRef.current();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   /** Clear the dashboard and stage states for a fresh start; past sessions stay in the list. */
   const newSession = () => {
@@ -408,6 +456,7 @@ export function App() {
           now={() => schedRef.current?.now() ?? 0}
           selected={selected}
           onSelect={(lane) => selectStage(stageOf(lane))}
+          transport={transport}
         />
       </section>
 

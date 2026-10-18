@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Trajectory } from '../core/trajectory';
 import { TimelineModel } from './timeline';
 
@@ -66,6 +66,7 @@ export function Dashboard({
   now,
   selected,
   onSelect,
+  transport,
 }: {
   trajectory?: Trajectory;
   running: boolean;
@@ -73,6 +74,8 @@ export function Dashboard({
   now?: () => number;
   selected: string | null;
   onSelect(lane: string | null): void;
+  /** Play/pause/stop for the shown session. */
+  transport: ReactNode;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -487,8 +490,12 @@ export function Dashboard({
       g.lineTo(hover.x + 0.5, H);
       g.stroke();
       g.globalAlpha = 1;
+      // Opaque backing so the cursor's time doesn't overprint the axis labels.
+      const label = fmt(tAt(hover.x), 10);
+      g.fillStyle = col.panel;
+      g.fillRect(hover.x + 1, 0, g.measureText(label).width + 8, AXIS - 1);
       g.fillStyle = col.text;
-      g.fillText(fmt(tAt(hover.x), 10), hover.x + 4, AXIS / 2);
+      g.fillText(label, hover.x + 4, AXIS / 2);
     }
     g.restore();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -598,6 +605,7 @@ export function Dashboard({
   return (
     <div className="dashboard">
       <div className="dashboard-bar">
+        {transport}
         <span className="muted">
           {trajectory ? (trajectory.meta.mode === 'replay' ? `replay of ${trajectory.meta.replayOf}` : running ? 'live' : trajectory.meta.id) : 'no session yet: press Run live'}
         </span>

@@ -46,6 +46,9 @@ export class SimScheduler implements Scheduler {
   private stopped = false;
   private realtimeTimer: ReturnType<typeof setTimeout> | undefined;
   private onStop: (() => void) | undefined;
+  /** Set while runRealtime is pacing; pause() parks it and resume() restarts the pacing from now. */
+  private pacing: { tick(): void; restart(): void } | undefined;
+  private paused = false;
 
   now(): number {
     return this.cur;
@@ -79,10 +82,11 @@ export class SimScheduler implements Scheduler {
     return new Promise((resolve) => {
       // stop() cancels the pending tick, so it has to settle the promise itself.
       this.onStop = resolve;
-      const wall0 = perf.now();
-      const sim0 = this.cur;
+      let wall0 = perf.now();
+      let sim0 = this.cur;
       const tick = () => {
         if (this.stopped) return resolve();
+        if (this.paused) return;
         const target = sim0 + (perf.now() - wall0) * speed;
         while (this.heap.length && this.heap[0].t <= target && !this.stopped) {
           const item = this.pop()!;
@@ -94,8 +98,33 @@ export class SimScheduler implements Scheduler {
         const wait = (this.heap[0].t - target) / speed;
         this.realtimeTimer = setTimeout(tick, Math.max(0, Math.min(wait, 50)));
       };
+      this.pacing = {
+        tick,
+        restart: () => {
+          wall0 = perf.now();
+          sim0 = this.cur;
+        },
+      };
       tick();
     });
+  }
+
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
+  /** Freeze the clock of a realtime run; nothing fires until resume(). */
+  pause(): void {
+    if (this.paused || this.stopped) return;
+    this.paused = true;
+    if (this.realtimeTimer) clearTimeout(this.realtimeTimer);
+  }
+
+  resume(): void {
+    if (!this.paused) return;
+    this.paused = false;
+    this.pacing?.restart();
+    this.pacing?.tick();
   }
 
   stop(): void {

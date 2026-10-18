@@ -328,8 +328,21 @@ const speechSynthesisDriver: LiveDriver = (req, sink) => {
   };
 };
 
+/** Output audio contexts, so a paused replay can freeze what is already scheduled. */
+const outputContexts = new Set<AudioContext>();
+
+/** Pause or resume every playing output (speaker audio and browser speech). */
+export function setOutputPaused(paused: boolean) {
+  for (const ctx of outputContexts) void (paused ? ctx.suspend() : ctx.resume());
+  if (typeof speechSynthesis !== 'undefined') {
+    if (paused) speechSynthesis.pause();
+    else speechSynthesis.resume();
+  }
+}
+
 const speaker: LiveDriver = (_req, sink, env) => {
   const ctx = new AudioContext({ latencyHint: 'interactive' });
+  outputContexts.add(ctx);
   const playing = new Set<AudioBufferSourceNode>();
   setTimeout(() => sink.recv({ type: 'ready', sampleRate: ctx.sampleRate, baseLatency: ctx.baseLatency, outputLatency: ctx.outputLatency ?? null }), 0);
   return {
@@ -353,6 +366,7 @@ const speaker: LiveDriver = (_req, sink, env) => {
       src.start(Math.max(ctx.currentTime, ctx.currentTime + (d.at! - env.now()) / 1000));
     },
     close() {
+      outputContexts.delete(ctx);
       void ctx.close();
     },
   };

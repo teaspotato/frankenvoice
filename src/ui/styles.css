@@ -95,6 +95,8 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 .sessions li span { display: flex; gap: 4px; flex-wrap: wrap; }
 
 .dashboard { display: flex; flex-direction: column; height: 100%; background: var(--panel); }
+.transport { display: inline-flex; gap: 2px; margin-right: 6px; }
+.transport button { min-width: 30px; font-size: 11px; }
 .dashboard-bar { display: flex; gap: 6px; align-items: center; padding: 4px 10px; border-bottom: 1px solid var(--border); }
 .dashboard-bar .spacer { flex: 1; }
 .dashboard-bar button { padding: 1px 8px; }

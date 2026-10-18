@@ -181,3 +181,29 @@ describe('ActivityTracker', () => {
     expect(a.snapshot(6000).stages.get('turn')).toBe('thinking');
   });
 });
+
+describe('SimScheduler pause', () => {
+  it('freezes the clock while paused and resumes from where it stopped', async () => {
+    let wall = 0;
+    const perf = { now: () => wall };
+    const s = new SimScheduler();
+    const fired: number[] = [];
+    for (const t of [10, 20, 30]) s.at(t, () => fired.push(t));
+    const done = s.runRealtime(1, perf);
+    wall = 15;
+    await new Promise((r) => setTimeout(r, 60));
+    expect(fired).toEqual([10]);
+    s.pause();
+    wall = 1000;
+    await new Promise((r) => setTimeout(r, 60));
+    expect(fired).toEqual([10]);
+    expect(s.now()).toBeLessThan(20);
+    s.resume();
+    wall = 1010;
+    await new Promise((r) => setTimeout(r, 60));
+    expect(fired).toEqual([10, 20]);
+    wall = 1100;
+    await done;
+    expect(fired).toEqual([10, 20, 30]);
+  });
+});
