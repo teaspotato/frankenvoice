@@ -5,9 +5,9 @@ A research playground for full-duplex voice agents built by wiring existing comp
 ## Quick start
 
 ```bash
-npm install
+pnpm install
 cp .env.example .env   # add keys for the providers you use
-npm run dev            # local proxy on :8787 + Vite on :5173
+pnpm dev               # local proxy on :8787 + Vite on :5173
 ```
 
 Open http://localhost:5173 and press **Run live**. Allow microphone access. Press **Stop** to finish. The session is saved to `./sessions/<id>.fvs` and appears in the Sessions list, where **Replay** runs it again.

@@ -325,7 +325,7 @@ export function App() {
         <button onClick={() => confirm('Replace the current graph with the default pipeline?') && setGraph(defaultGraph())}>Reset graph</button>
         <span className="spacer" />
         {health === null ? (
-          <span className="warn">proxy not reachable: run `npm run dev`</span>
+          <span className="warn">proxy not reachable: run `pnpm dev`</span>
         ) : missingKeys.length ? (
           <span className="warn">not configured in proxy .env: {missingKeys.join(', ')}</span>
         ) : (
