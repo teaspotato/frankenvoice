@@ -12,6 +12,8 @@ export interface Span {
   t0: number;
   t1?: number;
   text: string;
+  /** Events that make up this span, for following causes and effects. */
+  seqs: number[];
 }
 
 export interface AsrResult {
@@ -22,6 +24,8 @@ export interface AsrResult {
   a1: number;
   text: string;
   final: boolean;
+  /** Every partial and final result for this audio. */
+  seqs: number[];
 }
 
 export interface LlmSpan extends Span {
@@ -29,7 +33,7 @@ export interface LlmSpan extends Span {
   firstToken?: number;
   status?: string;
   /** Streamed chunks as they arrived. */
-  chunks: { t: number; text: string }[];
+  chunks: { t: number; text: string; seq: number }[];
 }
 
 export interface AudioBlock {
@@ -50,6 +54,13 @@ export interface CleanupFrame {
 export interface Marker {
   t: number;
   text: string;
+  seq: number;
+}
+
+/** What led to a set of events and what they led to, through each event's recorded causes. */
+export interface Related {
+  up: Set<number>;
+  down: Set<number>;
 }
 
 export class TimelineModel {
@@ -70,17 +81,19 @@ export class TimelineModel {
   speech: Span[] = [];
   /** Latest ASR result per segment (keyed by its first audio sample). */
   asr = new Map<number, AsrResult>();
-  asrArrivals: { t: number; final: boolean }[] = [];
-  floor: { t: number; state: string }[] = [];
-  userTurns: Marker[] = [];
+  asrArrivals: { t: number; final: boolean; text: string; seq: number; a0?: number; a1?: number }[] = [];
+  floor: { t: number; state: string; seq: number }[] = [];
+  userTurns: (Marker & { a0?: number; a1?: number })[] = [];
   llm: LlmSpan[] = [];
-  ttsRequests: number[] = [];
+  ttsRequests: { t: number; seq: number }[] = [];
   tts: (Span & { rid: string; seg: number })[] = [];
-  playback: (Span & { interrupted?: boolean })[] = [];
+  playback: (Span & { rid: string; interrupted?: boolean })[] = [];
   playbackSegments: Marker[] = [];
   boundaries: number[] = [];
   agentAudio: AudioBlock[] = [];
   errors: (Marker & { node: string })[] = [];
+  /** Events caused by each event (the inverse of TrajEvent.cause). */
+  private children = new Map<number, number[]>();
   /** Latest state per node. */
   state: Record<string, Record<string, Json>> = {};
   duration = 0;
@@ -134,11 +147,44 @@ export class TimelineModel {
     return out;
   }
 
+  /**
+   * Everything upstream of `seqs` (what triggered them) and downstream (what
+   * they produced), following recorded causes only: up through causes, down
+   * through effects, never sideways, so a shared connection or the session
+   * start doesn't relate everything to everything.
+   */
+  related(seqs: number[]): Related {
+    const self = new Set(seqs);
+    const walk = (next: (s: number) => readonly number[] | undefined) => {
+      const out = new Set<number>();
+      const stack = [...seqs];
+      while (stack.length) {
+        for (const n of next(stack.pop()!) ?? []) {
+          if (out.has(n) || self.has(n)) continue;
+          out.add(n);
+          stack.push(n);
+        }
+      }
+      return out;
+    };
+    return { up: walk((s) => this.event(s)?.cause), down: walk((s) => this.children.get(s)) };
+  }
+
+  private event(seq: number): TrajEvent | undefined {
+    const ev = this.traj.events;
+    return ev[seq]?.seq === seq ? ev[seq] : ev.find((e) => e.seq === seq);
+  }
+
   private consume(e: TrajEvent) {
     const d = (e.data ?? {}) as Record<string, any>;
+    for (const c of e.cause ?? []) {
+      const l = this.children.get(c);
+      if (l) l.push(e.seq);
+      else this.children.set(c, [e.seq]);
+    }
     if (e.kind === 'state') {
       this.state[e.node] = { ...this.state[e.node], ...(d as Record<string, Json>) };
-      if (typeof d.floor === 'string') this.floor.push({ t: e.t, state: d.floor });
+      if (typeof d.floor === 'string') this.floor.push({ t: e.t, state: d.floor, seq: e.seq });
       return;
     }
     if (e.kind === 'node.start' && typeof d.type === 'string' && d.type.startsWith('vad.')) {
@@ -147,21 +193,23 @@ export class TimelineModel {
       return;
     }
     if (e.kind === 'log' && d.level === 'error') {
-      this.errors.push({ t: e.t, node: e.node, text: String(d.message) });
+      this.errors.push({ t: e.t, node: e.node, text: String(d.message), seq: e.seq });
       return;
     }
     if (e.kind === 'io.open' && e.node === 'tts') {
-      this.ttsRequests.push(e.t);
+      this.ttsRequests.push({ t: e.t, seq: e.seq });
       return;
     }
     if (e.kind === 'io.send' && d.payload?.cmd === 'play' && e.media) {
       const samples = this.traj.tracks.readF32Range(e.media.track, e.media.start, e.media.end);
       this.agentAudio.push({ t: d.payload.at, peaks: this.peaks(samples, d.payload.sampleRate) });
+      this.playback[this.playback.length - 1]?.seqs.push(e.seq);
       return;
     }
     if (e.kind !== 'msg') return;
     switch (d.type) {
       case 'audio':
+        if (e.node === 'tts' && d.rid !== undefined) this.tts.find((x) => x.rid === d.rid && x.seg === d.seg)?.seqs.push(e.seq);
         if (e.node === 'cleanup' && e.media && e.port === 'audio') {
           const per = Math.round((this.micRate * PEAK_MS) / 1000);
           const upTo = Math.floor(e.media.end / per) * per;
@@ -192,33 +240,42 @@ export class TimelineModel {
         this.vad.push({ t: this.sampleToT(d.end), p: d.p });
         break;
       case 'vad.speech_start':
-        this.speech.push({ t0: this.sampleToT(d.at), text: '' });
+        this.speech.push({ t0: this.sampleToT(d.at), text: '', seqs: [e.seq] });
         break;
       case 'vad.speech_end': {
         const s = this.speech[this.speech.length - 1];
-        if (s && s.t1 === undefined) s.t1 = this.sampleToT(d.at);
+        if (s && s.t1 === undefined) {
+          s.t1 = this.sampleToT(d.at);
+          s.seqs.push(e.seq);
+        }
         break;
       }
       case 'asr.partial':
       case 'asr.final': {
         const final = d.type === 'asr.final';
-        this.asrArrivals.push({ t: e.t, final });
-        if (typeof d.start === 'number' && typeof d.end === 'number')
-          this.asr.set(d.start, { t: e.t, a0: this.sampleToT(d.start), a1: this.sampleToT(d.end), text: d.text ?? '', final });
+        const covers = typeof d.start === 'number' && typeof d.end === 'number' ? { a0: this.sampleToT(d.start), a1: this.sampleToT(d.end) } : {};
+        this.asrArrivals.push({ t: e.t, final, text: d.text ?? '', seq: e.seq, ...covers });
+        if (typeof d.start === 'number' && typeof d.end === 'number') {
+          const seqs = [...(this.asr.get(d.start)?.seqs ?? []), e.seq];
+          this.asr.set(d.start, { t: e.t, a0: this.sampleToT(d.start), a1: this.sampleToT(d.end), text: d.text ?? '', final, seqs });
+        }
         break;
       }
-      case 'turn.user':
-        this.userTurns.push({ t: e.t, text: d.text ?? '' });
+      case 'turn.user': {
+        const audio = typeof d.from === 'number' && d.from >= 0 ? { a0: this.sampleToT(d.from), a1: this.sampleToT(d.to) } : {};
+        this.userTurns.push({ t: e.t, text: d.text ?? '', seq: e.seq, ...audio });
         break;
+      }
       case 'llm.start':
-        this.llm.push({ rid: d.rid, t0: e.t, text: '', chunks: [] });
+        this.llm.push({ rid: d.rid, t0: e.t, text: '', chunks: [], seqs: [e.seq] });
         break;
       case 'llm.delta': {
         const l = this.llm.find((x) => x.rid === d.rid);
         if (l) {
           l.firstToken ??= e.t;
           l.text += d.text ?? '';
-          l.chunks.push({ t: e.t, text: d.text ?? '' });
+          l.chunks.push({ t: e.t, text: d.text ?? '', seq: e.seq });
+          l.seqs.push(e.seq);
         }
         break;
       }
@@ -227,22 +284,26 @@ export class TimelineModel {
         if (l) {
           l.t1 = e.t;
           l.status = d.status;
+          l.seqs.push(e.seq);
         }
         break;
       }
       case 'tts.segment_start':
-        this.tts.push({ rid: d.rid, seg: d.seg, t0: e.t, text: d.text ?? '' });
+        this.tts.push({ rid: d.rid, seg: d.seg, t0: e.t, text: d.text ?? '', seqs: [e.seq] });
         break;
       case 'tts.segment_end': {
         const s = this.tts.find((x) => x.rid === d.rid && x.seg === d.seg);
-        if (s) s.t1 = e.t;
+        if (s) {
+          s.t1 = e.t;
+          s.seqs.push(e.seq);
+        }
         break;
       }
       case 'playback.start':
-        this.playback.push({ t0: d.at ?? e.t, text: d.rid ?? '' });
+        this.playback.push({ t0: d.at ?? e.t, text: d.rid ?? '', rid: d.rid ?? '', seqs: [e.seq] });
         break;
       case 'playback.segment':
-        this.playbackSegments.push({ t: d.at ?? e.t, text: d.text ?? '' });
+        this.playbackSegments.push({ t: d.at ?? e.t, text: d.text ?? '', seq: e.seq });
         break;
       case 'playback.boundary':
         this.boundaries.push(d.at ?? e.t);
@@ -254,6 +315,7 @@ export class TimelineModel {
           // The speaker reports the end when its timer fires; the audio itself ended at its schedule.
           p.t1 = d.at ?? e.t;
           p.interrupted = d.type === 'playback.interrupted';
+          p.seqs.push(e.seq);
         }
         break;
       }

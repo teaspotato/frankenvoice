@@ -6,6 +6,8 @@ import { TrackStore } from '../src/core/tracks';
 import { EchoCanceller } from '../src/nodes/cleanup';
 import type { AudioMsg, TrajEvent } from '../src/core/types';
 import { ActivityTracker } from '../src/ui/activity';
+import { TimelineModel } from '../src/ui/timeline';
+import { Trajectory, TRAJECTORY_FORMAT } from '../src/core/trajectory';
 
 describe('SentenceSplitter', () => {
   it('emits sentences as soon as their boundary is certain', () => {
@@ -205,5 +207,23 @@ describe('SimScheduler pause', () => {
     wall = 1100;
     await done;
     expect(fired).toEqual([10, 20, 30]);
+  });
+});
+
+describe('TimelineModel.related', () => {
+  it('walks causes up and effects down, never sideways', () => {
+    const traj = new Trajectory({ format: TRAJECTORY_FORMAT, formatVersion: 1, id: 't', createdAt: '', mode: 'live', graph: { nodes: [], edges: [] } as never, graphHash: '' });
+    const add = (seq: number, cause?: number[]) => traj.append({ seq, t: seq, node: 'n', kind: 'msg', port: 'p', data: { type: 'x' }, ...(cause ? { cause } : {}) });
+    add(0); // shared connection
+    add(1, [0]); // result A
+    add(2, [0]); // result B (sibling of A through the connection)
+    add(3, [1]); // produced by A
+    add(4, [3]);
+    const m = new TimelineModel(traj);
+    m.update();
+    const r = m.related([1]);
+    expect([...r.up]).toEqual([0]);
+    expect([...r.down].sort()).toEqual([3, 4]);
+    expect(r.down.has(2)).toBe(false);
   });
 });

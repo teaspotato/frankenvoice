@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Trajectory } from '../core/trajectory';
-import { TimelineModel } from './timeline';
+import { TimelineModel, type Related } from './timeline';
 
 export interface Lane {
   id: string;
@@ -20,6 +20,19 @@ export const LANES: Lane[] = [
   { id: 'speaker', label: 'Playback', height: 48 },
 ];
 
+/** What each lane's marks mean, shown when hovering the lane's name. */
+const LEGEND: Record<string, string> = {
+  mic: 'Microphone input: waveform peaks every 10 ms, placed when each frame arrived. Green shading: speech the VAD detected.',
+  cleanup: 'Audio after noise/echo cleanup: what VAD and ASR hear. Small ticks under it: AEC double talk or the RNNoise gate closing. Hover for levels.',
+  vad: 'Speech probability per frame (line) against the start and stop thresholds (dashed). Shaded: detected speech.',
+  asr:
+    'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: grey ticks are partial results arriving, purple ticks are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
+  turn: 'Floor state: thinking (amber) and speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.',
+  llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT, chunks and chars/s. Bottom: each streamed chunk at the moment it arrived.',
+  tts: 'One bar per sentence, from its request until its audio finished arriving. Ticks at the bottom: requests sent.',
+  speaker: 'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Ticks at the top: sentence starts; at the bottom: word boundaries.',
+};
+
 const AXIS = 20;
 const LABEL_W = 78;
 const MIN_SPAN = 200;
@@ -32,6 +45,36 @@ interface Hit {
   /** Vertical extent within the canvas, when only part of the lane counts. */
   y0?: number;
   y1?: number;
+  /** Events behind this item, for highlighting what caused it and what it caused. */
+  seqs?: number[];
+  /** User audio it covers, in session time. */
+  audio?: [number, number];
+}
+
+type Relation = 'self' | 'up' | 'down' | 'audio';
+
+interface RelInfo {
+  up: string[];
+  down: string[];
+}
+
+/** How `h` relates to the hovered item. */
+function relationOf(h: Hit, tip: Hit, rel: Related, audio: [number, number][]): Relation | undefined {
+  if (!h.seqs?.length) return undefined;
+  if (h.seqs[0] === tip.seqs?.[0] && h.lane === tip.lane) return 'self';
+  if (h.seqs.some((s) => rel.up.has(s))) return 'up';
+  if (h.seqs.some((s) => rel.down.has(s))) return 'down';
+  if (h.audio && audio.some(([a, b]) => h.audio![0] < b && h.audio![1] > a)) return 'audio';
+  return undefined;
+}
+
+/** Find the item under the pointer, topmost first. */
+function hitAt(hits: Hit[], lane: string | undefined, px: number, py: number): Hit | undefined {
+  for (let i = hits.length - 1; i >= 0; i--) {
+    const h = hits[i];
+    if (h.lane === lane && px >= h.x0 - 1 && px <= h.x1 + 1 && (h.y0 === undefined || (py >= h.y0 && py <= h.y1!))) return h;
+  }
+  return undefined;
 }
 
 interface View {
@@ -82,6 +125,9 @@ export function Dashboard({
   const modelRef = useRef<TimelineModel | null>(null);
   const hitsRef = useRef<Hit[]>([]);
   const [view, setView] = useState<View>({ end: null, span: 15000 });
+  /** Causes and effects of the hovered item, as found by the last draw. */
+  const [relInfo, setRelInfo] = useState<RelInfo | null>(null);
+  const relKey = useRef('null');
   const viewRef = useRef(view);
   viewRef.current = view;
   const [size, setSize] = useState({ w: 800, h: 300 });
@@ -187,6 +233,13 @@ export function Dashboard({
       g.stroke();
       g.fillStyle = l.id === selected ? col.accent : col.muted;
       g.fillText(l.label, 8, y + l.height / 2);
+      if (LEGEND[l.id]) {
+        // hint that hovering the name explains the lane
+        g.globalAlpha = hover && hover.x <= LABEL_W && hover.y >= y && hover.y < y + l.height ? 1 : 0.4;
+        g.fillStyle = col.muted;
+        g.fillText('ⓘ', LABEL_W - 16, y + l.height / 2);
+        g.globalAlpha = 1;
+      }
       y += l.height;
     }
 
@@ -246,6 +299,12 @@ export function Dashboard({
       g.stroke();
     };
     const head = Math.max(m?.duration ?? 0, running && now ? now() : 0);
+    /** Attach the events (and user audio) behind the item just added to `hits`. */
+    const tag = (seqs: number[], audio?: [number, number]) => {
+      const h = hits[hits.length - 1];
+      h.seqs = seqs;
+      h.audio = audio;
+    };
 
     if (m) {
       // speech regions behind mic + vad
@@ -257,7 +316,7 @@ export function Dashboard({
         g.globalAlpha = 0.12;
         g.fillRect(a, laneY.mic[0], b - a, laneY.vad[1] - laneY.mic[0]);
         g.globalAlpha = 1;
-        hits.push({ lane: 'vad', x0: a, x1: b, text: `speech ${((((s.t1 ?? head) - s.t0) / 1000) as number).toFixed(2)} s` });
+        hits.push({ lane: 'vad', x0: a, x1: b, text: `speech ${((((s.t1 ?? head) - s.t0) / 1000) as number).toFixed(2)} s`, seqs: s.seqs, audio: [s.t0, s.t1 ?? head] });
       }
 
       // mic waveform, and what the noise/echo stage made of it
@@ -345,8 +404,11 @@ export function Dashboard({
           if (r.t < t0 || r.t > t1) continue;
         }
         const [ly0, ly1] = laneY.asr;
-        if (r.final) span('asr', r.a0, r.a1, col.asr, 0.3, r.text, 0.08, 0.62);
-        else {
+        if (r.final) {
+          span('asr', r.a0, r.a1, col.asr, 0.3, r.text, 0.08, 0.62);
+          tag(r.seqs, [r.a0, r.a1]);
+          Object.assign(hits[hits.length - 1], { y0: ly0, y1: ly0 + (ly1 - ly0) * 0.64, text: `final transcript: ${r.text}` });
+        } else {
           const x0 = x(r.a0);
           const x1 = Math.max(x(r.a1), x0 + 2);
           g.strokeStyle = col.asr;
@@ -354,7 +416,7 @@ export function Dashboard({
           g.strokeRect(x0 + 0.5, ly0 + (ly1 - ly0) * 0.08 + 0.5, x1 - x0 - 1, (ly1 - ly0) * 0.54);
           g.setLineDash([]);
           label(r.text, x0, x1, ly0 + (ly1 - ly0) * 0.35, col.muted);
-          hits.push({ lane: 'asr', x0, x1, text: `${r.text} (partial)` });
+          hits.push({ lane: 'asr', x0, x1, y0: ly0, y1: ly0 + (ly1 - ly0) * 0.64, text: `partial transcript (may still change): ${r.text}`, seqs: r.seqs, audio: [r.a0, r.a1] });
         }
         // latency: end of the audio to arrival of this result
         g.strokeStyle = col.asr;
@@ -364,11 +426,30 @@ export function Dashboard({
         g.lineTo(x(r.t), ly0 + (ly1 - ly0) * 0.82);
         g.stroke();
         g.globalAlpha = 1;
-        hits.push({ lane: 'asr', x0: x(r.a1), x1: x(r.t), text: `${r.final ? 'final' : 'partial'} arrived ${(r.t - r.a1).toFixed(0)} ms after its audio ended` });
+        hits.push({
+          lane: 'asr',
+          x0: x(r.a1),
+          x1: x(r.t),
+          y0: ly0 + (ly1 - ly0) * 0.64,
+          y1: ly1,
+          text: `ASR latency: the ${r.final ? 'final' : 'latest partial'} result arrived ${(r.t - r.a1).toFixed(0)} ms after the end of the audio it covers`,
+          seqs: r.seqs,
+        });
       }
       for (const a of m.asrArrivals) {
         if (a.t < t0 || a.t > t1) continue;
         vline('asr', a.t, a.final ? col.asr : col.muted, a.final ? 0.68 : 0.74, 0.96);
+        const [ly0, ly1] = laneY.asr;
+        hits.push({
+          lane: 'asr',
+          x0: x(a.t) - 3,
+          x1: x(a.t) + 3,
+          y0: ly0 + (ly1 - ly0) * 0.64,
+          y1: ly1,
+          text: `${a.final ? 'final' : 'partial'} result arrived${a.a1 !== undefined ? ` ${(a.t - a.a1).toFixed(0)} ms after its audio ended` : ''}: ${a.text || '(empty)'}`,
+          seqs: [a.seq],
+          audio: a.a0 === undefined ? undefined : [a.a0, a.a1!],
+        });
       }
 
       // turn-taking state
@@ -378,11 +459,12 @@ export function Dashboard({
         if (end < t0 || f.t > t1) return;
         if (floorColor[f.state]) span('turn', f.t, end, floorColor[f.state], 0.25, f.state, 0.15, 0.85);
         else hits.push({ lane: 'turn', x0: x(f.t), x1: x(end), text: f.state });
+        tag([f.seq]);
       });
       for (const u of m.userTurns) {
         if (u.t < t0 || u.t > t1) continue;
         vline('turn', u.t, col.turn);
-        hits.push({ lane: 'turn', x0: x(u.t) - 3, x1: x(u.t) + 3, text: `user turn: ${u.text}` });
+        hits.push({ lane: 'turn', x0: x(u.t) - 3, x1: x(u.t) + 3, text: `user turn: ${u.text}`, seqs: [u.seq], audio: u.a0 === undefined ? undefined : [u.a0, u.a1!] });
       }
 
       // LLM: waiting for the first token, then generating; below, each chunk at its arrival
@@ -398,7 +480,7 @@ export function Dashboard({
         hits.pop();
         span('llm', ft, end, col.llm, 0.35, stats, 0.06, 0.4);
         hits.pop();
-        hits.push({ lane: 'llm', x0: x(l.t0), x1: x(end), text: `${stats}\n${l.text}` });
+        hits.push({ lane: 'llm', x0: x(l.t0), x1: x(end), text: `${stats}\n${l.text}`, seqs: l.seqs });
         let so = '';
         l.chunks.forEach((c, i) => {
           so += c.text;
@@ -415,16 +497,22 @@ export function Dashboard({
             g.fillText(c.text.replace(/\s+/g, ' '), cx + 2, ly0 + h * 0.76);
             g.restore();
           }
-          hits.push({ lane: 'llm', y0: ly0 + h * 0.44, y1: ly1, x0: cx - 1, x1: Math.max(cx + 3, nx - 1), text: `+${(c.t - l.t0).toFixed(0)} ms  ${JSON.stringify(c.text)}\n${so}` });
+          hits.push({ lane: 'llm', y0: ly0 + h * 0.44, y1: ly1, x0: cx - 1, x1: Math.max(cx + 3, nx - 1), text: `+${(c.t - l.t0).toFixed(0)} ms  ${JSON.stringify(c.text)}\n${so}`, seqs: [c.seq] });
         });
       }
 
       // TTS: request sent, then audio streaming per sentence
-      for (const t of m.ttsRequests) if (t >= t0 && t <= t1) vline('tts', t, col.muted, 0.75, 1);
+      for (const r of m.ttsRequests) {
+        if (r.t < t0 || r.t > t1) continue;
+        vline('tts', r.t, col.muted, 0.75, 1);
+        const [ly0, ly1] = laneY.tts;
+        hits.push({ lane: 'tts', x0: x(r.t) - 3, x1: x(r.t) + 3, y0: ly0 + (ly1 - ly0) * 0.72, y1: ly1, text: 'request sent to the TTS provider', seqs: [r.seq] });
+      }
       for (const s of m.tts) {
         const end = s.t1 ?? head;
         if (end < t0 || s.t0 > t1) continue;
         span('tts', s.t0, end, col.tts, 0.35, s.text, 0.15, 0.7);
+        tag(s.seqs);
       }
 
       // playback: what was heard
@@ -432,7 +520,8 @@ export function Dashboard({
         const end = p.t1 ?? head;
         if (end < t0 || p.t0 > t1) continue;
         span('speaker', p.t0, end, col.sink, 0.1, '', 0, 1);
-        hits.pop();
+        hits[hits.length - 1].text = `${p.interrupted ? 'interrupted' : 'played'} ${((end - p.t0) / 1000).toFixed(2)} s`;
+        tag(p.seqs);
         if (p.interrupted) vline('speaker', end, col.danger);
       }
       {
@@ -454,7 +543,7 @@ export function Dashboard({
       for (const s of m.playbackSegments) {
         if (s.t < t0 || s.t > t1) continue;
         vline('speaker', s.t, col.text, 0, 0.3);
-        hits.push({ lane: 'speaker', x0: x(s.t) - 3, x1: x(s.t) + 60, text: s.text });
+        hits.push({ lane: 'speaker', x0: x(s.t) - 3, x1: x(s.t) + 60, text: s.text, seqs: [s.seq] });
       }
       for (const b of m.boundaries) if (b >= t0 && b <= t1) vline('speaker', b, col.sink, 0.7, 1);
 
@@ -466,7 +555,7 @@ export function Dashboard({
         g.beginPath();
         g.arc(x(err.t), ly0 + 6, 4, 0, Math.PI * 2);
         g.fill();
-        hits.push({ lane, x0: x(err.t) - 5, x1: x(err.t) + 5, text: `error: ${err.text}` });
+        hits.push({ lane, x0: x(err.t) - 5, x1: x(err.t) + 5, text: `error: ${err.text}`, seqs: [err.seq] });
       }
 
       // live head
@@ -479,6 +568,66 @@ export function Dashboard({
         g.stroke();
         g.globalAlpha = 1;
       }
+    }
+
+    // causes and effects of the item under the pointer
+    let info: RelInfo | null = null;
+    if (m && hover && hover.x > LABEL_W) {
+      const lane = Object.keys(laneY).find((k) => hover.y >= laneY[k][0] && hover.y < laneY[k][1]);
+      const tipHit = hitAt(hits, lane, hover.x, hover.y);
+      if (tipHit) {
+        // Glow the hovered item so it's clear what the tooltip describes.
+        const [ly0, ly1] = laneY[tipHit.lane];
+        g.save();
+        g.shadowColor = col.accent;
+        g.shadowBlur = 10;
+        g.strokeStyle = col.text;
+        g.lineWidth = 2;
+        g.strokeRect(tipHit.x0 - 1, (tipHit.y0 ?? ly0 + 2) - 1, Math.max(4, tipHit.x1 - tipHit.x0 + 2), (tipHit.y1 ?? ly1 - 2) - (tipHit.y0 ?? ly0 + 2) + 2);
+        g.restore();
+      }
+      if (tipHit?.seqs?.length) {
+        const rel = m.related(tipHit.seqs);
+        let rels = hits.map((h) => relationOf(h, tipHit, rel, []));
+        // User audio behind the item and everything causally tied to it; VAD/ASR on the same audio count too.
+        const audio = hits.filter((h, i) => rels[i] && h.audio).map((h) => h.audio!);
+        rels = hits.map((h, i) => rels[i] ?? relationOf(h, tipHit, rel, audio));
+        g.fillStyle = col.accent;
+        g.globalAlpha = 0.12;
+        for (const [a, b] of audio)
+          for (const l of ['mic', 'cleanup']) g.fillRect(x(a), laneY[l][0], Math.max(2, x(b) - x(a)), laneY[l][1] - laneY[l][0]);
+        g.globalAlpha = 1;
+        const stroke: Record<Relation, string> = { self: col.text, up: col.warn, down: col.accent, audio: col.muted };
+        g.lineWidth = 2;
+        hits.forEach((h, i) => {
+          const r = rels[i];
+          if (!r || h === tipHit) return;
+          const [ly0, ly1] = laneY[h.lane];
+          g.strokeStyle = stroke[r];
+          g.setLineDash(r === 'audio' ? [4, 3] : []);
+          g.strokeRect(h.x0, (h.y0 ?? ly0 + 2) + 1, Math.max(3, h.x1 - h.x0), (h.y1 ?? ly1 - 2) - (h.y0 ?? ly0 + 2) - 2);
+        });
+        g.setLineDash([]);
+        g.lineWidth = 1;
+        const list = (want: Relation) => {
+          const out: string[] = [];
+          hits
+            .map((h, i) => [h, rels[i]] as const)
+            .filter(([h, r]) => r === want && h.y0 === undefined)
+            .sort((a, b) => a[0].x0 - b[0].x0)
+            .forEach(([h]) => {
+              const s = `${LANES.find((l) => l.id === h.lane)?.label ?? h.lane}: ${h.text.split('\n')[0].slice(0, 60)}`;
+              if (!out.includes(s)) out.push(s);
+            });
+          return out;
+        };
+        info = { up: list('up'), down: list('down') };
+      }
+    }
+    const key = JSON.stringify(info);
+    if (key !== relKey.current) {
+      relKey.current = key;
+      setRelInfo(info);
     }
 
     // cursor
@@ -570,10 +719,9 @@ export function Dashboard({
       if (hover.y >= y && hover.y < y + l.height) tipLane = l.id;
       y += l.height;
     }
-    tip = [...hitsRef.current]
-      .reverse()
-      .find((h) => h.lane === tipLane && hover.x >= h.x0 - 1 && hover.x <= h.x1 + 1 && (h.y0 === undefined || (hover.y >= h.y0 && hover.y <= h.y1!)));
+    tip = hover.x > LABEL_W ? hitAt(hitsRef.current, tipLane, hover.x, hover.y) : undefined;
   }
+  const legend = hover && hover.x <= LABEL_W && tipLane ? LEGEND[tipLane] : undefined;
   let cleanAt: string | undefined;
   if (hover && tipLane === 'cleanup' && modelRef.current) {
     const t = currentEnd() - view.span + ((hover.x - LABEL_W) / plotW()) * view.span;
@@ -630,11 +778,33 @@ export function Dashboard({
           }}
           onDoubleClick={fit}
         />
-        {hover && (tip || vadAt || cleanAt) && (
+        {hover && legend && (
+          <div className="dashboard-tip legend" style={{ left: LABEL_W + 4, top: hover.y + 14 }}>
+            {legend}
+          </div>
+        )}
+        {hover && !legend && (tip || vadAt || cleanAt) && (
           <div className="dashboard-tip" style={{ left: Math.min(hover.x + 12, size.w - 320), top: hover.y + 14 }}>
             {vadAt && <div>{vadAt}</div>}
             {cleanAt && <div>{cleanAt}</div>}
             {tip && <div>{tip.text}</div>}
+            {relInfo && relInfo.up.length > 0 && (
+              <div className="rel up">
+                <b>↑ triggered by</b>
+                {relInfo.up.slice(-6).map((s) => (
+                  <div key={s}>{s}</div>
+                ))}
+              </div>
+            )}
+            {relInfo && relInfo.down.length > 0 && (
+              <div className="rel down">
+                <b>↓ produced</b>
+                {relInfo.down.slice(0, 8).map((s) => (
+                  <div key={s}>{s}</div>
+                ))}
+                {relInfo.down.length > 8 && <div className="muted">… {relInfo.down.length - 8} more</div>}
+              </div>
+            )}
           </div>
         )}
       </div>
