@@ -172,9 +172,24 @@ const speechSynthesis: LiveDriver = (req, sink) => {
   return { send() {}, close: () => void (closed = true) };
 };
 
+/** RNNoise stand-in: halves the signal, one reply per frame, after a random delay. */
+const rnnoise: LiveDriver = (_req, sink) => {
+  let closed = false;
+  let t = 0;
+  return {
+    send(_data, bin) {
+      if (!bin) return;
+      const f = new Float32Array(bin.slice().buffer).map((v) => v * 0.5);
+      t = Math.max(t, performance.now()) + jitter(0.2, 1);
+      later(t - performance.now(), () => !closed && sink.recv({ vad: Math.random() }, new Uint8Array(f.buffer)));
+    },
+    close: () => void (closed = true),
+  };
+};
+
 const speaker: LiveDriver = (_req, sink) => {
   later(1, () => sink.recv({ type: 'ready', outputLatency: 0.02 }));
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, speaker };
+export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker };

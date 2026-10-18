@@ -7,18 +7,26 @@ import { GRAPH_FORMAT, GRAPH_FORMAT_VERSION } from './core/graph';
 import { resolveParams } from './core/node';
 import type { Json } from './core/types';
 import { migrateGraph, registry } from './nodes';
+import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'vad' | 'asr' | 'turn' | 'llm' | 'tts' | 'speaker';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'asr' | 'turn' | 'llm' | 'tts' | 'speaker';
 
 export interface StageDef {
   id: StageId;
   label: string;
   /** Implementation name -> node type. The first one is the default. */
   variants: Record<string, string>;
+  /** Params set by another stage, hidden from this stage's panel. */
+  managed?: string[];
 }
 
 export const STAGES: StageDef[] = [
-  { id: 'mic', label: 'Microphone', variants: { mic: 'mic' } },
+  { id: 'mic', label: 'Microphone', variants: { mic: 'mic' }, managed: ['echoCancellation', 'noiseSuppression', 'autoGainControl'] },
+  {
+    id: 'cleanup',
+    label: 'Noise / echo',
+    variants: { browser: 'cleanup.browser', aec: 'cleanup.aec', rnnoise: 'cleanup.rnnoise', off: 'cleanup.off' },
+  },
   { id: 'vad', label: 'VAD', variants: { silero: 'vad.silero', energy: 'vad.energy' } },
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
   { id: 'turn', label: 'Turn-taking', variants: { 'half-duplex': 'turn.half-duplex' } },
@@ -67,34 +75,43 @@ export function activeStages(c: PipelineConfig): StageDef[] {
 
 const COLUMN: Record<StageId, [number, number]> = {
   mic: [0, 110],
-  vad: [230, 20],
-  asr: [230, 200],
-  turn: [460, 110],
-  llm: [690, 110],
-  tts: [920, 110],
-  speaker: [1150, 110],
+  cleanup: [210, 110],
+  vad: [420, 20],
+  asr: [420, 200],
+  turn: [630, 110],
+  llm: [840, 110],
+  tts: [1050, 110],
+  speaker: [1260, 110],
 };
 
 const e = (from: string, fp: string, to: string, tp: string): EdgeSpec => ({ from: { node: from, port: fp }, to: { node: to, port: tp } });
 
-/** The fixed topology: mic → VAD + ASR → turn-taking → LLM → TTS → speaker, with playback fed back to turn-taking. */
+/** The fixed topology: mic → noise/echo cleanup → VAD + ASR → turn-taking → LLM → TTS → speaker, with playback fed back to turn-taking. */
 export function buildGraph(c: PipelineConfig): GraphSpec {
   const stages = activeStages(c);
+  const cleanupType = stageType(c, 'cleanup');
   const nodes: NodeSpec[] = stages.map((s) => ({
     id: s.id,
     type: stageType(c, s.id),
-    params: stageParams(c, s.id),
+    params:
+      s.id === 'mic'
+        ? // The cleanup stage decides what the browser does at capture.
+          { ...stageParams(c, 'mic'), ...micProcessing(cleanupType, resolveParams(registry[cleanupType], stageParams(c, 'cleanup'))) }
+        : stageParams(c, s.id),
     ui: { x: COLUMN[s.id][0], y: COLUMN[s.id][1] },
   }));
   const hasSpeaker = stages.some((s) => s.id === 'speaker');
+  const wantsReference = registry[cleanupType].inputs.some((p) => p.name === 'ref');
   const edges = [
-    e('mic', 'audio', 'vad', 'audio'),
-    e('mic', 'audio', 'asr', 'audio'),
+    e('mic', 'audio', 'cleanup', 'audio'),
+    e('cleanup', 'audio', 'vad', 'audio'),
+    e('cleanup', 'audio', 'asr', 'audio'),
     e('vad', 'vad', 'turn', 'vad'),
     e('asr', 'transcript', 'turn', 'transcript'),
     e('turn', 'turn', 'llm', 'turn'),
     e('llm', 'text', 'tts', 'text'),
     ...(hasSpeaker ? [e('tts', 'audio', 'speaker', 'audio'), e('speaker', 'playback', 'turn', 'playback')] : [e('tts', 'playback', 'turn', 'playback')]),
+    ...(hasSpeaker && wantsReference ? [e('speaker', 'played', 'cleanup', 'ref')] : []),
   ];
   return { format: GRAPH_FORMAT, formatVersion: GRAPH_FORMAT_VERSION, name: 'Cascade', nodes, edges };
 }
@@ -107,6 +124,13 @@ export function configFromGraph(graph: GraphSpec): PipelineConfig {
     const n = g.nodes.find((x) => x.id === s.id) ?? g.nodes.find((x) => Object.values(s.variants).includes(x.type));
     const variant = n && Object.entries(s.variants).find(([, t]) => t === n.type)?.[0];
     if (n && variant) c[s.id] = { variant, params: { ...c[s.id].params, [variant]: n.params } };
+  }
+  // Sessions from before the cleanup stage set browser processing on the mic.
+  const mic = g.nodes.find((x) => x.type === 'mic');
+  if (mic && !g.nodes.some((x) => x.type.startsWith('cleanup.'))) {
+    const keys = ['echoCancellation', 'noiseSuppression', 'autoGainControl'];
+    const flags = Object.fromEntries(keys.map((k) => [k, mic.params[k] !== false]));
+    c.cleanup = Object.values(flags).some(Boolean) ? { variant: 'browser', params: { browser: flags } } : { variant: 'off', params: {} };
   }
   return c;
 }

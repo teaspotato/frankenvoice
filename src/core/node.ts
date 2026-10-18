@@ -86,7 +86,7 @@ export interface NodeImpl {
 export interface NodeDef<P = any> {
   type: string;
   title: string;
-  category: 'source' | 'vad' | 'asr' | 'control' | 'llm' | 'tts' | 'sink' | 'mock';
+  category: 'source' | 'cleanup' | 'vad' | 'asr' | 'control' | 'llm' | 'tts' | 'sink' | 'mock';
   description?: string;
   inputs: PortDef[];
   outputs: PortDef[];

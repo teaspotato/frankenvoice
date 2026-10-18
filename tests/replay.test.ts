@@ -140,4 +140,24 @@ describe('record and replay', () => {
     sim.runFast();
     expect(runtime.trajectory.events).toEqual(run.events);
   }, 10_000);
+
+  for (const variant of ['aec', 'rnnoise'] as const) {
+    it(`runs the ${variant} cleanup stage and replays it exactly`, async () => {
+      const c = defaultConfig();
+      c.cleanup.variant = variant;
+      const g = buildGraph(c);
+      expect(g.nodes.find((n) => n.id === 'mic')!.params).toMatchObject({ noiseSuppression: false, autoGainControl: false });
+      const run = await recordLive(1500, performance, g);
+      const stats = run.events.filter((e) => e.node === 'cleanup' && e.kind === 'msg' && e.port === 'stats');
+      expect(stats.length).toBeGreaterThan(10);
+      // VAD and ASR listen to the cleaned track.
+      const vadIn = run.events.find((e) => e.node === 'vad' && e.kind === 'io.send')!;
+      expect(vadIn.media!.track).toBe('cleanup.audio');
+      if (variant === 'aec') expect(run.events.some((e) => e.node === 'speaker' && e.port === 'played')).toBe(true);
+      expect(run.events.filter((e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toEqual([]);
+      const { runtime, sim } = prepareReplay(run, { registry });
+      sim.runFast();
+      expect(runtime.trajectory.events).toEqual(run.events);
+    }, 10_000);
+  }
 });

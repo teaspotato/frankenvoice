@@ -14,6 +14,9 @@ importers:
       '@ricky0123/vad-web':
         specifier: ^0.0.31
         version: 0.0.31
+      '@shiguredo/rnnoise-wasm':
+        specifier: ^2025.1.5
+        version: 2025.1.5
       fflate:
         specifier: ^0.8.3
         version: 0.8.3
@@ -371,6 +374,10 @@ packages:
 
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
+
+  '@shiguredo/rnnoise-wasm@2025.1.5':
+    resolution: {integrity: sha512-9YJxzzHftlW936E5z9aEKK2CrPfUgc3HgZ2keyQ5e2Pb5bx+6tykYQ2Gyudvxd7Sxmlnar7SemDMFfx0OuVuGA==}
+    engines: {node: '>=20', pnpm: '>=10'}
 
   '@stablelib/base64@1.0.1':
     resolution: {integrity: sha512-1bnPQqSxSuc3Ii6MhBysoWCg58j97aUjuCSZrGSmDxNqtytIi0k8utUenAwTZN4V5mXXYGsVUI9zeBqy+jBOSQ==}
@@ -1122,6 +1129,8 @@ snapshots:
     optional: true
 
   '@rolldown/pluginutils@1.0.1': {}
+
+  '@shiguredo/rnnoise-wasm@2025.1.5': {}
 
   '@stablelib/base64@1.0.1': {}
 

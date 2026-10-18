@@ -11,6 +11,7 @@ export interface Lane {
 /** One lane per pipeline stage, top to bottom in pipeline order. */
 export const LANES: Lane[] = [
   { id: 'mic', label: 'Mic', height: 48 },
+  { id: 'cleanup', label: 'Cleaned', height: 52 },
   { id: 'vad', label: 'VAD', height: 60 },
   { id: 'asr', label: 'ASR', height: 46 },
   { id: 'turn', label: 'Turn', height: 36 },
@@ -144,6 +145,7 @@ export function Dashboard({
       ok: css('--ok'),
       warn: css('--warn'),
       mic: css('--cat-source'),
+      cleanup: css('--cat-cleanup'),
       vad: css('--cat-vad'),
       asr: css('--cat-asr'),
       turn: css('--cat-control'),
@@ -252,12 +254,12 @@ export function Dashboard({
         hits.push({ lane: 'vad', x0: a, x1: b, text: `speech ${((((s.t1 ?? head) - s.t0) / 1000) as number).toFixed(2)} s` });
       }
 
-      // mic waveform
-      {
-        const [ly0, ly1] = laneY.mic;
+      // mic waveform, and what the noise/echo stage made of it
+      const wave = (lane: string, peaks: number[], color: string) => {
+        const [ly0, ly1] = laneY[lane];
         const mid = (ly0 + ly1) / 2;
         const half = (ly1 - ly0) / 2 - 3;
-        const n = m.micPeaks.length;
+        const n = peaks.length;
         let lo = 0;
         let hi = n;
         while (lo < hi) {
@@ -270,14 +272,37 @@ export function Dashboard({
           const t = m.peakToT(i);
           if (t > t1) break;
           const c = Math.floor(x(t) - LABEL_W);
-          if (c >= 0 && c < cols.length) cols[c] = Math.max(cols[c], m.micPeaks[i]);
+          if (c >= 0 && c < cols.length) cols[c] = Math.max(cols[c], peaks[i]);
         }
-        g.fillStyle = col.mic;
+        g.fillStyle = color;
         for (let c = 0; c < cols.length; c++) {
           if (!cols[c]) continue;
           const h = Math.max(1, Math.min(1, Math.sqrt(cols[c])) * half);
           g.fillRect(LABEL_W + c, mid - h, 1, h * 2);
         }
+      };
+      wave('mic', m.micPeaks, col.mic);
+      wave('cleanup', m.cleanPeaks, col.cleanup);
+      // reduction (in − out, 0–30 dB) and double-talk / gating
+      {
+        const [ly0, ly1] = laneY.cleanup;
+        const yr = (dbr: number) => ly1 - 3 - (Math.max(0, Math.min(30, dbr)) / 30) * (ly1 - ly0 - 6);
+        g.strokeStyle = col.text;
+        g.globalAlpha = 0.7;
+        g.beginPath();
+        let started = false;
+        for (const f of m.cleanup) {
+          if (f.t < t0 - 100 || f.t > t1 + 100) continue;
+          const px = x(f.t);
+          const py = yr(f.inDb - f.outDb);
+          if (!started) g.moveTo(px, py);
+          else g.lineTo(px, py);
+          started = true;
+        }
+        g.stroke();
+        g.globalAlpha = 1;
+        g.fillStyle = col.danger;
+        for (const f of m.cleanup) if ((f.doubleTalk || f.gated) && f.t >= t0 && f.t <= t1) g.fillRect(x(f.t) - 1, ly1 - 4, 2, 3);
       }
 
       // VAD probability
@@ -520,6 +545,18 @@ export function Dashboard({
     }
     tip = [...hitsRef.current].reverse().find((h) => h.lane === tipLane && hover.x >= h.x0 - 1 && hover.x <= h.x1 + 1);
   }
+  let cleanAt: string | undefined;
+  if (hover && tipLane === 'cleanup' && modelRef.current) {
+    const t = currentEnd() - view.span + ((hover.x - LABEL_W) / plotW()) * view.span;
+    let best: (typeof modelRef.current.cleanup)[number] | undefined;
+    for (const f of modelRef.current.cleanup) if (!best || Math.abs(f.t - t) < Math.abs(best.t - t)) best = f;
+    if (best && Math.abs(best.t - t) < 100) {
+      const r = best.inDb - best.outDb;
+      cleanAt = `in ${best.inDb} dB → out ${best.outDb} dB (${r >= 0 ? '−' : '+'}${Math.abs(r).toFixed(1)} dB)`;
+      if (best.refDb !== undefined) cleanAt += `\necho reference ${best.refDb} dB${best.doubleTalk ? ' · double talk: not adapting' : ''}`;
+      if (best.vad !== undefined) cleanAt += `\nRNNoise voice prob. ${best.vad}${best.gated ? ' · gated' : ''}`;
+    }
+  }
   let vadAt: string | undefined;
   if (hover && tipLane === 'vad' && modelRef.current) {
     const t = currentEnd() - view.span + ((hover.x - LABEL_W) / plotW()) * view.span;
@@ -563,9 +600,10 @@ export function Dashboard({
           }}
           onDoubleClick={fit}
         />
-        {hover && (tip || vadAt) && (
+        {hover && (tip || vadAt || cleanAt) && (
           <div className="dashboard-tip" style={{ left: Math.min(hover.x + 12, size.w - 320), top: hover.y + 14 }}>
             {vadAt && <div>{vadAt}</div>}
+            {cleanAt && <div>{cleanAt}</div>}
             {tip && <div>{tip.text}</div>}
           </div>
         )}

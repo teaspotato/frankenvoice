@@ -53,7 +53,7 @@ export function StagePanel({
         </label>
       )}
       {node.params
-        .filter((p) => paramActive(p, values))
+        .filter((p) => paramActive(p, values) && !def.managed?.includes(p.key))
         .map((p) => {
           const v = values[p.key];
           const set = (x: Json) => setParam(p.key, x);
@@ -81,6 +81,7 @@ export function StagePanel({
             </label>
           );
         })}
+      {def.managed && <p className="muted">Browser echo cancellation, noise suppression and gain are set by the Noise / echo stage.</p>}
       {state && (
         <>
           <h4>State</h4>

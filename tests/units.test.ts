@@ -3,6 +3,7 @@ import { SentenceSplitter } from '../src/nodes/segment';
 import { Framer } from '../src/nodes/audio';
 import { SimScheduler } from '../src/core/scheduler';
 import { TrackStore } from '../src/core/tracks';
+import { EchoCanceller } from '../src/nodes/cleanup';
 import type { AudioMsg } from '../src/core/types';
 
 describe('SentenceSplitter', () => {
@@ -128,5 +129,34 @@ describe('TrackStore', () => {
     ts.bytes('a'); // merge, then keep appending
     ts.appendF32('a', new Float32Array([9, 8]), 16000);
     expect([...ts.readF32Range('a', all.length - 1, all.length + 2)]).toEqual([all[all.length - 1], 9, 8]);
+  });
+});
+
+describe('EchoCanceller', () => {
+  const rate = 16000;
+  const params = { filterMs: 64, stepSize: 0.5, delayMs: 0, doubleTalk: 0.6, suppressionDb: 0, adapt: true };
+  // Deterministic white-ish noise.
+  let seed = 1;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1;
+
+  it('learns a delayed, filtered echo of what was played', () => {
+    const aec = new EchoCanceller(rate, params);
+    const played = new Float32Array(rate * 4).map(() => rnd() * 0.3);
+    aec.addReference(500, played, rate); // playback starts at 0.5 s
+    const lag = Math.round(0.03 * rate) + 500 * 16; // heard 30 ms later
+    const mic = new Float32Array(rate * 5);
+    for (let j = 0; j < mic.length; j++) {
+      const k = j - lag;
+      const a = k >= 0 && k < played.length ? played[k] : 0;
+      const b = k - 5 >= 0 && k - 5 < played.length ? played[k - 5] : 0;
+      mic[j] = 0.3 * a + 0.12 * b + rnd() * 0.001;
+    }
+    const out = new Float32Array(mic.length);
+    for (let s = 0; s + 512 <= mic.length; s += 512) out.set(aec.process(mic.subarray(s, s + 512), s, 0).out, s);
+    const e = (x: Float32Array, a: number, b: number) => x.subarray(a, b).reduce((acc, v) => acc + v * v, 0);
+    const erle = 10 * Math.log10(e(mic, rate * 3, rate * 4) / e(out, rate * 3, rate * 4));
+    expect(erle).toBeGreaterThan(20);
+    // Before playback it passes audio through untouched.
+    expect([...out.subarray(0, 4000)]).toEqual([...mic.subarray(0, 4000)]);
   });
 });

@@ -17,7 +17,7 @@ Open http://localhost:5173 and press **Run live**. Allow microphone access. Pres
 
 - **Pipeline diagram** (top): read-only, drawn to a fixed layout in `src/ui/PipelineView.tsx` (the playback feedback runs above the row so it never crosses a stage). Each stage shows its live state. Click a stage to configure it in the right panel.
 - **Dashboard** (middle): one lane per stage on a shared time axis, live while running and the same for replays and loaded sessions.
-  - *Mic*: waveform. *VAD*: speech probability with the start/stop thresholds; detected speech is shaded across Mic and VAD.
+  - *Mic*: waveform. *Cleaned*: what the noise/echo stage passes on, with how much it removed (in − out, 0–30 dB line); red ticks mark double talk (echo canceller not adapting) or RNNoise gating. *VAD*: speech probability with the start/stop thresholds; detected speech is shaded across Mic and VAD.
   - *ASR*: each result drawn over the audio it covers (dashed while partial, solid when final), with a line to the tick where it arrived, so recognition latency is visible.
   - *Turn*: floor state (thinking, speaking) and committed user turns.
   - *LLM*: waiting for the first token (light), then generating (solid); hover for time to first token and the text.
@@ -32,12 +32,27 @@ The pipeline runs in the browser. The small proxy in `server/` keeps API keys ou
 ## Pipeline
 
 ```
-mic ─┬─> vad (Silero, in-browser) ──> turn ─> llm ─> tts ─> speaker
-     └─> asr (streaming) ────────────┘  ^                       │
-                                        └─────── playback ──────┘
+                       ┌─> vad (Silero) ──┐
+mic ─> noise/echo ─────┤                  ├─> turn ─> llm ─> tts ─> speaker
+          ^            └─> asr (streaming)┘    ^                     │  │
+          │                                    └──── playback ───────┘  │
+          └──────────────── echo reference (what was played) ───────────┘
 ```
 
 The wiring lives in `src/pipeline.ts` (`STAGES` and `buildGraph`). Each stage lists the node types that can fill it; the UI only chooses among those and sets their params. To change the topology, edit that file.
+
+## Noise / echo cancellation
+
+The stage between the mic and VAD/ASR has four implementations, each with its knobs in the stage panel:
+
+| implementation | what it does | knobs |
+| --- | --- | --- |
+| `browser` (default) | WebRTC echo cancellation, noise suppression and gain control, applied by the browser at capture | each of the three on/off |
+| `aec` | NLMS echo canceller in the page. Its reference is the audio the speaker played, placed on the session clock. Browser processing is off, so the Mic lane is raw and the Cleaned lane is its output | filter length, step size, reference delay, double-talk threshold, residual suppression, adapt on/off |
+| `rnnoise` | RNNoise neural noise suppression (WASM, 48 kHz internally); also reports a voice probability | wet/dry mix, gate below a voice probability, gate depth, browser AEC in front |
+| `off` | raw microphone, no processing | none |
+
+The echo canceller is deterministic, so a replay with changed knobs (**replay with current config**) shows what they would have done to the same recorded audio. RNNoise's output is recorded, and its mix and gate are applied after the recording, so those two can also be retuned on a replay.
 
 ## Providers
 
@@ -70,7 +85,7 @@ The core rule is that **everything is replayable as-is**: ASR partials, LLM toke
 How the runtime ensures that:
 
 - **One session clock.** Every event has `t`, its arrival time in ms on a monotonic session clock. Events about audio also carry `media: {track, start, end}`, a sample range on a recorded media track. So each event records both *when* it happened and *which audio* it refers to. The mic driver also logs the AudioContext time of every captured frame.
-- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `silero`, `deepgram`, `anthropic`, `openai`, `cartesia`, `openai-tts`, `deepgram-tts`, `speech-synthesis`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
+- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `rnnoise`, `silero`, `deepgram`, `anthropic`, `openai`, `cartesia`, `openai-tts`, `deepgram-tts`, `speech-synthesis`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
 - **Deterministic turns.** When an external event arrives, the runtime stamps it with the current time, hands it to its node, and drains every resulting message synchronously, all at that timestamp. Nodes are pure functions of what they receive, so the same external events at the same times always produce the same log.
 - **Replay on a virtual clock.** A replay serves every recorded exchange and timer from the trajectory at its original time, with the original event order breaking ties. The result is checked against the source: the Sessions list shows *identical to source ✓* or the first event where the two differ.
 - **Causality.** Every event lists the seqs of the events that caused it, so any output (a TTS chunk, say) can be traced back through the LLM tokens to the ASR result and the audio frames behind it.

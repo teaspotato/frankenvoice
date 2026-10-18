@@ -6,21 +6,25 @@ const W = 150;
 const H = 64;
 
 /**
- * Fixed layout: one column per step, VAD and ASR stacked in the second. The
- * playback feedback runs above the main row, where nothing else is drawn.
+ * Fixed layout: one column per step, VAD and ASR stacked in the third. The
+ * playback feedback runs above the main row and the echo reference below it,
+ * where nothing else is drawn.
  */
 const POS: Record<StageId, [number, number]> = {
   mic: [10, 88],
-  vad: [220, 10],
-  asr: [220, 166],
-  turn: [430, 88],
-  llm: [640, 88],
-  tts: [850, 88],
-  speaker: [1060, 88],
+  cleanup: [210, 88],
+  vad: [410, 10],
+  asr: [410, 166],
+  turn: [610, 88],
+  llm: [810, 88],
+  tts: [1010, 88],
+  speaker: [1210, 88],
 };
-const VIEW_W = 1220;
-const VIEW_H = 240;
+const VIEW_W = 1370;
+const VIEW_H = 272;
 const FEEDBACK_Y = 60;
+/** The echo reference runs under everything, below ASR. */
+const REFERENCE_Y = 250;
 
 function summarize(v: Json): string {
   if (v === null) return '–';
@@ -65,8 +69,9 @@ export function PipelineView({
   const stages = activeStages(config);
   const out: StageId = stages.some((s) => s.id === 'speaker') ? 'speaker' : 'tts';
   const edges: Edge[] = [
-    link(right('mic'), left('vad'), 'audio'),
-    link(right('mic'), left('asr'), 'audio'),
+    link(right('mic'), left('cleanup'), 'audio'),
+    link(right('cleanup'), left('vad'), 'clean'),
+    link(right('cleanup'), left('asr'), 'clean'),
     link(right('vad'), left('turn'), 'speech'),
     link(right('asr'), left('turn'), 'transcript'),
     link(right('turn'), left('llm'), 'turn'),
@@ -83,6 +88,17 @@ export function PipelineView({
     lx: (ox + tx) / 2,
     ly: FEEDBACK_Y - 6,
   });
+
+  if (out === 'speaker' && registry[stageType(config, 'cleanup')].inputs.some((p) => p.name === 'ref')) {
+    const [sx, sy] = [POS.speaker[0] + W / 2, POS.speaker[1] + H];
+    const [cx, cy] = [POS.cleanup[0] + W / 2, POS.cleanup[1] + H];
+    edges.push({
+      d: `M${sx},${sy} L${sx},${REFERENCE_Y - r} Q${sx},${REFERENCE_Y} ${sx - r},${REFERENCE_Y} L${cx + r},${REFERENCE_Y} Q${cx},${REFERENCE_Y} ${cx},${REFERENCE_Y - r} L${cx},${cy + 2}`,
+      label: 'echo reference (what was played)',
+      lx: (sx + cx) / 2,
+      ly: REFERENCE_Y - 6,
+    });
+  }
 
   return (
     <svg className={`pipeline${running ? ' running' : ''}`} viewBox={`0 0 ${VIEW_W} ${VIEW_H}`} preserveAspectRatio="xMidYMid meet" onClick={() => onSelect(null)}>

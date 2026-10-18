@@ -14,6 +14,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.135.0",
     "@ricky0123/vad-web": "^0.0.31",
+    "@shiguredo/rnnoise-wasm": "^2025.1.5",
     "fflate": "^0.8.3",
     "onnxruntime-web": "^1.30.0",
     "react": "^19.3.1",

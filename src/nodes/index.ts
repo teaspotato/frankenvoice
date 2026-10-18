@@ -3,6 +3,7 @@ import type { GraphSpec } from '../core/graph';
 import type { Json } from '../core/types';
 import { GRAPH_FORMAT_VERSION } from '../core/graph';
 import { micNode } from './mic';
+import { aecNode, browserCleanupNode, noCleanupNode, rnnoiseNode } from './cleanup';
 import { energyVadNode, sileroVadNode } from './vad';
 import { asrNode } from './asr';
 import { halfDuplexTurnNode } from './turn';
@@ -13,7 +14,7 @@ import { browserTtsNode } from './browser-tts';
 import { echoLlmNode, toneTtsNode } from './mocks';
 
 export const registry: NodeRegistry = Object.fromEntries(
-  [micNode, sileroVadNode, energyVadNode, asrNode, halfDuplexTurnNode, llmNode, ttsNode, browserTtsNode, speakerNode, echoLlmNode, toneTtsNode].map(
+  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, energyVadNode, asrNode, halfDuplexTurnNode, llmNode, ttsNode, browserTtsNode, speakerNode, echoLlmNode, toneTtsNode].map(
     (d) => [d.type, d],
   ),
 );

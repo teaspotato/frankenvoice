@@ -35,6 +35,16 @@ export interface AudioBlock {
   peaks: Float32Array;
 }
 
+export interface CleanupFrame {
+  t: number;
+  inDb: number;
+  outDb: number;
+  refDb?: number;
+  doubleTalk?: boolean;
+  vad?: number;
+  gated?: boolean;
+}
+
 export interface Marker {
   t: number;
   text: string;
@@ -48,6 +58,10 @@ export class TimelineModel {
   private micRate = 16000;
   private micPeakSamples = 0;
   micPeaks: number[] = [];
+  /** Cleaned audio (what VAD/ASR hear), same sample indexing as the mic. */
+  private cleanPeakSamples = 0;
+  cleanPeaks: number[] = [];
+  cleanup: CleanupFrame[] = [];
   vad: { t: number; p: number }[] = [];
   vadThreshold?: number;
   vadNegThreshold?: number;
@@ -146,6 +160,15 @@ export class TimelineModel {
     if (e.kind !== 'msg') return;
     switch (d.type) {
       case 'audio':
+        if (e.node === 'cleanup' && e.media && e.port === 'audio') {
+          const per = Math.round((this.micRate * PEAK_MS) / 1000);
+          const upTo = Math.floor(e.media.end / per) * per;
+          if (upTo > this.cleanPeakSamples) {
+            const s = this.traj.tracks.readF32Range(e.media.track, this.cleanPeakSamples, upTo);
+            this.cleanPeaks.push(...this.peaks(s, this.micRate));
+            this.cleanPeakSamples = upTo;
+          }
+        }
         if (e.node === 'mic' && e.media) {
           this.micRate = d.sampleRate ?? this.micRate;
           this.micSamples.push(e.media.end);
@@ -159,6 +182,9 @@ export class TimelineModel {
             this.micPeakSamples = upTo;
           }
         }
+        break;
+      case 'cleanup.frame':
+        this.cleanup.push({ t: this.sampleToT(d.end), inDb: d.inDb, outDb: d.outDb, refDb: d.refDb, doubleTalk: d.doubleTalk, vad: d.vad, gated: d.gated });
         break;
       case 'vad.frame':
         this.vad.push({ t: this.sampleToT(d.end), p: d.p });

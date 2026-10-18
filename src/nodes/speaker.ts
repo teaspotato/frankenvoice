@@ -17,7 +17,10 @@ export const speakerNode: NodeDef<Record<string, never>> = {
     { name: 'audio', type: 'audio' },
     { name: 'control', type: 'control' },
   ],
-  outputs: [{ name: 'playback', type: 'playback' }],
+  outputs: [
+    { name: 'playback', type: 'playback' },
+    { name: 'played', type: 'played', description: 'Each chunk of audio with the session time it plays at (echo reference)' },
+  ],
   params: [],
   channels: [{ name: 'speaker', description: 'Scheduled playback through Web Audio', output: true }],
   create(ctx) {
@@ -59,6 +62,7 @@ export const speakerNode: NodeDef<Record<string, never>> = {
             endAt = at;
             ctx.setState('playing', false);
             ctx.emit('playback', { type: 'playback.interrupted', rid, at });
+            ctx.emit('played', { type: 'played.flush', at });
           }
           return;
         }
@@ -76,6 +80,7 @@ export const speakerNode: NodeDef<Record<string, never>> = {
           media: { track: msg.track, start: msg.start, end: msg.end },
           logBin: false,
         });
+        ctx.emit('played', { type: 'audio', track: msg.track, start: msg.start, end: msg.end, sampleRate: msg.sampleRate, samples: msg.samples, at });
         const r = (msg.rid as string) ?? null;
         if (!playing || r !== rid) {
           playing = true;
