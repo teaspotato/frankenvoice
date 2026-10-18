@@ -236,13 +236,14 @@ export class Runtime {
         const setSeq = rt.log(id, 'timer.set', { data: { id: timerId, delay: delayMs, ...(label ? { label } : {}) } });
         let done = false;
         const fireAt = rt.opts.world.timerFireAt(timerId, rt.t, delayMs);
-        const cancel = rt.opts.scheduler.at(fireAt, () =>
+        const cancel = rt.opts.scheduler.at(fireAt.t, () =>
           rt.turn(() => {
             if (done || !rt.running) return;
             done = true;
             rt.cause = rt.log(id, 'timer.fire', { data: { id: timerId }, cause: [setSeq] });
             rt.guard(slot, fn);
           }),
+          fireAt.order,
         );
         return {
           clear() {

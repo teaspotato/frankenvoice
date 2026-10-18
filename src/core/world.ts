@@ -45,8 +45,11 @@ export interface Divergence {
 
 export interface World {
   open(ex: Exchange, sink: Delivery): Conn;
-  /** Session time at which a timer set at `tSet` actually fires. */
-  timerFireAt(timerId: string, tSet: number, delay: number): number;
+  /**
+   * When a timer set at `tSet` actually fires. `order` (the recorded seq, in
+   * replay) breaks ties with other events due at the same instant.
+   */
+  timerFireAt(timerId: string, tSet: number, delay: number): { t: number; order?: number };
   /** Report replay divergences into the log. Set by the runtime. */
   onDiverge?: (d: Divergence) => void;
   channelModes(): Record<string, 'live' | 'replay'>;
@@ -75,8 +78,8 @@ export class LiveWorld implements World {
     }
   }
 
-  timerFireAt(_id: string, tSet: number, delay: number): number {
-    return tSet + delay;
+  timerFireAt(_id: string, tSet: number, delay: number): { t: number } {
+    return { t: tSet + delay };
   }
 
   channelModes(): Record<string, 'live' | 'replay'> {
@@ -105,7 +108,7 @@ export interface ReplayOptions {
 export class ReplayWorld implements World {
   onDiverge?: (d: Divergence) => void;
   private exchanges = new Map<string, RecordedExchange>();
-  private timers = new Map<string, { set: number; fire: number }>();
+  private timers = new Map<string, { set: number; fire: number; seq: number }>();
   private live: LiveWorld;
 
   constructor(
@@ -121,7 +124,7 @@ export class ReplayWorld implements World {
       else if (ev.kind === 'io.recv' && d?.xid) this.exchanges.get(d.xid)?.incoming.push(ev);
       else if (ev.kind === 'io.close' && d?.xid && d.by === 'remote') this.exchanges.get(d.xid)?.incoming.push(ev);
       else if (ev.kind === 'timer.set' && d?.id) timerSet.set(d.id, ev.t);
-      else if (ev.kind === 'timer.fire' && d?.id && timerSet.has(d.id)) this.timers.set(d.id, { set: timerSet.get(d.id)!, fire: ev.t });
+      else if (ev.kind === 'timer.fire' && d?.id && timerSet.has(d.id)) this.timers.set(d.id, { set: timerSet.get(d.id)!, fire: ev.t, seq: ev.seq });
     }
   }
 
@@ -165,10 +168,10 @@ export class ReplayWorld implements World {
     };
   }
 
-  timerFireAt(timerId: string, tSet: number, delay: number): number {
+  timerFireAt(timerId: string, tSet: number, delay: number): { t: number; order?: number } {
     const rec = this.timers.get(timerId);
-    if (!rec) return tSet + delay;
-    return shift(rec.fire, rec.set, tSet);
+    if (!rec) return { t: tSet + delay };
+    return { t: shift(rec.fire, rec.set, tSet), order: rec.seq };
   }
 
   channelModes(): Record<string, 'live' | 'replay'> {

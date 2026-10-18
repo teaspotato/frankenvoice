@@ -17,8 +17,8 @@ function testGraph(): GraphSpec {
   return g;
 }
 
-async function recordLive(ms: number): Promise<Trajectory> {
-  const scheduler = new LiveScheduler();
+async function recordLive(ms: number, perf: { now(): number } = performance): Promise<Trajectory> {
+  const scheduler = new LiveScheduler(perf);
   const rt = new Runtime({ graph: testGraph(), registry, scheduler, world: new LiveWorld(fakeDrivers, scheduler), mode: 'live' });
   rt.start();
   await new Promise((r) => setTimeout(r, ms));
@@ -78,6 +78,16 @@ describe('record and replay', () => {
     const asr = (t: Trajectory) => t.events.filter((e) => e.node === 'asr').map((e) => [e.t, e.kind, e.data]);
     expect(asr(runtime.trajectory)).toEqual(asr(live));
   });
+
+  it('replays identically when a coarse clock makes many events share a timestamp', async () => {
+    // Browsers quantize performance.now() (Firefox to 1 ms); ties must replay in their original order.
+    const coarse = await recordLive(800, { now: () => Math.floor(performance.now() / 2) * 2 });
+    const times = coarse.events.map((e) => e.t);
+    expect(new Set(times).size).toBeLessThan(times.length / 2);
+    const { runtime, sim } = prepareReplay(coarse, { registry });
+    sim.runFast();
+    expect(runtime.trajectory.events).toEqual(coarse.events);
+  }, 10_000);
 
   it('links every derived event to a cause', () => {
     const roots = ['session.start', 'session.stop', 'node.start', 'node.stop'];

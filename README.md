@@ -1,0 +1,84 @@
+# Frankenvoice
+
+A research playground for full-duplex voice agents built by wiring existing components together instead of training a model. You arrange nodes (microphone, VAD, streaming ASR, turn-taking, LLM, TTS, speaker) in a browser node editor, talk to the result live, and every session is recorded so it can be replayed exactly.
+
+## Quick start
+
+```bash
+npm install
+cp .env.example .env   # add ANTHROPIC_API_KEY, DEEPGRAM_API_KEY, CARTESIA_API_KEY
+npm run dev            # local proxy on :8787 + Vite on :5173
+```
+
+Open http://localhost:5173 and press **Run live**. Allow microphone access. Press **Stop** to finish. The session is saved to `./sessions/<id>.fvs` and appears in the Sessions list, where **Replay** runs it again.
+
+The pipeline runs in the browser. The small proxy in `server/` keeps API keys out of the page, avoids CORS, and stores session bundles. It forwards requests and streams responses unchanged, so the browser records exactly what each provider sent.
+
+## Default pipeline
+
+```
+mic ─┬─> vad (Silero, in-browser) ──> turn ─> llm (Claude) ─> tts (Cartesia) ─> speaker
+     └─> asr (Deepgram, streaming) ──┘  ^                                         │
+                                        └───────────── playback ──────────────────┘
+```
+
+This first stage is half-duplex. The turn node commits a user turn on ASR endpointing and ignores user speech while the agent is talking. Barge-in and backchannels come next (see Roadmap).
+
+`llm.echo` and `tts.tone` are mock nodes for wiring and testing pipelines without API keys.
+
+## Time, logging and replay
+
+The core rule is that **everything is replayable as-is**: ASR partials, LLM tokens and TTS audio come back exactly as they first arrived, at the same moments.
+
+How the runtime ensures that:
+
+- **One session clock.** Every event has `t`, its arrival time in ms on a monotonic session clock. Events about audio also carry `media: {track, start, end}`, a sample range on a recorded media track. So each event records both *when* it happened and *which audio* it refers to. The mic driver also logs the AudioContext time of every captured frame.
+- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `silero`, `deepgram`, `anthropic`, `cartesia`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
+- **Deterministic turns.** When an external event arrives, the runtime stamps it with the current time, hands it to its node, and drains every resulting message synchronously, all at that timestamp. Nodes are pure functions of what they receive, so the same external events at the same times always produce the same log.
+- **Replay on a virtual clock.** A replay serves every recorded exchange and timer from the trajectory at its original time, with the original event order breaking ties. The result is checked against the source: the Sessions list shows *identical to source ✓* or the first event where the two differ.
+- **Causality.** Every event lists the seqs of the events that caused it, so any output (a TTS chunk, say) can be traced back through the LLM tokens to the ASR result and the audio frames behind it.
+
+Replay options:
+
+- **real time / audible** paces the virtual clock against the wall clock and plays the agent audio again.
+- **replay with current graph** runs your edited graph against the recorded world. Upstream nodes reproduce exactly; any exchange whose request differs from the recording is flagged as an `io.diverge` event.
+- **live channels** (for example `anthropic`) serves those channels live during replay, so the same recorded user audio can be run against a new LLM or TTS.
+
+### Session bundle format (`.fvs`, a zip)
+
+| file | contents |
+| --- | --- |
+| `meta.json` | session id, mode, `replayOf`, the full graph and its hash, channel modes, track table |
+| `events.jsonl` | one event per line: `{seq, t, node, kind, port?, data?, media?, bin?, cause?}` |
+| `tracks/NNN.bin` | raw track bytes: float32 LE PCM for media tracks (`mic.audio`, `tts.audio`), payload bytes for IO tracks (`io/<node>/<channel>`) |
+
+Event kinds: `session.*`, `node.*`, `msg` (a node emitted on a port), `state` (internal state change), `log`, `timer.*`, `io.open|send|recv|close|diverge`.
+
+## Writing a node
+
+A node is a `NodeDef` (see `src/nodes/*.ts`): ports, params, the IO channels it uses, and `create(ctx)`, which returns `{start, onInput, stop}`. Rules that keep replay exact:
+
+1. Touch the outside world only through `ctx.io.open(channel, request, handlers)`. Put everything that determines the response into `request`, since it is recorded and compared on replay.
+2. Delay work only with `ctx.setTimer`, and read time only with `ctx.now()`.
+3. Keep all state inside the node and expose what matters with `ctx.setState` so it lands in the log.
+4. Append produced audio with `ctx.media.append` and emit `{type: 'audio', ...ref, samples}`.
+
+The browser side of a channel is a `LiveDriver` in `src/drivers/index.ts`.
+
+## Layout
+
+```
+src/core/     runtime, scheduler (live + virtual clock), world (live/replay IO), trajectory, bundle, compare
+src/nodes/    node definitions and the default graph
+src/drivers/  browser drivers: mic worklet, Silero (onnxruntime-web), Deepgram WS, Claude SDK, Cartesia, Web Audio
+src/ui/       React Flow editor, inspector, sessions, event log
+server/       local proxy and session storage
+tests/        replay determinism tests with randomized fake drivers
+```
+
+## Roadmap
+
+1. ~~Runtime with trajectory logging, graph editor, basic voice loop~~
+2. Full-duplex floor control: barge-in, with history cut back to what was heard; backchannels; every decision logged with its reason
+3. Tool calls mid-conversation, with filler speech and interruptible calls
+4. Trajectory viewer: waveforms plus per-node timeline, scrubbing, per-node latency, run-vs-run comparison
