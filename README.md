@@ -11,7 +11,7 @@ pnpm dev               # local proxy on :8787 + Vite on :5173
 
 Open **Settings** in the toolbar to enter API keys and base URLs. The proxy saves them to `.frankenvoice/settings.json` (git-ignored, readable only by you); the page never gets a key back, only whether it is set. A `.env` file (see `.env.example`) still works, and values set in Settings override it. The proxy port (`FV_PROXY_PORT`) is the one thing that has to come from the environment, since the page needs it to reach the proxy.
 
-Open http://localhost:5173 and press **Run live**. Allow microphone access. Press **Stop** to finish. The session is saved to `./sessions/<id>.fvs` and appears in the Sessions list, where **Replay** runs it again.
+Open http://localhost:5173 and press **Run live**. Allow microphone access. Press **Stop** to finish. The session is saved to `./sessions/<id>.fvs` (uncheck **autosave live sessions** to keep sessions only in the tab) and appears in the Sessions list, where **Replay** runs it again.
 
 ## The UI
 
@@ -25,7 +25,7 @@ Open http://localhost:5173 and press **Run live**. Allow microphone access. Pres
   - Scroll to zoom, drag to pan, double-click or **Fit** for the whole session, **Follow** to track the live edge. Hover for details; click a lane to select its stage. Errors show as red dots on their stage's lane.
 - **Stage panel** (right): pick a stage's implementation (for example Silero or energy VAD, API or browser TTS) and edit its params. Saved in the browser; **Save config** / **Open…** move it as a file, and **Use its config** on a session restores what that session ran with.
 - **Event log** (bottom): every recorded event, filterable.
-- **Sessions** (right): **New session** clears the dashboard; **Delete** removes a session from the list and, for a recorded session, its file in `./sessions`.
+- **Sessions** (right): **New session** clears the dashboard; click a session's name to rename it (a saved session's file is renamed too); **Save** writes an unsaved live session to `./sessions` when autosave is off; **Delete** removes a session from the list and, for a recorded session, its file in `./sessions`.
 
 The pipeline runs in the browser. The small proxy in `server/` keeps API keys out of the page, avoids CORS, and stores settings and session bundles. It only answers requests from the local UI: other websites (by `Origin`) and DNS-rebinding hosts (by `Host`) get 403. It forwards requests and streams responses unchanged, so the browser records exactly what each provider sent.
 

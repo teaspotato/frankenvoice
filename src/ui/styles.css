@@ -67,11 +67,16 @@ fieldset.params:disabled { opacity: 0.55; }
 .param span { color: var(--muted); font-size: 12px; }
 .param input[type='checkbox'] { justify-self: start; }
 pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; border-radius: 4px; overflow: auto; max-height: 200px; }
+.autosave { display: block; margin-bottom: 8px; }
 .replay-opts { display: grid; gap: 4px; margin-bottom: 8px; }
 .replay-opts input:not([type]) { width: 100%; }
 .sessions { list-style: none; padding: 0; margin: 0; }
 .sessions li { border: 1px solid var(--border); border-radius: 6px; padding: 6px; margin-bottom: 6px; display: grid; gap: 4px; }
+.sessions li { cursor: pointer; }
 .sessions li.current { border-color: var(--accent); }
+.session-head { display: flex; align-items: center; gap: 6px; }
+.session-head .session-name { flex: 1; min-width: 0; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-head button.session-name:hover { text-decoration: underline dotted; cursor: text; }
 .sessions li small { color: var(--muted); }
 .sessions li span { display: flex; gap: 4px; flex-wrap: wrap; }
 

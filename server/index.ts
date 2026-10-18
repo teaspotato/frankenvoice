@@ -4,7 +4,7 @@
 // session bundles and the settings edited in the web UI (keys, base URLs).
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { dirname, join, resolve } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -192,7 +192,8 @@ function sendableCode(code: number): number {
   return code;
 }
 
-const SAFE_ID = /^[\w.-]+$/;
+/** Session ids are file names: no path separators or reserved characters, no leading dot. */
+const SAFE_ID = /^[^/\\:*?"<>|\x00-\x1f.\s][^/\\:*?"<>|\x00-\x1f]{0,99}$/u;
 
 async function sessions(req: IncomingMessage, res: ServerResponse, id: string | undefined) {
   const SESSIONS_DIR = sessionsDir();
@@ -211,6 +212,14 @@ async function sessions(req: IncomingMessage, res: ServerResponse, id: string | 
   if (req.method === 'GET') {
     res.writeHead(200, { 'content-type': 'application/zip' });
     return res.end(await readFile(file));
+  }
+  if (req.method === 'PATCH') {
+    const to = String((JSON.parse((await readBody(req)).toString('utf8') || '{}') as { id?: unknown }).id ?? '').trim();
+    if (!SAFE_ID.test(to)) return json(res, 400, { error: 'bad session name' });
+    const dest = join(SESSIONS_DIR, `${to}.fvs`);
+    if (to !== id && (await stat(dest).catch(() => null))) return json(res, 409, { error: `a session named ${to} already exists` });
+    await rename(file, dest);
+    return json(res, 200, { ok: true, path: dest });
   }
   if (req.method === 'DELETE') {
     await rm(file, { force: true });

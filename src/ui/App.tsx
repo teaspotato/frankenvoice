@@ -29,6 +29,7 @@ import { Dashboard } from './Dashboard';
 import { EventLog } from './EventLog';
 
 const CONFIG_KEY = 'frankenvoice.pipeline';
+const AUTOSAVE_KEY = 'frankenvoice.autosave';
 
 function loadConfig(): PipelineConfig {
   try {
@@ -80,8 +81,19 @@ export function App() {
   const [health, setHealth] = useState<Record<string, boolean> | null>(null);
   const [replayOpts, setReplayOpts] = useState({ audible: true, realtime: true, useCurrentConfig: false, liveChannels: '' });
   const [notice, setNotice] = useState('');
+  /** The session whose name is being edited: a Session, or the id of one only on disk. */
+  const [renaming, setRenaming] = useState<Session | string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [serverSessions, setServerSessions] = useState<string[]>([]);
+  const [autosave, setAutosave] = useState(() => {
+    try {
+      return localStorage.getItem(AUTOSAVE_KEY) !== 'off';
+    } catch {
+      return true;
+    }
+  });
+  // Read when a run finishes, so toggling mid-run applies to that run.
+  const autosaveRef = useRef(autosave);
   const runtimeRef = useRef<Runtime | null>(null);
   const schedRef = useRef<Scheduler | null>(null);
   const simRef = useRef<SimScheduler | null>(null);
@@ -93,6 +105,15 @@ export function App() {
       /* storage unavailable */
     }
   }, [config]);
+
+  useEffect(() => {
+    autosaveRef.current = autosave;
+    try {
+      localStorage.setItem(AUTOSAVE_KEY, autosave ? 'on' : 'off');
+    } catch {
+      /* storage unavailable */
+    }
+  }, [autosave]);
 
   const refreshProxy = useCallback(() => {
     fetch('/api/health')
@@ -133,17 +154,19 @@ export function App() {
     setSessions((ss) => [s, ...ss]);
     setCurrent(s);
     setRunning(null);
-    if (rt.trajectory.meta.mode === 'live') {
-      try {
-        const res = await fetch(`/api/sessions/${rt.trajectory.meta.id}`, { method: 'PUT', body: encodeBundle(rt.trajectory) as BodyInit });
-        if (res.ok) {
-          s.saved = ((await res.json()) as { path: string }).path;
-          setServerSessions((l) => [rt.trajectory.meta.id, ...l]);
-          setSessions((ss) => [...ss]);
-        }
-      } catch {
-        /* proxy not running: the session stays in memory and can be exported */
-      }
+    if (rt.trajectory.meta.mode === 'live' && autosaveRef.current) await saveSession(s);
+  };
+
+  const saveSession = async (s: Session) => {
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(s.traj.meta.id)}`, { method: 'PUT', body: encodeBundle(s.traj) as BodyInit });
+      if (!res.ok) throw new Error(`save failed: ${res.status}`);
+      s.saved = ((await res.json()) as { path: string }).path;
+      setServerSessions((l) => [s.traj.meta.id, ...l.filter((id) => id !== s.traj.meta.id)]);
+      setSessions((ss) => [...ss]);
+    } catch (e) {
+      /* proxy not running: the session stays in memory and can be exported */
+      setNotice(`Session not saved (${String(e)}). It stays in this tab and can be exported.`);
     }
   };
 
@@ -223,12 +246,60 @@ export function App() {
   };
 
   const loadServerSession = async (id: string) => {
-    const res = await fetch(`/api/sessions/${id}`);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
     const traj = decodeBundle(new Uint8Array(await res.arrayBuffer()));
+    // The file name is the session's name; it changes when the session is renamed.
+    traj.meta.id = id;
     const s = { traj, saved: id };
     setSessions((ss) => [s, ...ss.filter((x) => x.traj.meta.id !== id || x.traj.meta.mode !== traj.meta.mode)]);
     setCurrent(s);
   };
+
+  /** Rename a session; a saved one has its file renamed too. */
+  const renameSession = async (from: string, raw: string, s?: Session) => {
+    setRenaming(null);
+    const to = raw.trim();
+    if (!to || to === from) return;
+    if (s?.saved || (!s && serverSessions.includes(from))) {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(from)}`, { method: 'PATCH', body: JSON.stringify({ id: to }) }).catch(() => null);
+      if (!res?.ok) return setNotice(`could not rename ${from}: ${res ? ((await res.json()) as { error: string }).error : 'proxy not running'}`);
+      if (s) s.saved = ((await res.json()) as { path: string }).path;
+      setServerSessions((l) => l.map((x) => (x === from ? to : x)));
+    } else if (sessions.some((x) => x !== s && x.traj.meta.id === to) || serverSessions.includes(to)) {
+      return setNotice(`a session named ${to} already exists`);
+    }
+    if (s) s.traj.meta.id = to;
+    setNotice('');
+    setSessions((ss) => [...ss]);
+  };
+
+  const nameField = (id: string, s?: Session) =>
+    renaming === (s ?? id) ? (
+      <input
+        className="session-name"
+        autoFocus
+        defaultValue={id}
+        maxLength={100}
+        onFocus={(e) => e.target.select()}
+        onBlur={(e) => renameSession(id, e.target.value, s)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') e.currentTarget.blur();
+          if (e.key === 'Escape') setRenaming(null);
+        }}
+      />
+    ) : (
+      <button
+        className="link session-name"
+        title="Click to rename"
+        disabled={!!running && current === s}
+        onClick={() => {
+          if (s) setCurrent(s);
+          setRenaming(s ?? id);
+        }}
+      >
+        {id}
+      </button>
+    );
 
   const importFile = async (f: File) => {
     try {
@@ -318,6 +389,9 @@ export function App() {
         )}
 
         <h3>Sessions</h3>
+        <label className="autosave" title="Save each live session to the proxy's sessions folder when it stops">
+          <input type="checkbox" checked={autosave} onChange={(e) => setAutosave(e.target.checked)} /> autosave live sessions
+        </label>
         <div className="replay-opts">
           <label>
             <input type="checkbox" checked={replayOpts.realtime} onChange={(e) => setReplayOpts({ ...replayOpts, realtime: e.target.checked })} /> real time
@@ -345,11 +419,16 @@ export function App() {
         {notice && <p className="warn">{notice}</p>}
         <ul className="sessions">
           {sessions.map((s, i) => (
-            <li key={`${s.traj.meta.id}-${i}`} className={current === s ? 'current' : ''}>
-              <button className="link" onClick={() => setCurrent(s)}>
-                {s.traj.meta.mode === 'replay' ? '↻ ' : '● '}
-                {s.traj.meta.id}
-              </button>
+            <li
+              key={i}
+              className={current === s ? 'current' : ''}
+              // Clicking the row (not one of its buttons) selects the session; the name renames it.
+              onClick={(e) => !(e.target as HTMLElement).closest('button, input') && setCurrent(s)}
+            >
+              <div className="session-head">
+                {s.traj.meta.mode === 'replay' ? '↻' : '●'}
+                {nameField(s.traj.meta.id, s)}
+              </div>
               <small>
                 {(s.traj.duration / 1000).toFixed(1)} s · {s.traj.events.length} events
                 {s.comparison && ` · ${describeComparison(s)}`}
@@ -359,6 +438,11 @@ export function App() {
                 <button disabled={!!running} onClick={() => replay(s.traj)}>
                   Replay
                 </button>
+                {!s.saved && s.traj.meta.mode === 'live' && (
+                  <button onClick={() => saveSession(s)} title="Save to the proxy's sessions folder">
+                    Save
+                  </button>
+                )}
                 <button onClick={() => download(`${s.traj.meta.id}.fvs`, encodeBundle(s.traj) as BlobPart, 'application/zip')}>Export</button>
                 <button disabled={!!running} onClick={() => setConfig(configFromGraph(s.traj.meta.graph))} title="Set every stage to what this session ran with">
                   Use its config
@@ -373,11 +457,10 @@ export function App() {
             .filter((id) => !sessions.some((s) => s.traj.meta.id === id))
             .map((id) => (
               <li key={id}>
-                <button className="link" onClick={() => loadServerSession(id)}>
-                  ⤓ {id}
-                </button>
+                <div className="session-head">⤓{nameField(id)}</div>
                 <small>on disk</small>
                 <span>
+                  <button onClick={() => loadServerSession(id)}>Load</button>
                   <button className="danger-link" onClick={() => deleteSession(id)}>
                     Delete
                   </button>
