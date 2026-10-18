@@ -32,13 +32,17 @@ ASR, LLM and TTS are each one node with a **Provider** param, so swapping provid
 | `llm` | `anthropic` | `ANTHROPIC_API_KEY` |
 | | `openai-compatible`, endpoint `openrouter` / `openai` / `custom` | `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `OPENAI_COMPAT_BASE_URL` (+ optional key) |
 | `tts` | `cartesia` | `CARTESIA_API_KEY` |
+| | `deepgram` (Aura, `/v1/speak`, 16-bit PCM; default voice `aura-2-thalia-en`) | `DEEPGRAM_API_KEY` |
 | | `openai-compatible` (`/audio/speech`, PCM), endpoint `openai` / `custom` | as above |
+| `tts.browser` | the browser's built-in `speechSynthesis` | none |
 
 For OpenRouter, set the LLM node to `openai-compatible`, endpoint `openrouter`, and a model slug. The toolbar shows which keys the current graph still needs.
 
 Each provider is a small pure adapter (`src/nodes/{asr,llm,tts}/`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`src/drivers/index.ts`). Recordings keep the provider's raw payloads, so replay feeds the same bytes through the same adapter. Adding a provider means one adapter, plus a driver and proxy route if it speaks a new protocol.
 
 This first stage is half-duplex. The turn node commits a user turn on ASR endpointing and ignores user speech while the agent is talking. Barge-in and backchannels come next (see Roadmap).
+
+`tts.browser` replaces both `tts` and `speaker`: wire `llm.text` into it and its `playback` into the turn node. The browser plays the audio itself, so no samples are recorded. What is recorded is when each sentence started, each word boundary the browser reported, and when it ended, so replay reproduces the playback timing and audible replay speaks the text again. Voices differ between browsers and machines, and headless browsers usually have none.
 
 `llm.echo` and `tts.tone` are mock nodes for wiring and testing pipelines without API keys.
 
@@ -49,14 +53,14 @@ The core rule is that **everything is replayable as-is**: ASR partials, LLM toke
 How the runtime ensures that:
 
 - **One session clock.** Every event has `t`, its arrival time in ms on a monotonic session clock. Events about audio also carry `media: {track, start, end}`, a sample range on a recorded media track. So each event records both *when* it happened and *which audio* it refers to. The mic driver also logs the AudioContext time of every captured frame.
-- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `silero`, `deepgram`, `anthropic`, `openai`, `cartesia`, `openai-tts`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
+- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `silero`, `deepgram`, `anthropic`, `openai`, `cartesia`, `openai-tts`, `deepgram-tts`, `speech-synthesis`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
 - **Deterministic turns.** When an external event arrives, the runtime stamps it with the current time, hands it to its node, and drains every resulting message synchronously, all at that timestamp. Nodes are pure functions of what they receive, so the same external events at the same times always produce the same log.
 - **Replay on a virtual clock.** A replay serves every recorded exchange and timer from the trajectory at its original time, with the original event order breaking ties. The result is checked against the source: the Sessions list shows *identical to source ✓* or the first event where the two differ.
 - **Causality.** Every event lists the seqs of the events that caused it, so any output (a TTS chunk, say) can be traced back through the LLM tokens to the ASR result and the audio frames behind it.
 
 Replay options:
 
-- **real time / audible** paces the virtual clock against the wall clock and plays the agent audio again.
+- **real time / audible** paces the virtual clock against the wall clock and plays the agent audio again (output channels such as `speaker` and `speech-synthesis` run live as monitors).
 - **replay with current graph** runs your edited graph against the recorded world. Upstream nodes reproduce exactly; any exchange whose request differs from the recording is flagged as an `io.diverge` event.
 - **live channels** (for example `anthropic`) serves those channels live during replay, so the same recorded user audio can be run against a new LLM or TTS.
 

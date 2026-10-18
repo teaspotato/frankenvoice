@@ -57,3 +57,21 @@ export const openaiTtsAdapter: TtsAdapter = {
   },
   format: () => ({ encoding: 's16le', sampleRate: 24000 }),
 };
+
+/** Deepgram Aura POST /v1/speak, raw 16-bit PCM (container=none). */
+export const deepgramTtsAdapter: TtsAdapter = {
+  provider: 'deepgram',
+  channel: 'deepgram-tts',
+  params: [
+    { key: 'model', label: 'Voice model', type: 'string', default: 'aura-2-thalia-en' },
+    { key: 'sampleRate', label: 'Sample rate', type: 'number', default: 24000 },
+  ],
+  buildRequest(text, p) {
+    return {
+      path: '/v1/speak',
+      query: { model: p.model, encoding: 'linear16', sample_rate: p.sampleRate, container: 'none' },
+      body: { text },
+    };
+  },
+  format: (p) => ({ encoding: 's16le', sampleRate: p.sampleRate as number }),
+};

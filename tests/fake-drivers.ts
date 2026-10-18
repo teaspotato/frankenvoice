@@ -135,9 +135,46 @@ const cartesia: LiveDriver = (req, sink) => {
   return { send() {}, close: () => void (closed = true) };
 };
 
+/** Deepgram Aura: 16-bit PCM, streamed in chunks that split samples. */
+const deepgramTts: LiveDriver = (req, sink) => {
+  const { body, query } = req as { body: { text: string }; query: { sample_rate: number } };
+  const n = Math.round(body.text.length * 0.004 * query.sample_rate);
+  const pcm = new Int16Array(n).map((_, i) => Math.round(Math.sin(i / 10) * 3000));
+  const bytes = new Uint8Array(pcm.buffer);
+  let closed = false;
+  let off = 0;
+  let t = jitter(2, 4);
+  while (off < bytes.length) {
+    const len = Math.min(bytes.length - off, 1 + Math.floor(Math.random() * 3000));
+    const chunk = bytes.slice(off, off + len);
+    off += len;
+    t += jitter(0.2, 1);
+    later(t, () => !closed && sink.recv(null, chunk));
+  }
+  later(t + 0.5, () => !closed && sink.close());
+  return { send() {}, close: () => void (closed = true) };
+};
+
+/** Mimics speechSynthesis: start, a boundary per word, end (fast, jittered). */
+const speechSynthesis: LiveDriver = (req, sink) => {
+  const { text } = req as { text: string };
+  let closed = false;
+  let t = jitter(2, 4);
+  later(t, () => !closed && sink.recv({ type: 'start', voice: 'fake' }));
+  let charIndex = 0;
+  for (const word of text.split(' ')) {
+    const at = charIndex;
+    later(t + jitter(0.5, 1), () => !closed && sink.recv({ type: 'boundary', name: 'word', charIndex: at }));
+    charIndex += word.length + 1;
+    t += jitter(1, 2);
+  }
+  later(t + 1, () => !closed && sink.close());
+  return { send() {}, close: () => void (closed = true) };
+};
+
 const speaker: LiveDriver = (_req, sink) => {
   later(1, () => sink.recv({ type: 'ready', outputLatency: 0.02 }));
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, speaker };
+export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, speaker };

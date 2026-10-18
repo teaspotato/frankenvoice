@@ -2,11 +2,12 @@ import type { NodeContext, NodeDef } from '../../core/node';
 import type { JsonObject, Msg } from '../../core/types';
 import { SentenceSplitter } from '../segment';
 import { paramsFor, providerParams } from '../providers';
-import { cartesiaAdapter, openaiTtsAdapter } from './adapters';
+import { cartesiaAdapter, deepgramTtsAdapter, openaiTtsAdapter } from './adapters';
 import type { TtsAdapter } from './types';
 
 export const ttsAdapters: Record<string, TtsAdapter> = {
   [cartesiaAdapter.provider]: cartesiaAdapter,
+  [deepgramTtsAdapter.provider]: deepgramTtsAdapter,
   [openaiTtsAdapter.provider]: openaiTtsAdapter,
 };
 
@@ -30,7 +31,7 @@ export const ttsNode: NodeDef = {
   type: 'tts',
   title: 'TTS',
   category: 'tts',
-  description: 'Sentence-level streaming text-to-speech. Providers: Cartesia, OpenAI-compatible /audio/speech.',
+  description: 'Sentence-level streaming text-to-speech. Providers: Cartesia, Deepgram Aura, OpenAI-compatible /audio/speech.',
   inputs: [
     { name: 'text', type: 'text' },
     { name: 'control', type: 'control' },

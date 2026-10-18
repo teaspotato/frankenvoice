@@ -197,10 +197,15 @@ const openai: LiveDriver = (req, sink) => {
 };
 
 /** POST a JSON request and stream the raw response bytes back (TTS providers). */
+type RawRequest = { endpoint?: string; path: string; query?: Record<string, Json>; body: Json };
+
+const withQuery = (url: string, query?: Record<string, Json>) =>
+  query ? `${url}?${new URLSearchParams(Object.entries(query).map(([k, v]) => [k, String(v)]))}` : url;
+
 const rawBytes =
-  (url: (r: { endpoint?: string; path: string }) => string): LiveDriver =>
+  (url: (r: RawRequest) => string): LiveDriver =>
   (req, sink) => {
-    const r = req as { endpoint?: string; path: string; body: Json };
+    const r = req as RawRequest;
     const ac = new AbortController();
     (async () => {
       const res = await postJson(url(r), r.body, ac.signal);
@@ -218,6 +223,45 @@ const rawBytes =
 
 const cartesia = rawBytes((r) => `/api/cartesia${r.path}`);
 const openaiTts = rawBytes((r) => `/api/openai/${encodeURIComponent(r.endpoint ?? '')}${r.path}`);
+const deepgramTts = rawBytes((r) => withQuery(`/api/deepgram${r.path}`, r.query));
+
+/** Built-in speechSynthesis, one utterance per exchange. Closing the exchange cancels speech. */
+const liveUtterances = new Set<SpeechSynthesisUtterance>(); // Chrome drops events of utterances that get garbage collected
+const speechSynthesisDriver: LiveDriver = (req, sink) => {
+  const r = req as { text: string; voice: string; lang: string; rate: number; pitch: number };
+  if (typeof speechSynthesis === 'undefined') {
+    setTimeout(() => sink.close({ error: { message: 'speechSynthesis is not available in this browser' } }), 0);
+    return { send() {}, close() {} };
+  }
+  const u = new SpeechSynthesisUtterance(r.text);
+  const voice = r.voice ? speechSynthesis.getVoices().find((v) => v.name === r.voice || v.voiceURI === r.voice) : undefined;
+  if (voice) u.voice = voice;
+  u.lang = voice?.lang ?? r.lang;
+  u.rate = r.rate;
+  u.pitch = r.pitch;
+  let done = false;
+  const finish = (data: Json) => {
+    if (done) return;
+    done = true;
+    liveUtterances.delete(u);
+    sink.close(data);
+  };
+  u.onstart = () => !done && sink.recv({ type: 'start', voice: u.voice?.name ?? null });
+  u.onboundary = (e) => !done && sink.recv({ type: 'boundary', name: e.name, charIndex: e.charIndex, charLength: e.charLength ?? null, elapsedTime: e.elapsedTime });
+  u.onend = () => finish(null);
+  u.onerror = (e) => finish(e.error === 'interrupted' || e.error === 'canceled' ? { status: e.error } : { error: { message: e.error } });
+  liveUtterances.add(u);
+  speechSynthesis.speak(u);
+  return {
+    send() {},
+    close() {
+      if (done) return;
+      done = true;
+      liveUtterances.delete(u);
+      speechSynthesis.cancel();
+    },
+  };
+};
 
 const speaker: LiveDriver = (_req, sink, env) => {
   const ctx = new AudioContext({ latencyHint: 'interactive' });
@@ -249,4 +293,4 @@ const speaker: LiveDriver = (_req, sink, env) => {
   };
 };
 
-export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, speaker };
+export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesisDriver, speaker };

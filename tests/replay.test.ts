@@ -109,4 +109,36 @@ describe('record and replay', () => {
     sim.runFast();
     expect(runtime.trajectory.events).toEqual(run.events);
   }, 10_000);
+
+  it('swaps TTS to Deepgram Aura (16-bit PCM) and replays it exactly', async () => {
+    const g = testGraph();
+    g.nodes.find((n) => n.id === 'tts')!.params = { provider: 'deepgram' };
+    const run = await recordLive(800, performance, g);
+    const opened = run.events.find((e) => e.kind === 'io.open' && e.node === 'tts')!;
+    expect(opened.data).toMatchObject({ channel: 'deepgram-tts', request: { path: '/v1/speak', query: { model: 'aura-2-thalia-en', encoding: 'linear16' } } });
+    expect(run.events.some((e) => e.kind === 'msg' && e.node === 'tts' && (e.data as { type: string }).type === 'audio')).toBe(true);
+    expect(run.events.filter((e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toEqual([]);
+    const { runtime, sim } = prepareReplay(run, { registry });
+    sim.runFast();
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 10_000);
+
+  it('runs the browser speech-synthesis node in place of tts + speaker, and replays it exactly', async () => {
+    const g = testGraph();
+    g.nodes = g.nodes.filter((n) => n.id !== 'tts' && n.id !== 'speaker');
+    g.edges = g.edges.filter((e) => !['tts', 'speaker'].includes(e.from.node) && !['tts', 'speaker'].includes(e.to.node));
+    g.nodes.push({ id: 'say', type: 'tts.browser', params: {} });
+    g.edges.push({ from: { node: 'llm', port: 'text' }, to: { node: 'say', port: 'text' } });
+    g.edges.push({ from: { node: 'say', port: 'playback' }, to: { node: 'turn', port: 'playback' } });
+    const run = await recordLive(1500, performance, g);
+    const playback = run.events.filter((e) => e.kind === 'msg' && e.node === 'say').map((e) => (e.data as { type: string }).type);
+    expect(playback).toContain('playback.start');
+    expect(playback).toContain('playback.boundary');
+    expect(playback).toContain('playback.end');
+    // The turn node gets the floor back when speech ends.
+    expect(run.events.some((e) => e.node === 'turn' && e.kind === 'log' && JSON.stringify(e.data).includes('playback ended'))).toBe(true);
+    const { runtime, sim } = prepareReplay(run, { registry });
+    sim.runFast();
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 10_000);
 });

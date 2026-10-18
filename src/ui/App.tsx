@@ -243,6 +243,7 @@ export function App() {
   };
 
   const replay = async (source: Trajectory) => {
+    const outputChannels = Object.values(registry).flatMap((d) => (d.channels ?? []).filter((c) => c.output).map((c) => c.name));
     const liveChannels = replayOpts.liveChannels
       .split(',')
       .map((s) => s.trim())
@@ -252,7 +253,7 @@ export function App() {
       graph: replayOpts.useCurrentGraph ? graph : migrateGraph(source.meta.graph),
       drivers: browserDrivers,
       liveChannels,
-      monitorChannels: replayOpts.audible && replayOpts.realtime ? ['speaker'] : [],
+      monitorChannels: replayOpts.audible && replayOpts.realtime ? outputChannels : [],
     });
     simRef.current = sim;
     attach(rt);

@@ -99,7 +99,9 @@ async function forward(name: string, rest: string, req: IncomingMessage, res: Se
   const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : new Uint8Array(await readBody(req));
   const ac = new AbortController();
   res.on('close', () => ac.abort());
-  const upstream = await fetch(up.base + rest, { method: req.method, headers, body, signal: ac.signal });
+  // The Deepgram upstream is a ws(s) URL for streaming ASR; its REST endpoints (TTS) use http(s).
+  const base = up.base.replace(/^ws(s?):/, 'http$1:');
+  const upstream = await fetch(base + rest, { method: req.method, headers, body, signal: ac.signal });
   const outHeaders: Record<string, string> = {};
   upstream.headers.forEach((v, k) => {
     if (!DROP_RES.has(k)) outHeaders[k] = v;
@@ -144,7 +146,7 @@ const server = createServer((req, res) => {
     if (p === '/api/health') {
       return json(res, 200, Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])));
     }
-    let m = /^\/api\/(anthropic|cartesia|openai\/[\w-]+)(\/.*)$/.exec(p);
+    let m = /^\/api\/(anthropic|cartesia|deepgram|openai\/[\w-]+)(\/.*)$/.exec(p);
     if (m) return forward(m[1], m[2] + url.search, req, res);
     m = /^\/api\/sessions(?:\/([^/]+))?$/.exec(p);
     if (m) return sessions(req, res, m[1] && decodeURIComponent(m[1]));
