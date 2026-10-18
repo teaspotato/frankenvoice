@@ -4,13 +4,14 @@ import { LiveScheduler } from '../src/core/scheduler';
 import { LiveWorld } from '../src/core/world';
 import { prepareReplay } from '../src/core/replay';
 import { decodeBundle, encodeBundle } from '../src/core/bundle';
-import { defaultGraph, registry } from '../src/nodes';
+import { registry } from '../src/nodes';
+import { buildGraph, defaultConfig } from '../src/pipeline';
 import type { Trajectory } from '../src/core/trajectory';
 import type { GraphSpec } from '../src/core/graph';
 import { fakeDrivers } from './fake-drivers';
 
 function testGraph(): GraphSpec {
-  const g = defaultGraph();
+  const g = buildGraph(defaultConfig());
   // Also run the deterministic energy VAD alongside Silero.
   g.nodes.push({ id: 'vad2', type: 'vad.energy', params: {} });
   g.edges.push({ from: { node: 'mic', port: 'audio' }, to: { node: 'vad2', port: 'audio' } });
@@ -124,14 +125,12 @@ describe('record and replay', () => {
   }, 10_000);
 
   it('runs the browser speech-synthesis node in place of tts + speaker, and replays it exactly', async () => {
-    const g = testGraph();
-    g.nodes = g.nodes.filter((n) => n.id !== 'tts' && n.id !== 'speaker');
-    g.edges = g.edges.filter((e) => !['tts', 'speaker'].includes(e.from.node) && !['tts', 'speaker'].includes(e.to.node));
-    g.nodes.push({ id: 'say', type: 'tts.browser', params: {} });
-    g.edges.push({ from: { node: 'llm', port: 'text' }, to: { node: 'say', port: 'text' } });
-    g.edges.push({ from: { node: 'say', port: 'playback' }, to: { node: 'turn', port: 'playback' } });
+    const c = defaultConfig();
+    c.tts.variant = 'browser';
+    const g = buildGraph(c);
+    expect(g.nodes.some((n) => n.id === 'speaker')).toBe(false);
     const run = await recordLive(1500, performance, g);
-    const playback = run.events.filter((e) => e.kind === 'msg' && e.node === 'say').map((e) => (e.data as { type: string }).type);
+    const playback = run.events.filter((e) => e.kind === 'msg' && e.node === 'tts').map((e) => (e.data as { type: string }).type);
     expect(playback).toContain('playback.start');
     expect(playback).toContain('playback.boundary');
     expect(playback).toContain('playback.end');

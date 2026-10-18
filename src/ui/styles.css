@@ -47,19 +47,17 @@ input, select, textarea { background: var(--bg); border: 1px solid var(--border)
 
 .app {
   display: grid; height: 100%;
-  grid-template-columns: 170px 1fr 330px;
-  grid-template-rows: auto 1fr 34%;
-  grid-template-areas: 'bar bar bar' 'palette canvas inspector' 'log log inspector';
+  grid-template-columns: 1fr 330px;
+  grid-template-rows: auto 190px minmax(200px, 1fr) 28%;
+  grid-template-areas: 'bar bar' 'diagram inspector' 'dash inspector' 'log inspector';
 }
 .toolbar { grid-area: bar; display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
 .toolbar .brand { font-weight: 700; letter-spacing: 0.02em; }
-.toolbar .graph-name { width: 220px; }
 .toolbar .spacer { flex: 1; }
-.palette { grid-area: palette; overflow: auto; padding: 8px; border-right: 1px solid var(--border); background: var(--panel); }
-.palette h3, .inspector h3 { margin: 4px 0 8px; font-size: 13px; }
-.palette-item { display: block; width: 100%; text-align: left; margin-bottom: 6px; border-left: 4px solid var(--c, var(--border)); }
-.palette-item small { display: block; color: var(--muted); font-family: var(--mono); font-size: 11px; }
-.canvas { grid-area: canvas; min-height: 0; }
+.diagram { grid-area: diagram; min-height: 0; border-bottom: 1px solid var(--border); }
+.diagram .react-flow__node { cursor: pointer; }
+.dash { grid-area: dash; min-height: 0; }
+.inspector h3 { margin: 4px 0 8px; font-size: 13px; }
 .inspector { grid-area: inspector; overflow: auto; padding: 10px; border-left: 1px solid var(--border); background: var(--panel); }
 .inspector h3 small { color: var(--muted); font-weight: 400; font-family: var(--mono); }
 .param { display: grid; grid-template-columns: 1fr; gap: 2px; margin-bottom: 8px; }
@@ -72,7 +70,16 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 .sessions li { border: 1px solid var(--border); border-radius: 6px; padding: 6px; margin-bottom: 6px; display: grid; gap: 4px; }
 .sessions li.current { border-color: var(--accent); }
 .sessions li small { color: var(--muted); }
-.sessions li span { display: flex; gap: 4px; }
+.sessions li span { display: flex; gap: 4px; flex-wrap: wrap; }
+
+.dashboard { display: flex; flex-direction: column; height: 100%; background: var(--panel); }
+.dashboard-bar { display: flex; gap: 6px; align-items: center; padding: 4px 10px; border-bottom: 1px solid var(--border); }
+.dashboard-bar .spacer { flex: 1; }
+.dashboard-bar button { padding: 1px 8px; }
+.dashboard-bar button.on { border-color: var(--accent); color: var(--accent); }
+.dashboard-body { position: relative; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
+.dashboard-body canvas { display: block; cursor: crosshair; }
+.dashboard-tip { position: absolute; max-width: 320px; pointer-events: none; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; font: 11px/1.35 var(--mono); white-space: pre-wrap; box-shadow: 0 2px 8px rgb(0 0 0 / 0.15); z-index: 5; }
 .log { grid-area: log; min-height: 0; border-top: 1px solid var(--border); background: var(--panel); }
 
 .cat-source { --c: var(--cat-source); } .cat-vad { --c: var(--cat-vad); } .cat-asr { --c: var(--cat-asr); }
@@ -107,7 +114,7 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 .ev.k-state .kind { color: var(--cat-control); }
 .ev.k-io-recv .kind, .ev.k-io-send .kind, .ev.k-io-open .kind, .ev.k-io-close .kind { color: var(--cat-asr); }
 .ev.k-io-diverge, .ev.k-log .data { color: var(--warn); }
-.event-detail { position: absolute; right: 340px; bottom: 10px; width: 520px; max-height: 50%; overflow: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font: 11px/1.35 var(--mono); box-shadow: 0 4px 16px rgb(0 0 0 / 0.15); cursor: pointer; }
+.event-detail { position: absolute; right: 340px; bottom: 10px; z-index: 10; width: 520px; max-height: 50%; overflow: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font: 11px/1.35 var(--mono); box-shadow: 0 4px 16px rgb(0 0 0 / 0.15); cursor: pointer; }
 
 /* settings */
 .modal-backdrop { position: fixed; inset: 0; background: rgb(0 0 0 / 0.35); display: flex; align-items: flex-start; justify-content: center; padding: 48px 16px; z-index: 50; overflow: auto; }

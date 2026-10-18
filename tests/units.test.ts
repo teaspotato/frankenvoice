@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { SentenceSplitter } from '../src/nodes/segment';
 import { Framer } from '../src/nodes/audio';
 import { SimScheduler } from '../src/core/scheduler';
+import { TrackStore } from '../src/core/tracks';
 import type { AudioMsg } from '../src/core/types';
 
 describe('SentenceSplitter', () => {
@@ -109,5 +110,23 @@ describe('openai-compatible adapter', () => {
     expect(p.recv({ $done: true })).toEqual([{ type: 'end', stopReason: 'stop' }]);
     expect(p.close(null)).toEqual([]);
     expect(openaiCompatAdapter.parser().recv({ error: { message: 'bad model' } })).toEqual([{ type: 'error', error: { message: 'bad model' } }]);
+  });
+});
+
+describe('TrackStore', () => {
+  it('reads sample ranges across chunks without merging', () => {
+    const ts = new TrackStore();
+    const all: number[] = [];
+    for (let c = 0; c < 7; c++) {
+      const chunk = new Float32Array(3 + c).map((_, i) => c * 100 + i);
+      all.push(...chunk);
+      ts.appendF32('a', chunk, 16000);
+    }
+    for (const [s, e] of [[0, 3], [2, 9], [5, 40], [10, 11], [40, 100], [-3, 2]]) {
+      expect([...ts.readF32Range('a', s, e)]).toEqual(all.slice(Math.max(0, s), e));
+    }
+    ts.bytes('a'); // merge, then keep appending
+    ts.appendF32('a', new Float32Array([9, 8]), 16000);
+    expect([...ts.readF32Range('a', all.length - 1, all.length + 2)]).toEqual([all[all.length - 1], 9, 8]);
   });
 });

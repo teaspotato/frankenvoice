@@ -1,6 +1,6 @@
 # Frankenvoice
 
-A research playground for full-duplex voice agents built by wiring existing components together instead of training a model. You arrange nodes (microphone, VAD, streaming ASR, turn-taking, LLM, TTS, speaker) in a browser node editor, talk to the result live, and every session is recorded so it can be replayed exactly.
+A research playground for full-duplex voice agents built from existing components (microphone, VAD, streaming ASR, turn-taking, LLM, TTS, speaker). The pipeline is fixed in code and iterated on by changing code. The web UI is a realtime observability view: a diagram of the pipeline with each stage's live state, and a time-aligned dashboard with one lane per stage. Every session is recorded so it can be replayed exactly.
 
 ## Quick start
 
@@ -13,9 +13,22 @@ Open **Settings** in the toolbar to enter API keys and base URLs. The proxy save
 
 Open http://localhost:5173 and press **Run live**. Allow microphone access. Press **Stop** to finish. The session is saved to `./sessions/<id>.fvs` and appears in the Sessions list, where **Replay** runs it again.
 
+## The UI
+
+- **Pipeline diagram** (top): read-only. Each stage shows its live state. Click a stage to configure it in the right panel.
+- **Dashboard** (middle): one lane per stage on a shared time axis, live while running and the same for replays and loaded sessions.
+  - *Mic*: waveform. *VAD*: speech probability with the start/stop thresholds; detected speech is shaded across Mic and VAD.
+  - *ASR*: each result drawn over the audio it covers (dashed while partial, solid when final), with a line to the tick where it arrived, so recognition latency is visible.
+  - *Turn*: floor state (thinking, speaking) and committed user turns.
+  - *LLM*: waiting for the first token (light), then generating (solid); hover for time to first token and the text.
+  - *TTS*: request ticks and each sentence's audio stream. *Playback*: the scheduled agent audio, sentence starts, and interruptions.
+  - Scroll to zoom, drag to pan, double-click or **Fit** for the whole session, **Follow** to track the live edge. Hover for details; click a lane to select its stage. Errors show as red dots on their stage's lane.
+- **Stage panel** (right): pick a stage's implementation (for example Silero or energy VAD, API or browser TTS) and edit its params. Saved in the browser; **Save config** / **Open…** move it as a file, and **Use its config** on a session restores what that session ran with.
+- **Event log** (bottom): every recorded event, filterable.
+
 The pipeline runs in the browser. The small proxy in `server/` keeps API keys out of the page, avoids CORS, and stores settings and session bundles. It only answers requests from the local UI: other websites (by `Origin`) and DNS-rebinding hosts (by `Host`) get 403. It forwards requests and streams responses unchanged, so the browser records exactly what each provider sent.
 
-## Default pipeline
+## Pipeline
 
 ```
 mic ─┬─> vad (Silero, in-browser) ──> turn ─> llm ─> tts ─> speaker
@@ -23,9 +36,11 @@ mic ─┬─> vad (Silero, in-browser) ──> turn ─> llm ─> tts ─> spea
                                         └─────── playback ──────┘
 ```
 
+The wiring lives in `src/pipeline.ts` (`STAGES` and `buildGraph`). Each stage lists the node types that can fill it; the UI only chooses among those and sets their params. To change the topology, edit that file.
+
 ## Providers
 
-ASR, LLM and TTS are each one node with a **Provider** param, so swapping providers never means rewiring the graph:
+ASR, LLM and TTS each have a **Provider** param:
 
 | node | providers | setting (Settings panel or env) |
 | --- | --- | --- |
@@ -37,15 +52,15 @@ ASR, LLM and TTS are each one node with a **Provider** param, so swapping provid
 | | `openai-compatible` (`/audio/speech`, PCM), endpoint `openai` / `custom` | as above |
 | `tts.browser` | the browser's built-in `speechSynthesis` | none |
 
-For OpenRouter, set the LLM node to `openai-compatible`, endpoint `openrouter`, and a model slug. The toolbar shows which keys the current graph still needs; click it to open Settings.
+For OpenRouter, set the LLM stage provider to `openai-compatible`, endpoint `openrouter`, and a model slug. The toolbar shows which keys the current config still needs; click it to open Settings.
 
 Each provider is a small pure adapter (`src/nodes/{asr,llm,tts}/`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`src/drivers/index.ts`). Recordings keep the provider's raw payloads, so replay feeds the same bytes through the same adapter. Adding a provider means one adapter, plus a driver and proxy route if it speaks a new protocol.
 
 This first stage is half-duplex. The turn node commits a user turn on ASR endpointing and ignores user speech while the agent is talking. Barge-in and backchannels come next (see Roadmap).
 
-`tts.browser` replaces both `tts` and `speaker`: wire `llm.text` into it and its `playback` into the turn node. The browser plays the audio itself, so no samples are recorded. What is recorded is when each sentence started, each word boundary the browser reported, and when it ended, so replay reproduces the playback timing and audible replay speaks the text again. Voices differ between browsers and machines, and headless browsers usually have none.
+`tts.browser` (TTS implementation `browser`) replaces both `tts` and `speaker`; the pipeline drops the speaker stage when it is selected. The browser plays the audio itself, so no samples are recorded. What is recorded is when each sentence started, each word boundary the browser reported, and when it ended, so replay reproduces the playback timing and audible replay speaks the text again. Voices differ between browsers and machines, and headless browsers usually have none.
 
-`llm.echo` and `tts.tone` are mock nodes for wiring and testing pipelines without API keys.
+`llm.echo` and `tts.tone` (implementations `echo` and `tone`) are mocks for trying the pipeline without API keys.
 
 ## Time, logging and replay
 
@@ -62,7 +77,7 @@ How the runtime ensures that:
 Replay options:
 
 - **real time / audible** paces the virtual clock against the wall clock and plays the agent audio again (output channels such as `speaker` and `speech-synthesis` run live as monitors).
-- **replay with current graph** runs your edited graph against the recorded world. Upstream nodes reproduce exactly; any exchange whose request differs from the recording is flagged as an `io.diverge` event.
+- **replay with current config** runs the current stage config against the recorded world. Upstream nodes reproduce exactly; any exchange whose request differs from the recording is flagged as an `io.diverge` event.
 - **live channels** (for example `anthropic`) serves those channels live during replay, so the same recorded user audio can be run against a new LLM or TTS.
 
 ### Session bundle format (`.fvs`, a zip)
@@ -77,29 +92,30 @@ Event kinds: `session.*`, `node.*`, `msg` (a node emitted on a port), `state` (i
 
 ## Writing a node
 
-A node is a `NodeDef` (see `src/nodes/*.ts`): ports, params, the IO channels it uses, and `create(ctx)`, which returns `{start, onInput, stop}`. Rules that keep replay exact:
+A stage is filled by a node: a `NodeDef` (see `src/nodes/*.ts`): ports, params, the IO channels it uses, and `create(ctx)`, which returns `{start, onInput, stop}`. Rules that keep replay exact:
 
 1. Touch the outside world only through `ctx.io.open(channel, request, handlers)`. Put everything that determines the response into `request`, since it is recorded and compared on replay.
 2. Delay work only with `ctx.setTimer`, and read time only with `ctx.now()`.
 3. Keep all state inside the node and expose what matters with `ctx.setState` so it lands in the log.
 4. Append produced audio with `ctx.media.append` and emit `{type: 'audio', ...ref, samples}`.
 
-The browser side of a channel is a `LiveDriver` in `src/drivers/index.ts`.
+The browser side of a channel is a `LiveDriver` in `src/drivers/index.ts`. Register the node in `src/nodes/index.ts` and list it as a variant of its stage in `src/pipeline.ts`. To give it its own dashboard drawing, derive the data in `src/ui/timeline.ts` and draw it in `src/ui/Dashboard.tsx`.
 
 ## Layout
 
 ```
 src/core/     runtime, scheduler (live + virtual clock), world (live/replay IO), trajectory, bundle, compare
-src/nodes/    node definitions and the default graph
+src/pipeline.ts  the fixed pipeline: stages, their implementations, wiring
+src/nodes/    node definitions
 src/drivers/  browser drivers: mic worklet, Silero (onnxruntime-web), Deepgram WS, Claude SDK, OpenAI-compatible SSE, TTS byte streams, Web Audio
-src/ui/       React Flow editor, inspector, sessions, event log
+src/ui/       pipeline diagram, dashboard (timeline.ts derives lanes, Dashboard.tsx draws them), stage panel, settings, sessions, event log
 server/       local proxy and session storage
 tests/        replay determinism tests with randomized fake drivers
 ```
 
 ## Roadmap
 
-1. ~~Runtime with trajectory logging, graph editor, basic voice loop~~
-2. Full-duplex floor control: barge-in, with history cut back to what was heard; backchannels; every decision logged with its reason
+1. ~~Runtime with trajectory logging and a basic voice loop~~; fixed pipeline with a live per-stage dashboard, scrubbing and run comparison
+2. Full-duplex floor control: barge-in, with history cut back to what was heard; backchannels; every decision marked on the dashboard with its reason
 3. Tool calls mid-conversation, with filler speech and interruptible calls
-4. Trajectory viewer: waveforms plus per-node timeline, scrubbing, per-node latency, run-vs-run comparison
+4. Local models on a GPU box (VAD, ASR, LLM, TTS), with their internals visualized

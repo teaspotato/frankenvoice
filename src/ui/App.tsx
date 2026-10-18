@@ -1,46 +1,43 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  Background,
-  Controls,
-  ReactFlow,
-  type Connection,
-  type Edge,
-  type EdgeChange,
-  type NodeChange,
-  applyNodeChanges,
-} from '@xyflow/react';
-import '@xyflow/react/dist/style.css';
-import { registry, defaultGraph, migrateGraph } from '../nodes';
-import type { GraphSpec } from '../core/graph';
-import { GRAPH_FORMAT } from '../core/graph';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { registry } from '../nodes';
+import { GRAPH_FORMAT, type GraphSpec } from '../core/graph';
 import { Runtime } from '../core/runtime';
-import { LiveScheduler, type SimScheduler } from '../core/scheduler';
+import { LiveScheduler, type Scheduler, type SimScheduler } from '../core/scheduler';
 import { LiveWorld } from '../core/world';
 import { prepareReplay } from '../core/replay';
 import { decodeBundle, encodeBundle } from '../core/bundle';
 import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
 import type { Json } from '../core/types';
-import { paramActive, resolveParams } from '../core/node';
 import { browserDrivers } from '../drivers';
+import {
+  CONFIG_FORMAT,
+  activeStages,
+  buildGraph,
+  configFromGraph,
+  defaultConfig,
+  normalizeConfig,
+  requiredUpstreams,
+  stageType,
+  type PipelineConfig,
+  type StageId,
+} from '../pipeline';
 import { SettingsPanel } from './Settings';
-import { FvNode, type FvFlowNode } from './FvNode';
+import { PipelineView } from './PipelineView';
+import { StagePanel } from './StagePanel';
+import { Dashboard } from './Dashboard';
 import { EventLog } from './EventLog';
 
-const GRAPH_KEY = 'frankenvoice.graph';
-const nodeTypes = { fv: FvNode };
+const CONFIG_KEY = 'frankenvoice.pipeline';
 
-function loadGraph(): GraphSpec {
+function loadConfig(): PipelineConfig {
   try {
-    const raw = localStorage.getItem(GRAPH_KEY);
-    if (raw) {
-      const g = JSON.parse(raw) as GraphSpec;
-      if (g.format === GRAPH_FORMAT) return migrateGraph(g);
-    }
+    const raw = localStorage.getItem(CONFIG_KEY);
+    if (raw) return normalizeConfig(JSON.parse(raw) as PipelineConfig);
   } catch {
-    /* storage unavailable */
+    /* storage unavailable or corrupt */
   }
-  return defaultGraph();
+  return defaultConfig();
 }
 
 function download(name: string, data: BlobPart, type: string) {
@@ -72,28 +69,30 @@ function describeComparison(s: Session): string {
 }
 
 export function App() {
-  const [graph, setGraph] = useState<GraphSpec>(loadGraph);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [runtime, setRuntime] = useState<Runtime | null>(null);
+  const [config, setConfig] = useState<PipelineConfig>(loadConfig);
+  const [selected, setSelected] = useState<StageId | null>(null);
   const [running, setRunning] = useState<'live' | 'replay' | null>(null);
   const [nodeStates, setNodeStates] = useState<Record<string, Record<string, Json>>>({});
+  /** Node type behind each entry of nodeStates (the run they came from may predate a config change). */
+  const [stateTypes, setStateTypes] = useState<Record<string, string>>({});
   const [sessions, setSessions] = useState<Session[]>([]);
   const [current, setCurrent] = useState<Session | null>(null);
   const [health, setHealth] = useState<Record<string, boolean> | null>(null);
-  const [replayOpts, setReplayOpts] = useState({ audible: true, realtime: true, useCurrentGraph: false, liveChannels: '' });
+  const [replayOpts, setReplayOpts] = useState({ audible: true, realtime: true, useCurrentConfig: false, liveChannels: '' });
   const [notice, setNotice] = useState('');
   const [showSettings, setShowSettings] = useState(false);
-  const simRef = useRef<SimScheduler | null>(null);
-  const [flowNodes, setFlowNodes] = useState<FvFlowNode[]>([]);
   const [serverSessions, setServerSessions] = useState<string[]>([]);
+  const runtimeRef = useRef<Runtime | null>(null);
+  const schedRef = useRef<Scheduler | null>(null);
+  const simRef = useRef<SimScheduler | null>(null);
 
   useEffect(() => {
     try {
-      localStorage.setItem(GRAPH_KEY, JSON.stringify(graph));
+      localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
     } catch {
       /* storage unavailable */
     }
-  }, [graph]);
+  }, [config]);
 
   const refreshProxy = useCallback(() => {
     fetch('/api/health')
@@ -107,96 +106,13 @@ export function App() {
   }, []);
   useEffect(refreshProxy, [refreshProxy]);
 
-  // ---- graph <-> React Flow -------------------------------------------------
-
-  useEffect(() => {
-    setFlowNodes((prev) => {
-      const prevById = new Map(prev.map((n) => [n.id, n]));
-      return graph.nodes.map((n, i) => ({
-        id: n.id,
-        type: 'fv' as const,
-        position: n.ui ?? prevById.get(n.id)?.position ?? { x: 80 + i * 40, y: 80 + i * 40 },
-        selected: n.id === selected,
-        data: {
-          def: registry[n.type],
-          label: n.id,
-          subtitle: typeof n.params.provider === 'string' ? n.params.provider : undefined,
-          state: nodeStates[n.id],
-          active: !!running,
-        },
-      }));
-    });
-  }, [graph, nodeStates, selected, running]);
-
-  const flowEdges: Edge[] = useMemo(
-    () =>
-      graph.edges.map((e) => ({
-        id: `${e.from.node}.${e.from.port}->${e.to.node}.${e.to.port}`,
-        source: e.from.node,
-        sourceHandle: e.from.port,
-        target: e.to.node,
-        targetHandle: e.to.port,
-        animated: !!running,
-      })),
-    [graph.edges, running],
-  );
-
-  const onNodesChange = useCallback((changes: NodeChange<FvFlowNode>[]) => {
-    setFlowNodes((ns) => applyNodeChanges(changes, ns));
-    const moved = changes.flatMap((c) => (c.type === 'position' && c.position && !c.dragging ? [{ id: c.id, position: c.position }] : []));
-    const removed = changes.flatMap((c) => (c.type === 'remove' ? [c.id] : []));
-    if (moved.length || removed.length) {
-      setGraph((g) => ({
-        ...g,
-        nodes: g.nodes
-          .filter((n) => !removed.includes(n.id))
-          .map((n) => {
-            const m = moved.find((c) => c.id === n.id);
-            return m ? { ...n, ui: { x: Math.round(m.position.x), y: Math.round(m.position.y) } } : n;
-          }),
-        edges: g.edges.filter((e) => !removed.includes(e.from.node) && !removed.includes(e.to.node)),
-      }));
-    }
-  }, []);
-
-  const onEdgesChange = useCallback((changes: EdgeChange[]) => {
-    const removed = changes.filter((c) => c.type === 'remove').map((c) => c.id);
-    if (!removed.length) return;
-    setGraph((g) => ({ ...g, edges: g.edges.filter((e) => !removed.includes(`${e.from.node}.${e.from.port}->${e.to.node}.${e.to.port}`)) }));
-  }, []);
-
-  const portType = (node: string | null, port: string | null | undefined, dir: 'in' | 'out') => {
-    const spec = graph.nodes.find((n) => n.id === node);
-    const def = spec && registry[spec.type];
-    return (dir === 'in' ? def?.inputs : def?.outputs)?.find((p) => p.name === port)?.type;
-  };
-
-  const isValidConnection = (c: Connection | Edge) => {
-    const a = portType(c.source, c.sourceHandle, 'out');
-    const b = portType(c.target, c.targetHandle, 'in');
-    return !!a && !!b && (a === b || a === 'any' || b === 'any');
-  };
-
-  const onConnect = (c: Connection) => {
-    if (!isValidConnection(c) || !c.sourceHandle || !c.targetHandle) return;
-    setGraph((g) => ({ ...g, edges: [...g.edges, { from: { node: c.source, port: c.sourceHandle! }, to: { node: c.target, port: c.targetHandle! } }] }));
-  };
-
-  const addNode = (type: string) => {
-    const base = type.split('.').pop()!;
-    let id = base;
-    for (let i = 2; graph.nodes.some((n) => n.id === id); i++) id = `${base}${i}`;
-    setGraph((g) => ({ ...g, nodes: [...g.nodes, { id, type, params: {}, ui: { x: 200, y: 360 } }] }));
-    setSelected(id);
-  };
-
-  const setParam = (id: string, key: string, value: Json) =>
-    setGraph((g) => ({ ...g, nodes: g.nodes.map((n) => (n.id === id ? { ...n, params: { ...n.params, [key]: value } } : n)) }));
-
   // ---- running ----------------------------------------------------------------
 
-  const attach = (rt: Runtime) => {
+  const attach = (rt: Runtime, scheduler: Scheduler) => {
+    runtimeRef.current = rt;
+    schedRef.current = scheduler;
     setNodeStates({});
+    setStateTypes(Object.fromEntries(rt.trajectory.meta.graph.nodes.map((n) => [n.id, n.type])));
     let pending: Record<string, Record<string, Json>> = {};
     let raf = 0;
     rt.onState((node, state) => {
@@ -234,15 +150,14 @@ export function App() {
   const runLive = () => {
     const scheduler = new LiveScheduler();
     const rt = new Runtime({
-      graph,
+      graph: buildGraph(config),
       registry,
       scheduler,
       world: new LiveWorld(browserDrivers, scheduler),
       mode: 'live',
       env: { userAgent: navigator.userAgent },
     });
-    attach(rt);
-    setRuntime(rt);
+    attach(rt, scheduler);
     setCurrent({ traj: rt.trajectory });
     setRunning('live');
     setNotice('');
@@ -254,9 +169,10 @@ export function App() {
       simRef.current?.stop();
       return;
     }
-    if (!runtime) return;
-    runtime.stop();
-    void finishSession(runtime);
+    const rt = runtimeRef.current;
+    if (!rt) return;
+    rt.stop();
+    void finishSession(rt);
   };
 
   const replay = async (source: Trajectory) => {
@@ -267,14 +183,13 @@ export function App() {
       .filter(Boolean);
     const { runtime: rt, sim } = prepareReplay(source, {
       registry,
-      graph: replayOpts.useCurrentGraph ? graph : migrateGraph(source.meta.graph),
+      graph: replayOpts.useCurrentConfig ? buildGraph(config) : source.meta.graph,
       drivers: browserDrivers,
       liveChannels,
       monitorChannels: replayOpts.audible && replayOpts.realtime ? outputChannels : [],
     });
     simRef.current = sim;
-    attach(rt);
-    setRuntime(rt);
+    attach(rt, sim);
     setCurrent({ traj: rt.trajectory });
     setRunning('replay');
     if (replayOpts.realtime) await sim.runRealtime(1);
@@ -295,9 +210,10 @@ export function App() {
   const importFile = async (f: File) => {
     try {
       if (f.name.endsWith('.json')) {
-        const g = JSON.parse(await f.text()) as GraphSpec;
-        if (g.format !== GRAPH_FORMAT) throw new Error('not a frankenvoice graph');
-        setGraph(migrateGraph(g));
+        const j = JSON.parse(await f.text()) as { format?: string };
+        if (j.format === CONFIG_FORMAT) setConfig(normalizeConfig((j as { stages: PipelineConfig }).stages));
+        else if (j.format === GRAPH_FORMAT) setConfig(configFromGraph(j as GraphSpec));
+        else throw new Error('not a frankenvoice pipeline config');
       } else {
         const traj = decodeBundle(new Uint8Array(await f.arrayBuffer()));
         const s = { traj };
@@ -311,21 +227,15 @@ export function App() {
 
   // ---- render -------------------------------------------------------------------
 
-  const sel = graph.nodes.find((n) => n.id === selected);
-  const selDef = sel && registry[sel.type];
-  const needed = new Set(
-    graph.nodes.flatMap((n) => {
-      const def = registry[n.type];
-      return def?.requires?.(resolveParams(def, n.params)) ?? [];
-    }),
-  );
-  const missingKeys = health ? [...needed].filter((k) => !health[k]) : [];
+  const missingKeys = health ? requiredUpstreams(config).filter((k) => !health[k]) : [];
+  // The Playback lane belongs to the TTS stage when the browser speaks for itself.
+  const stageOf = (lane: string | null): StageId | null =>
+    lane === null ? null : activeStages(config).some((s) => s.id === lane) ? (lane as StageId) : 'tts';
 
   return (
     <div className="app">
       <header className="toolbar">
         <span className="brand">frankenvoice</span>
-        <input className="graph-name" value={graph.name} onChange={(e) => setGraph({ ...graph, name: e.target.value })} />
         {!running ? (
           <button className="primary" onClick={runLive}>
             ● Run live
@@ -335,12 +245,16 @@ export function App() {
             ■ Stop {running}
           </button>
         )}
-        <button onClick={() => download(`${graph.name || 'graph'}.json`, JSON.stringify(graph, null, 2), 'application/json')}>Save graph</button>
+        <button
+          onClick={() => download('frankenvoice-pipeline.json', JSON.stringify({ format: CONFIG_FORMAT, stages: config }, null, 2), 'application/json')}
+        >
+          Save config
+        </button>
         <label className="button">
           Open…
           <input type="file" accept=".json,.fvs,.zip" hidden onChange={(e) => e.target.files?.[0] && importFile(e.target.files[0])} />
         </label>
-        <button onClick={() => confirm('Replace the current graph with the default pipeline?') && setGraph(defaultGraph())}>Reset graph</button>
+        <button onClick={() => confirm('Reset every stage to its default settings?') && setConfig(defaultConfig())}>Reset config</button>
         <span className="spacer" />
         {health === null ? (
           <span className="warn">proxy not reachable: run `pnpm dev`</span>
@@ -355,79 +269,25 @@ export function App() {
       </header>
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} onSaved={refreshProxy} />}
 
-      <aside className="palette">
-        <h3>Nodes</h3>
-        {Object.values(registry).map((d) => (
-          <button key={d.type} className={`palette-item cat-${d.category}`} onClick={() => addNode(d.type)} title={d.description}>
-            {d.title}
-            <small>{d.type}</small>
-          </button>
-        ))}
-      </aside>
+      <section className="diagram">
+        <PipelineView config={config} states={nodeStates} stateTypes={stateTypes} running={!!running} selected={selected} onSelect={setSelected} />
+      </section>
 
-      <main className="canvas">
-        <ReactFlow
-          nodes={flowNodes}
-          edges={flowEdges}
-          nodeTypes={nodeTypes}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          isValidConnection={isValidConnection}
-          onNodeClick={(_e, n) => setSelected(n.id)}
-          onPaneClick={() => setSelected(null)}
-          deleteKeyCode={running ? null : ['Backspace', 'Delete']}
-          nodesConnectable={!running}
-          fitView
-        >
-          <Background />
-          <Controls />
-        </ReactFlow>
-      </main>
+      <section className="dash">
+        <Dashboard
+          trajectory={current?.traj}
+          running={!!running}
+          now={() => schedRef.current?.now() ?? 0}
+          selected={selected}
+          onSelect={(lane) => setSelected(stageOf(lane))}
+        />
+      </section>
 
       <aside className="inspector">
-        {sel && selDef ? (
-          <>
-            <h3>
-              {sel.id} <small>{selDef.type}</small>
-            </h3>
-            <p className="muted">{selDef.description}</p>
-            {selDef.params.filter((p) => paramActive(p, resolveParams(selDef, sel.params))).map((p) => {
-              const v = resolveParams(selDef, sel.params)[p.key];
-              const set = (x: Json) => setParam(sel.id, p.key, x);
-              return (
-                <label key={p.key} className="param">
-                  <span>{p.label}</span>
-                  {p.type === 'boolean' ? (
-                    <input type="checkbox" checked={!!v} onChange={(e) => set(e.target.checked)} />
-                  ) : p.type === 'select' ? (
-                    <select value={String(v)} onChange={(e) => set(e.target.value)}>
-                      {p.options!.map((o) => (
-                        <option key={o}>{o}</option>
-                      ))}
-                    </select>
-                  ) : p.type === 'text' ? (
-                    <textarea rows={5} value={String(v)} onChange={(e) => set(e.target.value)} />
-                  ) : (
-                    <input
-                      type={p.type === 'number' ? 'number' : 'text'}
-                      value={String(v)}
-                      onChange={(e) => set(p.type === 'number' ? Number(e.target.value) : e.target.value)}
-                    />
-                  )}
-                  {p.description && <small className="muted">{p.description}</small>}
-                </label>
-              );
-            })}
-            {nodeStates[sel.id] && (
-              <>
-                <h4>State</h4>
-                <pre className="state">{JSON.stringify(nodeStates[sel.id], null, 2)}</pre>
-              </>
-            )}
-          </>
+        {selected ? (
+          <StagePanel config={config} stage={selected} state={stateTypes[selected] === stageType(config, selected) ? nodeStates[selected] : undefined} disabled={!!running} onChange={setConfig} />
         ) : (
-          <p className="muted">Select a node to edit its parameters. Drag from an output to an input of the same type to connect.</p>
+          <p className="muted">Click a stage in the diagram or a lane in the dashboard to configure it. The pipeline's wiring is defined in code (src/pipeline.ts).</p>
         )}
 
         <h3>Sessions</h3>
@@ -441,10 +301,10 @@ export function App() {
           <label>
             <input
               type="checkbox"
-              checked={replayOpts.useCurrentGraph}
-              onChange={(e) => setReplayOpts({ ...replayOpts, useCurrentGraph: e.target.checked })}
+              checked={replayOpts.useCurrentConfig}
+              onChange={(e) => setReplayOpts({ ...replayOpts, useCurrentConfig: e.target.checked })}
             />{' '}
-            replay with current graph
+            replay with current config
           </label>
           <label>
             live channels{' '}
@@ -473,7 +333,9 @@ export function App() {
                   Replay
                 </button>
                 <button onClick={() => download(`${s.traj.meta.id}.fvs`, encodeBundle(s.traj) as BlobPart, 'application/zip')}>Export</button>
-                <button onClick={() => setGraph(migrateGraph(s.traj.meta.graph))}>Load graph</button>
+                <button disabled={!!running} onClick={() => setConfig(configFromGraph(s.traj.meta.graph))} title="Set every stage to what this session ran with">
+                  Use its config
+                </button>
               </span>
             </li>
           ))}
@@ -496,4 +358,3 @@ export function App() {
     </div>
   );
 }
-
