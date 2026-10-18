@@ -17,9 +17,9 @@ function testGraph(): GraphSpec {
   return g;
 }
 
-async function recordLive(ms: number, perf: { now(): number } = performance): Promise<Trajectory> {
+async function recordLive(ms: number, perf: { now(): number } = performance, graph = testGraph()): Promise<Trajectory> {
   const scheduler = new LiveScheduler(perf);
-  const rt = new Runtime({ graph: testGraph(), registry, scheduler, world: new LiveWorld(fakeDrivers, scheduler), mode: 'live' });
+  const rt = new Runtime({ graph, registry, scheduler, world: new LiveWorld(fakeDrivers, scheduler), mode: 'live' });
   rt.start();
   await new Promise((r) => setTimeout(r, ms));
   rt.stop();
@@ -95,4 +95,18 @@ describe('record and replay', () => {
     const bySeq = new Map(live.events.map((e) => [e.seq, e]));
     for (const e of live.events) for (const c of e.cause ?? []) expect(bySeq.get(c)!.t).toBeLessThanOrEqual(e.t);
   });
+
+  it('swaps the LLM provider without touching the rest of the graph, and replays it exactly', async () => {
+    const g = testGraph();
+    Object.assign(g.nodes.find((n) => n.id === 'llm')!.params, { provider: 'openai-compatible', endpoint: 'openrouter', model: 'some/model' });
+    const run = await recordLive(800, performance, g);
+    const opened = run.events.find((e) => e.kind === 'io.open' && e.node === 'llm')!;
+    expect((opened.data as { channel: string }).channel).toBe('openai');
+    expect((opened.data as { request: { endpoint: string; body: { model: string } } }).request.body.model).toBe('some/model');
+    const deltas = run.events.filter((e) => e.kind === 'msg' && (e.data as { type: string }).type === 'llm.delta');
+    expect(deltas.length).toBeGreaterThan(0);
+    const { runtime, sim } = prepareReplay(run, { registry });
+    sim.runFast();
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 10_000);
 });

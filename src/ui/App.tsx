@@ -10,7 +10,7 @@ import {
   applyNodeChanges,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { registry, defaultGraph } from '../nodes';
+import { registry, defaultGraph, migrateGraph } from '../nodes';
 import type { GraphSpec } from '../core/graph';
 import { GRAPH_FORMAT } from '../core/graph';
 import { Runtime } from '../core/runtime';
@@ -21,7 +21,7 @@ import { decodeBundle, encodeBundle } from '../core/bundle';
 import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
 import type { Json } from '../core/types';
-import { resolveParams } from '../core/node';
+import { paramActive, resolveParams } from '../core/node';
 import { browserDrivers } from '../drivers';
 import { FvNode, type FvFlowNode } from './FvNode';
 import { EventLog } from './EventLog';
@@ -34,7 +34,7 @@ function loadGraph(): GraphSpec {
     const raw = localStorage.getItem(GRAPH_KEY);
     if (raw) {
       const g = JSON.parse(raw) as GraphSpec;
-      if (g.format === GRAPH_FORMAT) return g;
+      if (g.format === GRAPH_FORMAT) return migrateGraph(g);
     }
   } catch {
     /* storage unavailable */
@@ -100,7 +100,13 @@ export function App() {
         type: 'fv' as const,
         position: n.ui ?? prevById.get(n.id)?.position ?? { x: 80 + i * 40, y: 80 + i * 40 },
         selected: n.id === selected,
-        data: { def: registry[n.type], label: n.id, state: nodeStates[n.id], active: !!running },
+        data: {
+          def: registry[n.type],
+          label: n.id,
+          subtitle: typeof n.params.provider === 'string' ? n.params.provider : undefined,
+          state: nodeStates[n.id],
+          active: !!running,
+        },
       }));
     });
   }, [graph, nodeStates, selected, running]);
@@ -243,7 +249,7 @@ export function App() {
       .filter(Boolean);
     const { runtime: rt, sim } = prepareReplay(source, {
       registry,
-      graph: replayOpts.useCurrentGraph ? graph : undefined,
+      graph: replayOpts.useCurrentGraph ? graph : migrateGraph(source.meta.graph),
       drivers: browserDrivers,
       liveChannels,
       monitorChannels: replayOpts.audible && replayOpts.realtime ? ['speaker'] : [],
@@ -272,7 +278,7 @@ export function App() {
       if (f.name.endsWith('.json')) {
         const g = JSON.parse(await f.text()) as GraphSpec;
         if (g.format !== GRAPH_FORMAT) throw new Error('not a frankenvoice graph');
-        setGraph(g);
+        setGraph(migrateGraph(g));
       } else {
         const traj = decodeBundle(new Uint8Array(await f.arrayBuffer()));
         const s = { traj };
@@ -288,8 +294,13 @@ export function App() {
 
   const sel = graph.nodes.find((n) => n.id === selected);
   const selDef = sel && registry[sel.type];
-  const usedChannels = new Set(graph.nodes.flatMap((n) => registry[n.type]?.channels?.map((c) => c.name) ?? []));
-  const missingKeys = health ? (['anthropic', 'deepgram', 'cartesia'] as const).filter((k) => usedChannels.has(k) && !health[k]) : [];
+  const needed = new Set(
+    graph.nodes.flatMap((n) => {
+      const def = registry[n.type];
+      return def?.requires?.(resolveParams(def, n.params)) ?? [];
+    }),
+  );
+  const missingKeys = health ? [...needed].filter((k) => !health[k]) : [];
 
   return (
     <div className="app">
@@ -315,7 +326,7 @@ export function App() {
         {health === null ? (
           <span className="warn">proxy not reachable: run `npm run dev`</span>
         ) : missingKeys.length ? (
-          <span className="warn">missing API keys: {missingKeys.join(', ')}</span>
+          <span className="warn">not configured in proxy .env: {missingKeys.join(', ')}</span>
         ) : (
           <span className="ok">proxy ok</span>
         )}
@@ -358,7 +369,7 @@ export function App() {
               {sel.id} <small>{selDef.type}</small>
             </h3>
             <p className="muted">{selDef.description}</p>
-            {selDef.params.map((p) => {
+            {selDef.params.filter((p) => paramActive(p, resolveParams(selDef, sel.params))).map((p) => {
               const v = resolveParams(selDef, sel.params)[p.key];
               const set = (x: Json) => setParam(sel.id, p.key, x);
               return (
@@ -381,6 +392,7 @@ export function App() {
                       onChange={(e) => set(p.type === 'number' ? Number(e.target.value) : e.target.value)}
                     />
                   )}
+                  {p.description && <small className="muted">{p.description}</small>}
                 </label>
               );
             })}
@@ -438,7 +450,7 @@ export function App() {
                   Replay
                 </button>
                 <button onClick={() => download(`${s.traj.meta.id}.fvs`, encodeBundle(s.traj) as BlobPart, 'application/zip')}>Export</button>
-                <button onClick={() => setGraph(s.traj.meta.graph)}>Load graph</button>
+                <button onClick={() => setGraph(migrateGraph(s.traj.meta.graph))}>Load graph</button>
               </span>
             </li>
           ))}

@@ -1,14 +1,14 @@
-import type { NodeContext, NodeDef } from '../core/node';
-import type { Msg } from '../core/types';
-import { SentenceSplitter } from './segment';
+import type { NodeContext, NodeDef } from '../../core/node';
+import type { JsonObject, Msg } from '../../core/types';
+import { SentenceSplitter } from '../segment';
+import { paramsFor, providerParams } from '../providers';
+import { cartesiaAdapter, openaiTtsAdapter } from './adapters';
+import type { TtsAdapter } from './types';
 
-interface CartesiaParams {
-  modelId: string;
-  voiceId: string;
-  language: string;
-  sampleRate: number;
-  minSegmentChars: number;
-}
+export const ttsAdapters: Record<string, TtsAdapter> = {
+  [cartesiaAdapter.provider]: cartesiaAdapter,
+  [openaiTtsAdapter.provider]: openaiTtsAdapter,
+};
 
 interface Segment {
   rid: string;
@@ -22,30 +22,42 @@ interface Segment {
 }
 
 /**
- * Streaming TTS via Cartesia's /tts/bytes endpoint, one request per sentence.
- * Requests run concurrently; audio is emitted strictly in sentence order.
- * Raw response bytes are recorded, so replay reproduces the exact chunking.
+ * Streaming TTS, one request per sentence. Requests run concurrently; audio is
+ * emitted strictly in sentence order. The provider is a parameter; raw
+ * response bytes are recorded, so replay reproduces the exact chunking.
  */
-export const cartesiaTtsNode: NodeDef<CartesiaParams> = {
-  type: 'tts.cartesia',
-  title: 'Cartesia TTS',
+export const ttsNode: NodeDef = {
+  type: 'tts',
+  title: 'TTS',
   category: 'tts',
-  description: 'Sentence-level streaming text-to-speech (raw float32 PCM).',
+  description: 'Sentence-level streaming text-to-speech. Providers: Cartesia, OpenAI-compatible /audio/speech.',
   inputs: [
     { name: 'text', type: 'text' },
     { name: 'control', type: 'control' },
   ],
   outputs: [{ name: 'audio', type: 'audio' }],
   params: [
-    { key: 'modelId', label: 'Model', type: 'string', default: 'sonic-2' },
-    { key: 'voiceId', label: 'Voice ID', type: 'string', default: 'a0e99841-438c-4a64-b679-ae501e7d6091' },
-    { key: 'language', label: 'Language', type: 'string', default: 'en' },
-    { key: 'sampleRate', label: 'Sample rate', type: 'number', default: 24000 },
+    { key: 'provider', label: 'Provider', type: 'select', options: Object.keys(ttsAdapters), default: 'cartesia' },
     { key: 'minSegmentChars', label: 'Min segment chars', type: 'number', default: 1 },
+    ...providerParams(Object.values(ttsAdapters)),
   ],
-  channels: [{ name: 'cartesia', description: 'POST /tts/bytes, streamed response body' }],
+  channels: Object.values(ttsAdapters).map((a) => ({ name: a.channel, description: `${a.provider}: streamed raw PCM response` })),
+  requires: (p) => (p.provider === 'openai-compatible' ? [`openai/${String(p['openai-compatible.endpoint'])}`] : [String(p.provider)]),
   create(ctx) {
-    const p = ctx.params;
+    const p = ctx.params as JsonObject & { minSegmentChars: number };
+    const adapter = ttsAdapters[p.provider as string];
+    const ap = adapter ? paramsFor(adapter.provider, p) : {};
+    const fmt = adapter ? adapter.format(ap) : { encoding: 'f32le' as const, sampleRate: 24000 };
+    const bytesPerSample = fmt.encoding === 'f32le' ? 4 : 2;
+    const decode = (bytes: Uint8Array): Float32Array => {
+      if (fmt.encoding === 'f32le') return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const out = new Float32Array(bytes.byteLength / 2);
+      for (let i = 0; i < out.length; i++) out[i] = view.getInt16(i * 2, true) / 0x8000;
+      return out;
+    };
+    if (!adapter) ctx.log('error', `unknown TTS provider "${String(p.provider)}"`);
+    ctx.setState('provider', p.provider);
     let splitter = new SentenceSplitter(p.minSegmentChars);
     let queue: Segment[] = []; // segments not yet fully emitted, in order
     let rid = '';
@@ -58,8 +70,8 @@ export const cartesiaTtsNode: NodeDef<CartesiaParams> = {
         ctx.emit('audio', { type: 'tts.segment_start', rid: s.rid, seg: s.seg, text: s.text });
       }
       if (!samples.length) return;
-      const ref = ctx.media.append('audio', samples, p.sampleRate);
-      ctx.emit('audio', { type: 'audio', ...ref, sampleRate: p.sampleRate, samples, rid: s.rid, seg: s.seg });
+      const ref = ctx.media.append('audio', samples, fmt.sampleRate);
+      ctx.emit('audio', { type: 'audio', ...ref, sampleRate: fmt.sampleRate, samples, rid: s.rid, seg: s.seg });
     };
 
     /** Emit everything that is ready at the head of the queue. */
@@ -81,31 +93,23 @@ export const cartesiaTtsNode: NodeDef<CartesiaParams> = {
     };
 
     const speak = (text: string) => {
+      if (!adapter) return;
       const s: Segment = { rid, seg: segNo++, text, chunks: [], remainder: new Uint8Array(), done: false, started: false };
       queue.push(s);
       ctx.setState('status', 'synthesizing');
       s.io = ctx.io.open(
-        'cartesia',
-        {
-          path: '/tts/bytes',
-          body: {
-            model_id: p.modelId,
-            transcript: text,
-            voice: { mode: 'id', id: p.voiceId },
-            output_format: { container: 'raw', encoding: 'pcm_f32le', sample_rate: p.sampleRate },
-            language: p.language,
-          },
-        },
+        adapter.channel,
+        adapter.buildRequest(text, ap),
         {
           onRecv(_data, bin) {
             if (!bin) return;
-            // Chunk boundaries need not align with 4-byte samples.
+            // Chunk boundaries need not align with sample boundaries.
             const all = new Uint8Array(s.remainder.length + bin.length);
             all.set(s.remainder);
             all.set(bin, s.remainder.length);
-            const usable = all.length - (all.length % 4);
+            const usable = all.length - (all.length % bytesPerSample);
             s.remainder = all.slice(usable);
-            s.chunks.push(new Float32Array(all.buffer.slice(0, usable)));
+            s.chunks.push(decode(all.slice(0, usable)));
             if (queue[0] === s) pump();
           },
           onClose(data) {

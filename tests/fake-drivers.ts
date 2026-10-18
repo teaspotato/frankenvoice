@@ -101,6 +101,22 @@ const anthropic: LiveDriver = (req, sink) => {
   return { send() {}, close: () => void (closed = true) };
 };
 
+const openai: LiveDriver = (req, sink) => {
+  const r = req as { body: { messages: unknown[] } };
+  const tokens = `Compat reply ${r.body.messages.length}. Short and sweet!`.match(/\S+\s*/g)!;
+  let closed = false;
+  let t = jitter(2, 3);
+  const ev = (e: Json) => {
+    t += jitter(0.5, 2);
+    later(t, () => !closed && sink.recv(e));
+  };
+  for (const tok of tokens) ev({ id: 'c1', choices: [{ index: 0, delta: { content: tok }, finish_reason: null }] });
+  ev({ id: 'c1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+  ev({ $done: true });
+  later(t + 1, () => !closed && sink.close());
+  return { send() {}, close: () => void (closed = true) };
+};
+
 const cartesia: LiveDriver = (req, sink) => {
   const { body } = req as { body: { transcript: string; output_format: { sample_rate: number } } };
   const n = Math.round(body.transcript.length * 0.004 * body.output_format.sample_rate);
@@ -124,4 +140,4 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, cartesia, speaker };
+export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, speaker };

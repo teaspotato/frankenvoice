@@ -43,3 +43,60 @@ describe('SimScheduler', () => {
     expect(sim.now()).toBe(5);
   });
 });
+
+describe('migrateGraph', () => {
+  it('upgrades format-1 per-provider node types to provider params', async () => {
+    const { migrateGraph, registry } = await import('../src/nodes');
+    const old: import('../src/core/graph').GraphSpec = {
+      format: 'frankenvoice-graph',
+      formatVersion: 1,
+      name: 'old',
+      nodes: [
+        { id: 'asr', type: 'asr.deepgram', params: { model: 'nova-2' } },
+        { id: 'llm', type: 'llm.claude', params: { effort: 'high' } },
+        { id: 'tts', type: 'tts.cartesia', params: { modelId: 'sonic-x', minSegmentChars: 5 } },
+      ],
+      edges: [],
+    };
+    const g = migrateGraph(old);
+    expect(g.nodes.map((n) => n.type)).toEqual(['asr', 'llm', 'tts']);
+    expect(g.nodes[0].params).toEqual({ provider: 'deepgram', 'deepgram.model': 'nova-2' });
+    expect(g.nodes[1].params).toEqual({ provider: 'anthropic', effort: 'high' });
+    expect(g.nodes[2].params).toEqual({ provider: 'cartesia', 'cartesia.model': 'sonic-x', minSegmentChars: 5 });
+    for (const n of g.nodes) expect(registry[n.type]).toBeDefined();
+  });
+});
+
+describe('openai-compatible adapter', () => {
+  it('builds a chat request and parses the SSE payloads', async () => {
+    const { openaiCompatAdapter } = await import('../src/nodes/llm/openai');
+    const req = openaiCompatAdapter.buildRequest(
+      [
+        { role: 'user', text: 'hi' },
+        { role: 'assistant', text: 'hello' },
+        { role: 'user', text: 'how are you' },
+      ],
+      { endpoint: 'openrouter', model: 'm', system: 'sys', maxTokens: 50, extraBody: '{"temperature":0.2}' },
+    ) as { endpoint: string; body: Record<string, unknown> };
+    expect(req.endpoint).toBe('openrouter');
+    expect(req.body).toEqual({
+      model: 'm',
+      stream: true,
+      max_tokens: 50,
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'hello' },
+        { role: 'user', content: 'how are you' },
+      ],
+    });
+    const p = openaiCompatAdapter.parser();
+    expect(p.recv({ choices: [{ index: 0, delta: { role: 'assistant', content: '' } }] })).toEqual([]);
+    expect(p.recv({ choices: [{ index: 0, delta: { content: 'Hi' } }] })).toEqual([{ type: 'delta', text: 'Hi' }]);
+    expect(p.recv({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })).toEqual([]);
+    expect(p.recv({ $done: true })).toEqual([{ type: 'end', stopReason: 'stop' }]);
+    expect(p.close(null)).toEqual([]);
+    expect(openaiCompatAdapter.parser().recv({ error: { message: 'bad model' } })).toEqual([{ type: 'error', error: { message: 'bad model' } }]);
+  });
+});

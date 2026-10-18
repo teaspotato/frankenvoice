@@ -14,6 +14,12 @@ export interface ParamDef {
   default: Json;
   options?: string[];
   description?: string;
+  /** Show (and use) this param only when other params have one of these values, e.g. {provider: ['deepgram']}. */
+  when?: Record<string, Json[]>;
+}
+
+export function paramActive(p: ParamDef, values: Record<string, Json>): boolean {
+  return !p.when || Object.entries(p.when).every(([k, allowed]) => allowed.includes(values[k]));
 }
 
 export interface ChannelDef {
@@ -86,6 +92,8 @@ export interface NodeDef<P = any> {
   outputs: PortDef[];
   params: ParamDef[];
   channels?: ChannelDef[];
+  /** Proxy upstreams (API keys) this node needs with these params, e.g. ['anthropic'] or ['openai/openrouter']. */
+  requires?(params: Record<string, Json>): string[];
   create(ctx: NodeContext<P>): NodeImpl;
 }
 

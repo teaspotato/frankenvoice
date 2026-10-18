@@ -6,7 +6,7 @@ A research playground for full-duplex voice agents built by wiring existing comp
 
 ```bash
 npm install
-cp .env.example .env   # add ANTHROPIC_API_KEY, DEEPGRAM_API_KEY, CARTESIA_API_KEY
+cp .env.example .env   # add keys for the providers you use
 npm run dev            # local proxy on :8787 + Vite on :5173
 ```
 
@@ -17,10 +17,26 @@ The pipeline runs in the browser. The small proxy in `server/` keeps API keys ou
 ## Default pipeline
 
 ```
-mic ─┬─> vad (Silero, in-browser) ──> turn ─> llm (Claude) ─> tts (Cartesia) ─> speaker
-     └─> asr (Deepgram, streaming) ──┘  ^                                         │
-                                        └───────────── playback ──────────────────┘
+mic ─┬─> vad (Silero, in-browser) ──> turn ─> llm ─> tts ─> speaker
+     └─> asr (streaming) ────────────┘  ^                       │
+                                        └─────── playback ──────┘
 ```
+
+## Providers
+
+ASR, LLM and TTS are each one node with a **Provider** param, so swapping providers never means rewiring the graph:
+
+| node | providers | proxy env |
+| --- | --- | --- |
+| `asr` | `deepgram` | `DEEPGRAM_API_KEY` |
+| `llm` | `anthropic` | `ANTHROPIC_API_KEY` |
+| | `openai-compatible`, endpoint `openrouter` / `openai` / `custom` | `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `OPENAI_COMPAT_BASE_URL` (+ optional key) |
+| `tts` | `cartesia` | `CARTESIA_API_KEY` |
+| | `openai-compatible` (`/audio/speech`, PCM), endpoint `openai` / `custom` | as above |
+
+For OpenRouter, set the LLM node to `openai-compatible`, endpoint `openrouter`, and a model slug. The toolbar shows which keys the current graph still needs.
+
+Each provider is a small pure adapter (`src/nodes/{asr,llm,tts}/`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`src/drivers/index.ts`). Recordings keep the provider's raw payloads, so replay feeds the same bytes through the same adapter. Adding a provider means one adapter, plus a driver and proxy route if it speaks a new protocol.
 
 This first stage is half-duplex. The turn node commits a user turn on ASR endpointing and ignores user speech while the agent is talking. Barge-in and backchannels come next (see Roadmap).
 
@@ -33,7 +49,7 @@ The core rule is that **everything is replayable as-is**: ASR partials, LLM toke
 How the runtime ensures that:
 
 - **One session clock.** Every event has `t`, its arrival time in ms on a monotonic session clock. Events about audio also carry `media: {track, start, end}`, a sample range on a recorded media track. So each event records both *when* it happened and *which audio* it refers to. The mic driver also logs the AudioContext time of every captured frame.
-- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `silero`, `deepgram`, `anthropic`, `cartesia`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
+- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `silero`, `deepgram`, `anthropic`, `openai`, `cartesia`, `openai-tts`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
 - **Deterministic turns.** When an external event arrives, the runtime stamps it with the current time, hands it to its node, and drains every resulting message synchronously, all at that timestamp. Nodes are pure functions of what they receive, so the same external events at the same times always produce the same log.
 - **Replay on a virtual clock.** A replay serves every recorded exchange and timer from the trajectory at its original time, with the original event order breaking ties. The result is checked against the source: the Sessions list shows *identical to source ✓* or the first event where the two differ.
 - **Causality.** Every event lists the seqs of the events that caused it, so any output (a TTS chunk, say) can be traced back through the LLM tokens to the ASR result and the audio frames behind it.
@@ -70,7 +86,7 @@ The browser side of a channel is a `LiveDriver` in `src/drivers/index.ts`.
 ```
 src/core/     runtime, scheduler (live + virtual clock), world (live/replay IO), trajectory, bundle, compare
 src/nodes/    node definitions and the default graph
-src/drivers/  browser drivers: mic worklet, Silero (onnxruntime-web), Deepgram WS, Claude SDK, Cartesia, Web Audio
+src/drivers/  browser drivers: mic worklet, Silero (onnxruntime-web), Deepgram WS, Claude SDK, OpenAI-compatible SSE, TTS byte streams, Web Audio
 src/ui/       React Flow editor, inspector, sessions, event log
 server/       local proxy and session storage
 tests/        replay determinism tests with randomized fake drivers

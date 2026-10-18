@@ -5,6 +5,8 @@ import type { Json } from '../core/types';
 export type FvNodeData = {
   def: NodeDef;
   label: string;
+  /** Shown next to the type, e.g. the selected provider. */
+  subtitle?: string;
   state?: Record<string, Json>;
   active: boolean;
 };
@@ -29,7 +31,10 @@ export function FvNode({ data, selected }: NodeProps<FvFlowNode>) {
     <div className={`fv-node cat-${def.category}${selected ? ' selected' : ''}${data.active ? ' active' : ''}`}>
       <div className="fv-node-header">
         <span className="fv-node-title">{label}</span>
-        <span className="fv-node-type">{def.type}</span>
+        <span className="fv-node-type">
+          {def.type}
+          {data.subtitle ? ` · ${data.subtitle}` : ''}
+        </span>
       </div>
       <div className="fv-node-ports" style={{ height: rows * ROW }}>
         {def.inputs.map((p, i) => (

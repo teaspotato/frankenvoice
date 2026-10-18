@@ -1,0 +1,84 @@
+import type { Json, JsonObject } from '../../core/types';
+import type { ChatTurn, LlmAdapter, LlmStreamEvent } from './types';
+
+type Block = JsonObject & { type: string };
+
+/** Claude Messages API. Payloads are the SDK's raw stream events. */
+export const anthropicAdapter: LlmAdapter = {
+  provider: 'anthropic',
+  channel: 'anthropic',
+  defaultModel: 'claude-opus-5-5',
+  buildRequest(history: ChatTurn[], p: JsonObject): Json {
+    const messages: { role: string; content: Json }[] = [];
+    for (const t of history) {
+      const content: Json =
+        t.role === 'assistant' && t.native?.provider === 'anthropic' ? t.native.content : [{ type: 'text', text: t.text }];
+      const last = messages[messages.length - 1];
+      if (last?.role === t.role && t.role === 'user') (last.content as Json[]).push(...(content as Json[]));
+      else messages.push({ role: t.role, content });
+    }
+    return {
+      model: p.model,
+      max_tokens: p.maxTokens,
+      system: p.system,
+      messages: messages as Json,
+      output_config: { effort: p.effort },
+      ...(p.fallbacks ? { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' } : {}),
+    };
+  },
+  parser() {
+    const blocks: Block[] = [];
+    const json: Record<number, string> = {};
+    let stopReason: string | null = null;
+    return {
+      recv(data): LlmStreamEvent[] {
+        const ev = data as JsonObject;
+        switch (ev.type) {
+          case 'content_block_start':
+            blocks[ev.index as number] = { ...(ev.content_block as Block) };
+            return [];
+          case 'content_block_delta': {
+            const b = blocks[ev.index as number];
+            const d = ev.delta as JsonObject;
+            if (!b) return [];
+            if (d.type === 'text_delta') {
+              b.text = ((b.text as string) ?? '') + (d.text as string);
+              return [{ type: 'delta', text: d.text as string }];
+            }
+            if (d.type === 'thinking_delta') b.thinking = ((b.thinking as string) ?? '') + (d.thinking as string);
+            else if (d.type === 'signature_delta') b.signature = d.signature as string;
+            else if (d.type === 'input_json_delta') json[ev.index as number] = (json[ev.index as number] ?? '') + (d.partial_json as string);
+            return [];
+          }
+          case 'content_block_stop': {
+            const i = ev.index as number;
+            if (json[i] !== undefined && blocks[i]) {
+              try {
+                blocks[i].input = JSON.parse(json[i] || '{}') as Json;
+              } catch {
+                blocks[i].input = {};
+              }
+            }
+            return [];
+          }
+          case 'message_delta':
+            stopReason = ((ev.delta as JsonObject).stop_reason as string) ?? stopReason;
+            return [];
+          case 'message_stop':
+            return [{ type: 'end', stopReason }];
+          case 'error':
+            return [{ type: 'error', error: ev.error ?? null }];
+          default:
+            return [];
+        }
+      },
+      close(data) {
+        const d = data as JsonObject | null;
+        return d?.error ? [{ type: 'error', error: d.error }] : [{ type: 'end', stopReason }];
+      },
+      native() {
+        return blocks.filter((b) => b && (b.type !== 'text' || (b.text as string))) as Json;
+      },
+    };
+  },
+};

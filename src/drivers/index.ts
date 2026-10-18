@@ -145,27 +145,79 @@ const anthropic: LiveDriver = (req, sink) => {
   };
 };
 
-const cartesia: LiveDriver = (req, sink) => {
-  const r = req as { path: string; body: Json };
+/** Read a fetch body as Server-Sent Events, yielding each event's data string. Comment lines are dropped. */
+async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let data: string[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (value) buf += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).replace(/\r$/, '');
+      buf = buf.slice(nl + 1);
+      if (line === '') {
+        if (data.length) yield data.join('\n');
+        data = [];
+      } else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+    }
+    if (done) {
+      if (data.length) yield data.join('\n');
+      return;
+    }
+  }
+}
+
+async function postJson(url: string, body: Json, signal: AbortSignal): Promise<Response> {
+  return fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
+}
+
+/** OpenAI-compatible chat completions; each SSE data line is recorded parsed, `[DONE]` as {"$done": true}. */
+const openai: LiveDriver = (req, sink) => {
+  const r = req as { endpoint: string; body: Json };
   const ac = new AbortController();
   (async () => {
-    const res = await fetch(`/api/cartesia${r.path}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(r.body),
-      signal: ac.signal,
-    });
-    if (!res.ok || !res.body) return sink.close({ error: `HTTP ${res.status}`, body: await res.text() });
-    const reader = res.body.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      sink.recv(null, value);
+    const res = await postJson(`/api/openai/${encodeURIComponent(r.endpoint)}/chat/completions`, r.body, ac.signal);
+    if (!res.ok || !res.body) return sink.close({ error: { status: res.status, body: await res.text() } });
+    for await (const data of sseData(res.body)) {
+      if (data === '[DONE]') sink.recv({ $done: true });
+      else {
+        try {
+          sink.recv(JSON.parse(data) as Json);
+        } catch {
+          sink.recv({ $unparsed: data });
+        }
+      }
     }
     sink.close(null);
   })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
   return { send() {}, close: () => ac.abort() };
 };
+
+/** POST a JSON request and stream the raw response bytes back (TTS providers). */
+const rawBytes =
+  (url: (r: { endpoint?: string; path: string }) => string): LiveDriver =>
+  (req, sink) => {
+    const r = req as { endpoint?: string; path: string; body: Json };
+    const ac = new AbortController();
+    (async () => {
+      const res = await postJson(url(r), r.body, ac.signal);
+      if (!res.ok || !res.body) return sink.close({ error: { status: res.status, body: await res.text() } });
+      const reader = res.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        sink.recv(null, value);
+      }
+      sink.close(null);
+    })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
+    return { send() {}, close: () => ac.abort() };
+  };
+
+const cartesia = rawBytes((r) => `/api/cartesia${r.path}`);
+const openaiTts = rawBytes((r) => `/api/openai/${encodeURIComponent(r.endpoint ?? '')}${r.path}`);
 
 const speaker: LiveDriver = (_req, sink, env) => {
   const ctx = new AudioContext({ latencyHint: 'interactive' });
@@ -197,4 +249,4 @@ const speaker: LiveDriver = (_req, sink, env) => {
   };
 };
 
-export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, cartesia, speaker };
+export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, speaker };
