@@ -15,7 +15,7 @@ export const LANES: Lane[] = [
   { id: 'vad', label: 'VAD', height: 60 },
   { id: 'asr', label: 'ASR', height: 46 },
   { id: 'turn', label: 'Turn', height: 36 },
-  { id: 'llm', label: 'LLM', height: 36 },
+  { id: 'llm', label: 'LLM', height: 60 },
   { id: 'tts', label: 'TTS', height: 36 },
   { id: 'speaker', label: 'Playback', height: 48 },
 ];
@@ -29,6 +29,9 @@ interface Hit {
   x0: number;
   x1: number;
   text: string;
+  /** Vertical extent within the canvas, when only part of the lane counts. */
+  y0?: number;
+  y1?: number;
 }
 
 interface View {
@@ -379,20 +382,37 @@ export function Dashboard({
         hits.push({ lane: 'turn', x0: x(u.t) - 3, x1: x(u.t) + 3, text: `user turn: ${u.text}` });
       }
 
-      // LLM: waiting for the first token, then generating
+      // LLM: waiting for the first token, then generating; below, each chunk at its arrival
       for (const l of m.llm) {
         const end = l.t1 ?? head;
         if (end < t0 || l.t0 > t1) continue;
+        const [ly0, ly1] = laneY.llm;
+        const h = ly1 - ly0;
         const ft = l.firstToken ?? end;
-        span('llm', l.t0, ft, col.llm, 0.15, '', 0.2, 0.8);
+        const dur = (end - ft) / 1000;
+        const stats = `${l.firstToken ? `TTFT ${(l.firstToken - l.t0).toFixed(0)} ms` : 'waiting…'} · ${l.chunks.length} chunks${dur > 0.05 ? ` · ${(l.text.length / dur).toFixed(0)} ch/s` : ''}${l.status ? ` · ${l.status}` : ''}`;
+        span('llm', l.t0, ft, col.llm, 0.15, '', 0.06, 0.4);
         hits.pop();
-        span('llm', ft, end, col.llm, 0.35, l.text, 0.2, 0.8);
+        span('llm', ft, end, col.llm, 0.35, stats, 0.06, 0.4);
         hits.pop();
-        hits.push({
-          lane: 'llm',
-          x0: x(l.t0),
-          x1: x(end),
-          text: `${l.firstToken ? `first token ${(l.firstToken - l.t0).toFixed(0)} ms` : 'waiting for first token'}${l.status ? ` · ${l.status}` : ''}\n${l.text}`,
+        hits.push({ lane: 'llm', x0: x(l.t0), x1: x(end), text: `${stats}\n${l.text}` });
+        let so = '';
+        l.chunks.forEach((c, i) => {
+          so += c.text;
+          const cx = x(c.t);
+          const nx = i + 1 < l.chunks.length ? x(l.chunks[i + 1].t) : x(end) + 200;
+          if (nx < LABEL_W || cx > W) return;
+          vline('llm', c.t, col.llm, 0.46, 0.56);
+          if (nx - cx > 8) {
+            g.save();
+            g.beginPath();
+            g.rect(cx + 1, ly0 + h * 0.5, nx - cx - 2, h * 0.5);
+            g.clip();
+            g.fillStyle = col.text;
+            g.fillText(c.text.replace(/\s+/g, ' '), cx + 2, ly0 + h * 0.76);
+            g.restore();
+          }
+          hits.push({ lane: 'llm', y0: ly0 + h * 0.44, y1: ly1, x0: cx - 1, x1: Math.max(cx + 3, nx - 1), text: `+${(c.t - l.t0).toFixed(0)} ms  ${JSON.stringify(c.text)}\n${so}` });
         });
       }
 
@@ -543,7 +563,9 @@ export function Dashboard({
       if (hover.y >= y && hover.y < y + l.height) tipLane = l.id;
       y += l.height;
     }
-    tip = [...hitsRef.current].reverse().find((h) => h.lane === tipLane && hover.x >= h.x0 - 1 && hover.x <= h.x1 + 1);
+    tip = [...hitsRef.current]
+      .reverse()
+      .find((h) => h.lane === tipLane && hover.x >= h.x0 - 1 && hover.x <= h.x1 + 1 && (h.y0 === undefined || (hover.y >= h.y0 && hover.y <= h.y1!)));
   }
   let cleanAt: string | undefined;
   if (hover && tipLane === 'cleanup' && modelRef.current) {

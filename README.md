@@ -20,7 +20,7 @@ Open http://localhost:5173 and press **Run live**. Allow microphone access. Pres
   - *Mic*: waveform. *Cleaned*: what the noise/echo stage passes on, with how much it removed (in − out, 0–30 dB line); red ticks mark double talk (echo canceller not adapting) or RNNoise gating. *VAD*: speech probability with the start/stop thresholds; detected speech is shaded across Mic and VAD.
   - *ASR*: each result drawn over the audio it covers (dashed while partial, solid when final), with a line to the tick where it arrived, so recognition latency is visible.
   - *Turn*: floor state (thinking, speaking) and committed user turns.
-  - *LLM*: waiting for the first token (light), then generating (solid); hover for time to first token and the text.
+  - *LLM*: waiting for the first token (light), then generating (solid), labelled with time to first token, chunk count and chars/s. Below it, each streamed chunk is drawn at the moment it arrived (zoom in to read them); hover a chunk for its offset and the text so far.
   - *TTS*: request ticks and each sentence's audio stream. *Playback*: the scheduled agent audio, sentence starts, and interruptions.
   - Scroll to zoom, drag to pan, double-click or **Fit** for the whole session, **Follow** to track the live edge. Hover for details; click a lane to select its stage. Errors show as red dots on their stage's lane.
 - **Stage panel** (right): pick a stage's implementation (for example Silero or energy VAD, API or browser TTS) and edit its params. Saved in the browser; **Save config** / **Open…** move it as a file, and **Use its config** on a session restores what that session ran with.

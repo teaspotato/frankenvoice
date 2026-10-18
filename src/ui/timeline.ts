@@ -28,6 +28,8 @@ export interface LlmSpan extends Span {
   rid: string;
   firstToken?: number;
   status?: string;
+  /** Streamed chunks as they arrived. */
+  chunks: { t: number; text: string }[];
 }
 
 export interface AudioBlock {
@@ -209,13 +211,14 @@ export class TimelineModel {
         this.userTurns.push({ t: e.t, text: d.text ?? '' });
         break;
       case 'llm.start':
-        this.llm.push({ rid: d.rid, t0: e.t, text: '' });
+        this.llm.push({ rid: d.rid, t0: e.t, text: '', chunks: [] });
         break;
       case 'llm.delta': {
         const l = this.llm.find((x) => x.rid === d.rid);
         if (l) {
           l.firstToken ??= e.t;
           l.text += d.text ?? '';
+          l.chunks.push({ t: e.t, text: d.text ?? '' });
         }
         break;
       }
