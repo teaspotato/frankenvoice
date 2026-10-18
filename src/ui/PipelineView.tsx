@@ -26,6 +26,8 @@ const VIEW_H = 272;
 const FEEDBACK_Y = 60;
 /** The echo reference runs under everything, below ASR. */
 const REFERENCE_Y = 250;
+/** Barge-in cancels run between the row and the echo reference. */
+const CONTROL_Y = 190;
 
 function summarize(v: Json): string {
   if (v === null) return '–';
@@ -95,6 +97,22 @@ export function PipelineView({
     lx: (ox + tx) / 2,
     ly: FEEDBACK_Y - 6,
   });
+
+  // Barge-in: turn-taking can cancel the reply in flight, below the row.
+  if (registry[stageType(config, 'turn')].outputs.some((p) => p.name === 'control')) {
+    const sx = POS.turn[0] + W / 2 + 30;
+    const by = POS.turn[1] + H;
+    const targets = (['llm', 'tts', ...(out === 'speaker' ? ['speaker'] : [])] as StageId[]).map((id) => POS[id][0] + W / 2 + 30);
+    const last = targets[targets.length - 1];
+    edges.push({
+      src: 'turn.control',
+      d: `M${sx},${by} L${sx},${CONTROL_Y - r} Q${sx},${CONTROL_Y} ${sx + r},${CONTROL_Y} L${last - r},${CONTROL_Y} Q${last},${CONTROL_Y} ${last},${CONTROL_Y - r} L${last},${by + 2}`,
+      label: 'cancel (barge-in)',
+      lx: (sx + targets[0]) / 2,
+      ly: CONTROL_Y + 12,
+    });
+    for (const tx of targets.slice(0, -1)) edges.push({ src: 'turn.control', d: `M${tx},${CONTROL_Y} L${tx},${by + 2}`, label: '', lx: 0, ly: 0 });
+  }
 
   if (out === 'speaker' && registry[stageType(config, 'cleanup')].inputs.some((p) => p.name === 'ref')) {
     const [sx, sy] = [POS.speaker[0] + W / 2, POS.speaker[1] + H];

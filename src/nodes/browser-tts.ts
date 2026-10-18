@@ -42,6 +42,17 @@ export const browserTtsNode: NodeDef = {
     let segNo = 0;
     let llmDone = false;
     let playing = false;
+    /** What has been said of this reply: finished sentences, and the current one up to its last word boundary. */
+    let said: string[] = [];
+    let speaking: { text: string; upTo: number } | undefined;
+
+    const heard = () => {
+      if (!speaking) return said.join(' ');
+      // A boundary marks the start of a word; count that word as heard.
+      const rest = speaking.text.slice(speaking.upTo);
+      const wordEnd = speaking.upTo + (rest.match(/^\S*/)?.[0].length ?? 0);
+      return [...said, speaking.text.slice(0, wordEnd).trim()].filter(Boolean).join(' ');
+    };
 
     const setStatus = (s: string) => ctx.setState('status', s);
 
@@ -55,6 +66,7 @@ export const browserTtsNode: NodeDef = {
           onRecv(data) {
             const d = data as { type: string; charIndex?: number };
             if (d.type === 'start') {
+              speaking = { text: s.text, upTo: 0 };
               if (!playing) {
                 playing = true;
                 ctx.setState('playing', true);
@@ -62,12 +74,15 @@ export const browserTtsNode: NodeDef = {
               }
               ctx.emit('playback', { type: 'playback.segment', rid: s.rid, seg: s.seg, text: s.text, at: ctx.now() });
             } else if (d.type === 'boundary') {
+              if (speaking) speaking.upTo = d.charIndex ?? 0;
               ctx.emit('playback', { type: 'playback.boundary', rid: s.rid, seg: s.seg, charIndex: d.charIndex ?? 0, at: ctx.now() });
             }
           },
           onClose(data) {
             if (current !== io) return;
             current = undefined;
+            if (speaking) said.push(speaking.text);
+            speaking = undefined;
             if (data && (data as { error?: unknown }).error) ctx.log('error', 'speech synthesis failed', data);
             pump();
           },
@@ -93,7 +108,7 @@ export const browserTtsNode: NodeDef = {
       if (playing) {
         playing = false;
         ctx.setState('playing', false);
-        ctx.emit('playback', { type: 'playback.interrupted', rid, at: ctx.now() });
+        ctx.emit('playback', { type: 'playback.interrupted', rid, at: ctx.now(), heard: heard() });
       }
       queue = [];
       rid = '';
@@ -116,6 +131,8 @@ export const browserTtsNode: NodeDef = {
           case 'llm.start':
             if (rid) cancel();
             rid = msg.rid as string;
+            said = [];
+            speaking = undefined;
             segNo = 0;
             llmDone = false;
             break;

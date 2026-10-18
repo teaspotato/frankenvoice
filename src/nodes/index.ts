@@ -6,7 +6,7 @@ import { micNode } from './mic';
 import { aecNode, browserCleanupNode, noCleanupNode, rnnoiseNode } from './cleanup';
 import { energyVadNode, sileroVadNode } from './vad';
 import { asrNode } from './asr';
-import { halfDuplexTurnNode } from './turn';
+import { duplexTurnNode, halfDuplexTurnNode } from './turn';
 import { llmNode } from './llm';
 import { ttsNode } from './tts';
 import { speakerNode } from './speaker';
@@ -14,7 +14,7 @@ import { browserTtsNode } from './browser-tts';
 import { echoLlmNode, toneTtsNode } from './mocks';
 
 export const registry: NodeRegistry = Object.fromEntries(
-  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, energyVadNode, asrNode, halfDuplexTurnNode, llmNode, ttsNode, browserTtsNode, speakerNode, echoLlmNode, toneTtsNode].map(
+  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, energyVadNode, asrNode, duplexTurnNode, halfDuplexTurnNode, llmNode, ttsNode, browserTtsNode, speakerNode, echoLlmNode, toneTtsNode].map(
     (d) => [d.type, d],
   ),
 );

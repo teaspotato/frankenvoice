@@ -14,7 +14,7 @@ export const LANES: Lane[] = [
   { id: 'cleanup', label: 'Cleaned', height: 52 },
   { id: 'vad', label: 'VAD', height: 60 },
   { id: 'asr', label: 'ASR', height: 46 },
-  { id: 'turn', label: 'Turn', height: 36 },
+  { id: 'turn', label: 'Turn', height: 52 },
   { id: 'llm', label: 'LLM', height: 60 },
   { id: 'tts', label: 'TTS', height: 36 },
   { id: 'speaker', label: 'Playback', height: 48 },
@@ -27,7 +27,7 @@ const LEGEND: Record<string, string> = {
   vad: 'Speech probability per frame (line) against the start and stop thresholds (dashed). Shaded: detected speech.',
   asr:
     'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
-  turn: 'Floor state: thinking (amber) and speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.',
+  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), grey dot = backchannel or noise, ignored.',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT, chunks and chars/s. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
   speaker: 'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries.',
@@ -484,15 +484,53 @@ export function Dashboard({
       m.floor.forEach((f, i) => {
         const end = m.floor[i + 1]?.t ?? head;
         if (end < t0 || f.t > t1) return;
-        if (floorColor[f.state]) span('turn', f.t, end, floorColor[f.state], 0.25, f.state, 0.15, 0.85);
+        if (floorColor[f.state]) span('turn', f.t, end, floorColor[f.state], 0.25, f.state, 0.06, 0.56);
         else hits.push({ lane: 'turn', x0: x(f.t), x1: x(end), text: f.state });
         tag([f.seq]);
       });
       for (const u of m.userTurns) {
         if (u.t < t0 || u.t > t1) continue;
         vline('turn', u.t, col.turn);
-        hits.push({ lane: 'turn', x0: x(u.t) - 3, x1: x(u.t) + 3, text: `user turn: ${u.text}`, seqs: [u.seq], audio: u.a0 === undefined ? undefined : [u.a0, u.a1!] });
+        hits.push({
+          lane: 'turn',
+          x0: x(u.t) - 3,
+          x1: x(u.t) + 3,
+          text: `user turn${u.replaces ? ' (resent: the user kept talking)' : ''}: ${u.text}`,
+          seqs: [u.seq],
+          audio: u.a0 === undefined ? undefined : [u.a0, u.a1!],
+        });
       }
+      // Barge-in: user speech while the agent had the floor, and the decision on it
+      const verdict: Record<string, [string, string]> = {
+        interrupt: [col.danger, 'interrupted the agent'],
+        continue: [col.warn, 'user kept talking: reply dropped, turn resent'],
+        backchannel: [col.muted, 'backchannel or noise: agent kept going'],
+      };
+      m.bargeIns.forEach((b, i) => {
+        const end = b.t1 ?? head;
+        if (end < t0 || b.t0 > t1) return;
+        const [ly0, ly1] = laneY.turn;
+        const h = ly1 - ly0;
+        const [c, what] = verdict[b.decision ?? ''] ?? [col.text, 'deciding…'];
+        const x0 = x(b.t0);
+        const x1 = Math.max(x(end), x0 + 2);
+        g.globalAlpha = 0.25;
+        g.fillStyle = c;
+        g.fillRect(x0, ly0 + h * 0.66, x1 - x0, h * 0.26);
+        g.globalAlpha = 1;
+        if (b.decision) mark('turn', end, c, 0.79, b.decision === 'backchannel' ? 'dot' : 'diamond', 4);
+        const next = m.bargeIns[i + 1];
+        label(b.decision ?? '', x1 + 4, Math.min(x1 + 120, next ? x(next.t0) : Infinity), ly0 + h * 0.79, c);
+        hits.push({
+          lane: 'turn',
+          x0,
+          x1: x1 + 6,
+          y0: ly0 + h * 0.6,
+          y1: ly1,
+          text: `user spoke over the agent for ${(end - b.t0).toFixed(0)} ms: ${what}${b.why ? ` (${b.why})` : ''}${b.text ? `\nASR so far: ${b.text}` : ''}`,
+          seqs: b.seqs,
+        });
+      });
 
       // LLM: waiting for the first token, then generating; below, each chunk at its arrival
       for (const l of m.llm) {
@@ -547,7 +585,7 @@ export function Dashboard({
         const end = p.t1 ?? head;
         if (end < t0 || p.t0 > t1) continue;
         span('speaker', p.t0, end, col.sink, 0.1, '', 0, 1);
-        hits[hits.length - 1].text = `${p.interrupted ? 'interrupted' : 'played'} ${((end - p.t0) / 1000).toFixed(2)} s`;
+        hits[hits.length - 1].text = `${p.interrupted ? 'interrupted' : 'played'} ${((end - p.t0) / 1000).toFixed(2)} s${p.heard !== undefined ? `\nheard: ${p.heard || '(nothing)'}` : ''}`;
         tag(p.seqs);
         if (p.interrupted) vline('speaker', end, col.danger);
       }

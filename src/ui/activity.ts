@@ -24,11 +24,14 @@ export class ActivityTracker {
   private on = new Map<StageId, string>();
   /** Open streams per output port, e.g. an LLM response that hasn't ended. */
   private open = new Map<string, Set<string>>();
+  private floor = 'listening';
+  private bargeIn = false;
 
   consume(e: TrajEvent, wall: number) {
     const d = (e.data ?? {}) as Record<string, unknown>;
     if (e.kind === 'state' && e.node === 'turn' && typeof d.floor === 'string') {
-      this.set('turn', d.floor === 'listening' ? null : d.floor);
+      this.floor = d.floor;
+      this.showTurn();
       return;
     }
     if (e.kind !== 'msg' || !e.port) return;
@@ -41,6 +44,10 @@ export class ActivityTracker {
     this.lastMsg.set(key, wall);
     const rid = String(d.rid ?? '');
     switch (type) {
+      case 'turn.decision':
+        this.bargeIn = d.decision === 'candidate';
+        this.showTurn();
+        break;
       case 'vad.speech_start':
         this.set('vad', 'speech');
         break;
@@ -90,6 +97,10 @@ export class ActivityTracker {
     for (const [k, t] of this.lastMsg) if (wall - t < EDGE_HOLD_MS) edges.add(k);
     for (const [k, s] of this.open) if (s.size) edges.add(k);
     return { edges, stages: new Map(this.on) };
+  }
+
+  private showTurn() {
+    this.set('turn', this.bargeIn ? 'user talking over' : this.floor === 'listening' ? null : this.floor);
   }
 
   private set(stage: StageId, label: string | null) {

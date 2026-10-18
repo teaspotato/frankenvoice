@@ -9,6 +9,8 @@ export interface ChatTurn {
   role: 'user' | 'assistant';
   text: string;
   native?: { provider: string; content: Json };
+  /** The user turn this belongs to (an assistant turn: the one it answers). */
+  turnId?: string;
 }
 
 /** What every provider stream is reduced to. */

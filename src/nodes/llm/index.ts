@@ -67,7 +67,9 @@ export const llmNode: NodeDef = {
     const reqParams: JsonObject = { ...p, model: (p.model as string) || adapter?.defaultModel || '' };
     const history: ChatTurn[] = [];
     let n = 0;
-    let active: { io: ReturnType<typeof ctx.io.open>; rid: string; parser: LlmStreamParser; text: string; stopReason: string | null } | undefined;
+    let active:
+      | { io: ReturnType<typeof ctx.io.open>; rid: string; turnId?: string; parser: LlmStreamParser; text: string; stopReason: string | null }
+      | undefined;
 
     const finish = (status: 'done' | 'cancelled' | 'error', error?: Json) => {
       if (!active) return;
@@ -76,7 +78,8 @@ export const llmNode: NodeDef = {
       if (!a.io.closed) a.io.close({ status });
       // Keep whatever the model produced, so the next request continues from it.
       const native = a.parser.native();
-      if (a.text || native) history.push({ role: 'assistant', text: a.text, ...(native ? { native: { provider: adapter.provider, content: native } } : {}) });
+      if (a.text || native)
+        history.push({ role: 'assistant', text: a.text, turnId: a.turnId, ...(native ? { native: { provider: adapter.provider, content: native } } : {}) });
       ctx.emit('text', { type: 'llm.end', rid: a.rid, status, stopReason: a.stopReason, text: a.text, ...(error ? { error } : {}) });
       ctx.setState('status', status === 'error' ? 'error' : 'idle');
       ctx.setState('turns', history.length);
@@ -105,13 +108,29 @@ export const llmNode: NodeDef = {
           if (msg.type === 'cancel') finish('cancelled');
           return;
         }
+        if (msg.type === 'turn.heard') {
+          // The user cut the reply off: keep only what they heard, marked as cut off.
+          const i = history.findIndex((t) => t.role === 'assistant' && t.turnId === msg.turnId);
+          if (i < 0) return;
+          const heard = ((msg.text as string) ?? '').trim();
+          if (!heard) history.splice(i, 1);
+          else history[i] = { role: 'assistant', text: `${heard}—`, turnId: history[i].turnId };
+          ctx.setState('turns', history.length);
+          ctx.log('info', heard ? 'reply truncated to what was heard' : 'reply dropped: nothing was heard', { turnId: msg.turnId as string, heard });
+          return;
+        }
         if (msg.type !== 'turn.user' || !adapter) return;
         if (!reqParams.model) {
           ctx.log('error', `set a model for provider "${adapter.provider}"`);
           return;
         }
         finish('cancelled');
-        history.push({ role: 'user', text: msg.text as string });
+        if (msg.replaces) {
+          // The user wasn't done: this turn replaces an earlier one and whatever followed it.
+          const i = history.findIndex((t) => t.role === 'user' && t.turnId === msg.replaces);
+          if (i >= 0) history.splice(i);
+        }
+        history.push({ role: 'user', text: msg.text as string, turnId: msg.turnId as string });
 
         const rid = `${ctx.id}-r${n++}`;
         let request: Json;
@@ -132,7 +151,7 @@ export const llmNode: NodeDef = {
             if (active?.io === io) handle(parser.close(data));
           },
         });
-        active = { io, rid, parser, text: '', stopReason: null };
+        active = { io, rid, turnId: msg.turnId as string, parser, text: '', stopReason: null };
       },
       stop() {
         finish('cancelled');

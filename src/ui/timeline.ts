@@ -83,11 +83,13 @@ export class TimelineModel {
   asr = new Map<number, AsrResult>();
   asrArrivals: { t: number; final: boolean; text: string; seq: number; a0?: number; a1?: number }[] = [];
   floor: { t: number; state: string; seq: number }[] = [];
-  userTurns: (Marker & { a0?: number; a1?: number })[] = [];
+  userTurns: (Marker & { a0?: number; a1?: number; replaces?: string })[] = [];
+  /** User speech over the agent and what turn-taking made of it. */
+  bargeIns: { t0: number; t1?: number; decision?: string; why?: string; text: string; seqs: number[] }[] = [];
   llm: LlmSpan[] = [];
   ttsRequests: { t: number; seq: number }[] = [];
   tts: (Span & { rid: string; seg: number })[] = [];
-  playback: (Span & { rid: string; interrupted?: boolean })[] = [];
+  playback: (Span & { rid: string; interrupted?: boolean; heard?: string })[] = [];
   playbackSegments: Marker[] = [];
   boundaries: number[] = [];
   agentAudio: AudioBlock[] = [];
@@ -134,6 +136,15 @@ export class TimelineModel {
   /** Session time of mic peak `i` (peaks are equally spaced in audio time). */
   peakToT(i: number): number {
     return this.sampleToT((i + 0.5) * this.micRate * (PEAK_MS / 1000));
+  }
+
+  private clipAgentAudio(at: number) {
+    this.playbackSegments = this.playbackSegments.filter((s) => s.t < at);
+    this.agentAudio = this.agentAudio.flatMap((b) => {
+      if (b.t >= at) return [];
+      const keep = Math.ceil((at - b.t) / PEAK_MS);
+      return [keep < b.peaks.length ? { ...b, peaks: b.peaks.slice(0, keep) } : b];
+    });
   }
 
   private peaks(samples: Float32Array, rate: number): Float32Array {
@@ -263,7 +274,30 @@ export class TimelineModel {
       }
       case 'turn.user': {
         const audio = typeof d.from === 'number' && d.from >= 0 ? { a0: this.sampleToT(d.from), a1: this.sampleToT(d.to) } : {};
-        this.userTurns.push({ t: e.t, text: d.text ?? '', seq: e.seq, ...audio });
+        this.userTurns.push({ t: e.t, text: d.text ?? '', seq: e.seq, ...audio, ...(d.replaces ? { replaces: d.replaces } : {}) });
+        break;
+      }
+      case 'turn.decision': {
+        if (d.decision === 'candidate') {
+          this.bargeIns.push({ t0: e.t, text: '', seqs: [e.seq] });
+          break;
+        }
+        const b = this.bargeIns[this.bargeIns.length - 1];
+        if (b && b.t1 === undefined) {
+          b.t1 = e.t;
+          b.decision = d.decision;
+          b.why = d.why;
+          b.text = d.text ?? '';
+          b.seqs.push(e.seq);
+        }
+        break;
+      }
+      case 'turn.heard': {
+        const p = this.playback[this.playback.length - 1];
+        if (p) {
+          p.heard = d.text ?? '';
+          p.seqs.push(e.seq);
+        }
         break;
       }
       case 'llm.start':
@@ -316,6 +350,8 @@ export class TimelineModel {
           p.t1 = d.at ?? e.t;
           p.interrupted = d.type === 'playback.interrupted';
           p.seqs.push(e.seq);
+          // Audio already scheduled past the cut never played: don't draw it.
+          if (p.interrupted) this.clipAgentAudio(p.t1!);
         }
         break;
       }

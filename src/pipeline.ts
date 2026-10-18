@@ -29,7 +29,7 @@ export const STAGES: StageDef[] = [
   },
   { id: 'vad', label: 'VAD', variants: { silero: 'vad.silero', energy: 'vad.energy' } },
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
-  { id: 'turn', label: 'Turn-taking', variants: { 'half-duplex': 'turn.half-duplex' } },
+  { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
   { id: 'tts', label: 'TTS', variants: { api: 'tts', browser: 'tts.browser', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
@@ -61,6 +61,8 @@ export function normalizeConfig(c: Partial<PipelineConfig> | undefined): Pipelin
     const sc = c?.[s.id];
     if (sc && sc.variant in s.variants) d[s.id] = { variant: sc.variant, params: { ...d[s.id].params, ...sc.params } };
   }
+  // Configs saved before full-duplex existed move to it once; picking half-duplex again sticks.
+  if (d.turn.variant === 'half-duplex' && !('full-duplex' in d.turn.params)) d.turn = { variant: 'full-duplex', params: { ...d.turn.params, 'full-duplex': {} } };
   return d;
 }
 
@@ -112,6 +114,10 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('llm', 'text', 'tts', 'text'),
     ...(hasSpeaker ? [e('tts', 'audio', 'speaker', 'audio'), e('speaker', 'playback', 'turn', 'playback')] : [e('tts', 'playback', 'turn', 'playback')]),
     ...(hasSpeaker && wantsReference ? [e('speaker', 'played', 'cleanup', 'ref')] : []),
+    // Barge-in: turn-taking can stop the reply in flight.
+    ...(registry[stageType(c, 'turn')].outputs.some((p) => p.name === 'control')
+      ? [e('turn', 'control', 'llm', 'control'), e('turn', 'control', 'tts', 'control'), ...(hasSpeaker ? [e('turn', 'control', 'speaker', 'control')] : [])]
+      : []),
   ];
   return { format: GRAPH_FORMAT, formatVersion: GRAPH_FORMAT_VERSION, name: 'Cascade', nodes, edges };
 }

@@ -19,7 +19,7 @@ Open http://localhost:5173 and press **Run live**. Allow microphone access. Pres
 - **Dashboard** (middle): one lane per stage on a shared time axis, live while running and the same for replays and loaded sessions.
   - *Mic*: waveform. *Cleaned*: what the noise/echo stage passes on, with how much it removed (in − out, 0–30 dB line); red ticks mark double talk (echo canceller not adapting) or RNNoise gating. *VAD*: speech probability with the start/stop thresholds; detected speech is shaded across Mic and VAD.
   - *ASR*: each result drawn over the audio it covers (dashed while partial, solid when final), with a line to the dot where it arrived, so recognition latency is visible.
-  - *Turn*: floor state (thinking, speaking) and committed user turns.
+  - *Turn*: floor state (thinking, speaking) and committed user turns. Below it, each time the user talked over the agent: a band for how long, ending in the verdict (red *interrupt*, amber *continue*, grey *backchannel*). Hover for the reason and what the ASR had heard.
   - *LLM*: waiting for the first token (light), then generating (solid), labelled with time to first token, chunk count and chars/s. Below it, each streamed chunk gets a dot and its text at the moment it arrived (zoom in to read them); hover a chunk for its offset and the text so far.
   - *TTS*: a diamond per request sent and each sentence's audio stream. *Playback*: the scheduled agent audio, sentence starts (diamonds), word boundaries (dots), and interruptions.
   - Scroll to zoom, drag to pan, double-click or **Fit** for the whole session, **Follow** to track the live edge. Hover for details; click a lane's name to select its stage, empty space to seek. Errors show as red dots on their stage's lane.
@@ -37,7 +37,8 @@ The pipeline runs in the browser. The small proxy in `server/` keeps API keys ou
 ```
                        ┌─> vad (Silero) ──┐
 mic ─> noise/echo ─────┤                  ├─> turn ─> llm ─> tts ─> speaker
-          ^            └─> asr (streaming)┘    ^                     │  │
+          ^            └─> asr (streaming)┘    ^ │                   │  │
+          │                                    │ └ cancel ─> llm, tts, speaker
           │                                    └──── playback ───────┘  │
           └──────────────── echo reference (what was played) ───────────┘
 ```
@@ -75,7 +76,13 @@ For OpenRouter, set the LLM stage provider to `openai-compatible`, endpoint `ope
 
 Each provider is a small pure adapter (`src/nodes/{asr,llm,tts}/`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`src/drivers/index.ts`). Recordings keep the provider's raw payloads, so replay feeds the same bytes through the same adapter. Adding a provider means one adapter, plus a driver and proxy route if it speaks a new protocol.
 
-This first stage is half-duplex. The turn node commits a user turn on ASR endpointing and ignores user speech while the agent is talking. Barge-in and backchannels come next (see Roadmap).
+Turn-taking is full-duplex by default (`turn.duplex` in `src/nodes/turn.ts`); `half-duplex` is still selectable and ignores the user while the agent talks. The full-duplex stage commits a user turn on ASR endpointing like before. When VAD hears the user while the agent is thinking or speaking, it waits *min speech to interrupt* (400 ms), then decides:
+
+- **backchannel**: the speech ended first, or the ASR so far is only *backchannel words* (yeah, okay, mhm, …) and it is shorter than *max backchannel* (1200 ms). The agent keeps going.
+- **interrupt**: the agent was speaking. It sends `cancel` to the LLM, TTS and speaker. The speaker reports how much of the reply was heard (whole sentences played, plus the words of the current one in proportion to its playback), and the LLM's history keeps only that, ending in "—".
+- **continue**: the agent was still thinking (the user wasn't done). The reply is cancelled, and the previous turn is resent together with what the user says now (`turn.user` with `replaces`), replacing it in the LLM history.
+
+The speaker no longer reports the end of playback during a gap between sentences; it waits until the TTS reply is complete.
 
 `tts.browser` (TTS implementation `browser`) replaces both `tts` and `speaker`; the pipeline drops the speaker stage when it is selected. The browser plays the audio itself, so no samples are recorded. What is recorded is when each sentence started, each word boundary the browser reported, and when it ended, so replay reproduces the playback timing and audible replay speaks the text again. Voices differ between browsers and machines, and headless browsers usually have none.
 
@@ -135,6 +142,6 @@ tests/        replay determinism tests with randomized fake drivers
 ## Roadmap
 
 1. ~~Runtime with trajectory logging and a basic voice loop~~; fixed pipeline with a live per-stage dashboard, scrubbing and run comparison
-2. Full-duplex floor control: barge-in, with history cut back to what was heard; backchannels; every decision marked on the dashboard with its reason
+2. ~~Full-duplex floor control: barge-in, with history cut back to what was heard; backchannels; every decision marked on the dashboard with its reason~~ (first version; tune on real sessions)
 3. Tool calls mid-conversation, with filler speech and interruptible calls
 4. Local models on a GPU box (VAD, ASR, LLM, TTS), with their internals visualized
