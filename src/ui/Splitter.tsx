@@ -9,6 +9,8 @@ export interface Layout {
   side: number;
   /** Whether the event log is expanded; collapsed by default. */
   logOpen: boolean;
+  /** Whether the side panel (stage settings, sessions) is shown. */
+  sideOpen: boolean;
 }
 
 const LAYOUT_KEY = 'frankenvoice.layout';
@@ -17,6 +19,7 @@ export const DEFAULT_LAYOUT: Layout = {
   log: 220,
   side: 330,
   logOpen: false,
+  sideOpen: true,
 };
 type Size = 'diagram' | 'log' | 'side';
 const MIN: Record<Size, number> = { diagram: 80, log: 60, side: 220 };

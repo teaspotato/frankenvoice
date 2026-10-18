@@ -55,6 +55,8 @@ input, select, textarea { background: var(--bg); border: 1px solid var(--border)
 .toolbar { grid-area: bar; display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
 .toolbar .brand { font-weight: 700; letter-spacing: 0.02em; }
 .toolbar .spacer { flex: 1; }
+.app.side-collapsed { grid-template-columns: minmax(0, 1fr) 0; }
+.side-collapsed .inspector, .side-collapsed .splitter-side { display: none; }
 .app.log-collapsed { grid-template-rows: auto var(--diagram-h, 220px) minmax(120px, 1fr) auto; }
 .diagram, .log { position: relative; }
 .splitter { position: absolute; z-index: 5; touch-action: none; }

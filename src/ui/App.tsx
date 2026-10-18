@@ -339,12 +339,17 @@ export function App() {
 
   const missingKeys = health ? requiredUpstreams(config).filter((k) => !health[k]) : [];
   // The Playback lane belongs to the TTS stage when the browser speaks for itself.
+  /** Selecting a stage shows its settings, so it opens a collapsed side panel. */
+  const selectStage = (id: StageId | null) => {
+    setSelected(id);
+    if (id && !layout.sideOpen) setLayout({ ...layout, sideOpen: true });
+  };
   const stageOf = (lane: string | null): StageId | null =>
     lane === null ? null : activeStages(config).some((s) => s.id === lane) ? (lane as StageId) : 'tts';
 
   return (
     <div
-      className={`app${layout.logOpen ? '' : ' log-collapsed'}`}
+      className={`app${layout.logOpen ? '' : ' log-collapsed'}${layout.sideOpen ? '' : ' side-collapsed'}`}
       style={{ '--diagram-h': `${layout.diagram}px`, '--log-h': `${layout.log}px`, '--side-w': `${layout.side}px` } as CSSProperties}
     >
       <header className="toolbar">
@@ -382,12 +387,18 @@ export function App() {
           <span className="ok">proxy ok</span>
         )}
         <button onClick={() => setShowSettings(true)}>Settings</button>
+        <button
+          onClick={() => setLayout({ ...layout, sideOpen: !layout.sideOpen })}
+          title={layout.sideOpen ? 'Hide the side panel' : 'Show the side panel (stage settings, sessions)'}
+        >
+          {layout.sideOpen ? 'Hide panel ⇥' : '⇤ Show panel'}
+        </button>
       </header>
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} onSaved={refreshProxy} />}
 
       <section className="diagram">
         <Splitter layout={layout} onChange={setLayout} field="diagram" axis="y" sign={1} max={() => window.innerHeight - 260} />
-        <PipelineView config={config} states={nodeStates} stateTypes={stateTypes} activity={activity} running={!!running} selected={selected} onSelect={setSelected} />
+        <PipelineView config={config} states={nodeStates} stateTypes={stateTypes} activity={activity} running={!!running} selected={selected} onSelect={selectStage} />
       </section>
 
       <section className="dash">
@@ -396,7 +407,7 @@ export function App() {
           running={!!running}
           now={() => schedRef.current?.now() ?? 0}
           selected={selected}
-          onSelect={(lane) => setSelected(stageOf(lane))}
+          onSelect={(lane) => selectStage(stageOf(lane))}
         />
       </section>
 
