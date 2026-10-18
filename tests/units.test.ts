@@ -227,3 +227,20 @@ describe('TimelineModel.related', () => {
     expect(r.down.has(2)).toBe(false);
   });
 });
+
+describe('SimScheduler seek', () => {
+  it('runs everything before the target at once, then keeps pacing', async () => {
+    let wall = 0;
+    const perf = { now: () => wall };
+    const s = new SimScheduler();
+    const fired: number[] = [];
+    for (const t of [10, 500, 520]) s.at(t, () => fired.push(t));
+    const done = s.runRealtime(1, perf);
+    s.seek(505);
+    expect(fired).toEqual([10, 500]);
+    expect(s.now()).toBe(505);
+    wall = 20;
+    await done;
+    expect(fired).toEqual([10, 500, 520]);
+  });
+});

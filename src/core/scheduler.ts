@@ -113,6 +113,19 @@ export class SimScheduler implements Scheduler {
     return this.paused;
   }
 
+  /**
+   * Jump forward to session time `t`, running everything before it at once,
+   * then carry on pacing from there (or stay paused). Going back isn't
+   * possible: the run has to start over.
+   */
+  seek(t: number): void {
+    if (this.stopped || t <= this.cur) return;
+    if (this.realtimeTimer) clearTimeout(this.realtimeTimer);
+    this.runFast(t);
+    this.pacing?.restart();
+    if (!this.paused) this.pacing?.tick();
+  }
+
   /** Freeze the clock of a realtime run; nothing fires until resume(). */
   pause(): void {
     if (this.paused || this.stopped) return;

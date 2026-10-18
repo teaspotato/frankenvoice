@@ -110,6 +110,8 @@ export function Dashboard({
   selected,
   onSelect,
   onFocusEvents,
+  onSeek,
+  playhead,
   transport,
 }: {
   trajectory?: Trajectory;
@@ -121,6 +123,10 @@ export function Dashboard({
   onSelect(lane: string | null, item?: boolean): void;
   /** An item was clicked: the events behind it. */
   onFocusEvents(seqs: number[]): void;
+  /** Empty timeline space or the time axis was clicked: seek there. */
+  onSeek(t: number): void;
+  /** Where ▶ will start, shown while nothing runs. */
+  playhead: number | null;
   /** Play/pause/stop for the shown session. */
   transport: ReactNode;
 }) {
@@ -651,6 +657,23 @@ export function Dashboard({
       setRelInfo(info);
     }
 
+    // where ▶ starts
+    if (playhead !== null && playhead > 0 && playhead >= t0 && playhead <= t1) {
+      const px = Math.round(x(playhead)) + 0.5;
+      g.strokeStyle = col.accent;
+      g.fillStyle = col.accent;
+      g.beginPath();
+      g.moveTo(px, AXIS);
+      g.lineTo(px, H);
+      g.stroke();
+      g.beginPath();
+      g.moveTo(px - 5, 2);
+      g.lineTo(px + 5, 2);
+      g.lineTo(px, AXIS - 6);
+      g.closePath();
+      g.fill();
+    }
+
     // cursor
     if (hover && hover.x > LABEL_W) {
       g.strokeStyle = col.text;
@@ -669,7 +692,7 @@ export function Dashboard({
     }
     g.restore();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, view, size, hover, selected, trajectory, running, totalH]);
+  }, [tick, view, size, hover, selected, trajectory, running, totalH, playhead]);
 
   // ---- interaction --------------------------------------------------------
 
@@ -722,16 +745,19 @@ export function Dashboard({
     const rect = canvasRef.current!.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
+    const t = currentEnd() - view.span + ((px - LABEL_W) / plotW()) * view.span;
+    if (py < AXIS && px > LABEL_W) return onSeek(t);
     let y = AXIS;
     for (const l of LANES) {
       if (py >= y && py < y + l.height) {
-        // An item: select its stage and show its events. Empty lane space toggles the stage.
-        const h = px > LABEL_W ? hitAt(hitsRef.current, l.id, px, py) : undefined;
+        // A lane's name toggles its stage; an item shows its events; empty space seeks.
+        if (px <= LABEL_W) return onSelect(l.id === selected ? null : l.id);
+        const h = hitAt(hitsRef.current, l.id, px, py);
         if (h?.seqs?.length) {
           onFocusEvents(h.seqs);
           return onSelect(l.id, true);
         }
-        return onSelect(l.id === selected ? null : l.id);
+        return onSeek(t);
       }
       y += l.height;
     }
@@ -788,7 +814,7 @@ export function Dashboard({
           {trajectory ? (trajectory.meta.mode === 'replay' ? `replay of ${trajectory.meta.replayOf}` : running ? 'live' : trajectory.meta.id) : 'no session yet: press Run live'}
         </span>
         <span className="spacer" />
-        <small className="muted">scroll to zoom · drag to pan · click a lane to select its stage</small>
+        <small className="muted">click to seek · scroll to zoom · drag to pan · click a lane's name to select its stage</small>
         <button onClick={() => setView({ ...view, span: Math.max(MIN_SPAN, view.span / 1.5) })}>+</button>
         <button onClick={() => setView({ ...view, span: Math.min(3_600_000, view.span * 1.5) })}>−</button>
         <button onClick={fit}>Fit</button>

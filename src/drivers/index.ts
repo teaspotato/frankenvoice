@@ -298,6 +298,8 @@ const speechSynthesisDriver: LiveDriver = (req, sink) => {
     setTimeout(() => sink.close({ error: { message: 'speechSynthesis is not available in this browser' } }), 0);
     return { send() {}, close() {} };
   }
+  // Only reached as a replay monitor while skipping ahead: nothing to say.
+  if (outputSuppressed) return { send() {}, close() {} };
   const u = new SpeechSynthesisUtterance(r.text);
   const voice = r.voice ? speechSynthesis.getVoices().find((v) => v.name === r.voice || v.voiceURI === r.voice) : undefined;
   if (voice) u.voice = voice;
@@ -331,6 +333,19 @@ const speechSynthesisDriver: LiveDriver = (req, sink) => {
 /** Output audio contexts, so a paused replay can freeze what is already scheduled. */
 const outputContexts = new Set<AudioContext>();
 
+/** While set, outputs drop what they are asked to play: a replay is skipping ahead. */
+let outputSuppressed = false;
+const playingSources = new Set<AudioBufferSourceNode>();
+
+/** Silence outputs while a replay fast-forwards, cutting off whatever is playing. */
+export function setOutputSuppressed(on: boolean) {
+  outputSuppressed = on;
+  if (!on) return;
+  for (const s of playingSources) s.stop();
+  playingSources.clear();
+  if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
+}
+
 /** Pause or resume every playing output (speaker audio and browser speech). */
 export function setOutputPaused(paused: boolean) {
   for (const ctx of outputContexts) void (paused ? ctx.suspend() : ctx.resume());
@@ -353,7 +368,7 @@ const speaker: LiveDriver = (_req, sink, env) => {
         playing.clear();
         return;
       }
-      if (d.cmd !== 'play' || !bin) return;
+      if (d.cmd !== 'play' || !bin || outputSuppressed) return;
       const samples = new Float32Array(bin.slice().buffer);
       if (!samples.length) return;
       const buf = ctx.createBuffer(1, samples.length, d.sampleRate!);
@@ -361,8 +376,12 @@ const speaker: LiveDriver = (_req, sink, env) => {
       const src = ctx.createBufferSource();
       src.buffer = buf;
       src.connect(ctx.destination);
-      src.onended = () => playing.delete(src);
+      src.onended = () => {
+        playing.delete(src);
+        playingSources.delete(src);
+      };
       playing.add(src);
+      playingSources.add(src);
       src.start(Math.max(ctx.currentTime, ctx.currentTime + (d.at! - env.now()) / 1000));
     },
     close() {

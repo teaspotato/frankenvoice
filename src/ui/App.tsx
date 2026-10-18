@@ -9,7 +9,7 @@ import { decodeBundle, encodeBundle } from '../core/bundle';
 import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
 import type { Json } from '../core/types';
-import { browserDrivers, setOutputPaused } from '../drivers';
+import { browserDrivers, setOutputPaused, setOutputSuppressed } from '../drivers';
 import {
   CONFIG_FORMAT,
   activeStages,
@@ -219,7 +219,24 @@ export function App() {
     void finishSession(rt);
   };
 
-  const replay = async (source: Trajectory) => {
+  /** Session time ▶ starts from when nothing runs; set by clicking the timeline. */
+  const [playFrom, setPlayFrom] = useState(0);
+  /** Set when a seek backwards restarts the replay from this time. */
+  const restartAt = useRef<number | null>(null);
+  // A different session starts from its beginning.
+  useEffect(() => setPlayFrom(0), [current?.traj]);
+
+  /** Run everything before `t` at once with outputs silenced, then let the replay carry on from there. */
+  const skipTo = (sim: SimScheduler, t: number) => {
+    setOutputSuppressed(true);
+    try {
+      sim.seek(t);
+    } finally {
+      setOutputSuppressed(false);
+    }
+  };
+
+  const replay = async (source: Trajectory, from = 0) => {
     const outputChannels = Object.values(registry).flatMap((d) => (d.channels ?? []).filter((c) => c.output).map((c) => c.name));
     const liveChannels = replayOpts.liveChannels
       .split(',')
@@ -236,11 +253,35 @@ export function App() {
     attach(rt, sim);
     setCurrent({ traj: rt.trajectory });
     setRunning('replay');
-    if (replayOpts.realtime) await sim.runRealtime(1);
-    else sim.runFast();
+    setPlayFrom(0);
+    if (replayOpts.realtime) {
+      const done = sim.runRealtime(1);
+      if (from > 0) skipTo(sim, from);
+      await done;
+    } else sim.runFast();
     const stoppedAt = rt.isRunning ? sim.now() : undefined;
     if (rt.isRunning) rt.stop();
+    const again = restartAt.current;
+    if (again !== null) {
+      // Seeking backwards: start over and skip to the new time; this partial run isn't kept.
+      restartAt.current = null;
+      stopActivity.current();
+      return replay(source, again);
+    }
     await finishSession(rt, source, stoppedAt);
+  };
+
+  /** Seek: a replay jumps there (restarting if it's earlier); otherwise ▶ will start there. */
+  const seek = (t: number) => {
+    t = Math.max(0, t);
+    const sim = simRef.current;
+    if (running === 'replay' && sim && replayOpts.realtime) {
+      if (t > sim.now()) skipTo(sim, t);
+      else {
+        restartAt.current = t;
+        sim.stop();
+      }
+    } else if (!running) setPlayFrom(t);
   };
 
   /** Pause or resume a realtime replay: the session clock and the audio already scheduled both freeze. */
@@ -261,7 +302,7 @@ export function App() {
         </button>
       ) : (
         <button
-          onClick={() => current && replay(current.traj)}
+          onClick={() => current && replay(current.traj, playFrom)}
           disabled={!!running || !current}
           title={running === 'live' ? "A live session can't be paused" : 'Replay this session (space)'}
         >
@@ -276,7 +317,7 @@ export function App() {
 
   // Space plays, pauses or resumes, unless typing somewhere.
   const spaceRef = useRef(() => {});
-  spaceRef.current = () => (running === 'replay' ? togglePause() : !running && current && replay(current.traj));
+  spaceRef.current = () => (running === 'replay' ? togglePause() : !running && current && replay(current.traj, playFrom));
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.code !== 'Space' || (e.target as HTMLElement).closest('input, textarea, select, button, [contenteditable]')) return;
@@ -459,6 +500,8 @@ export function App() {
           selected={selected}
           onSelect={(lane, item) => selectStage(stageOf(lane), !item)}
           transport={transport}
+          onSeek={seek}
+          playhead={running ? null : playFrom}
           onFocusEvents={(seqs) => setFocus((f) => ({ seqs, n: (f?.n ?? 0) + 1 }))}
         />
       </section>
