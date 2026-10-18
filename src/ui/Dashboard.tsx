@@ -112,7 +112,8 @@ export function Dashboard({
 
   const window_ = (m: TimelineModel | null): [number, number] => {
     const head = Math.max(m?.duration ?? 0, running && now ? now() : 0);
-    const end = view.end ?? Math.max(head, view.span * 0.9);
+    // Never show time before the session started.
+    const end = Math.max(view.end ?? head, view.span);
     return [end - view.span, end];
   };
 

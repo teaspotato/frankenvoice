@@ -4,7 +4,7 @@
 // session bundles and the settings edited in the web UI (keys, base URLs).
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { chmod, mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { dirname, join, resolve } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -211,6 +211,10 @@ async function sessions(req: IncomingMessage, res: ServerResponse, id: string | 
   if (req.method === 'GET') {
     res.writeHead(200, { 'content-type': 'application/zip' });
     return res.end(await readFile(file));
+  }
+  if (req.method === 'DELETE') {
+    await rm(file, { force: true });
+    return json(res, 200, { ok: true });
   }
   json(res, 405, { error: 'method not allowed' });
 }

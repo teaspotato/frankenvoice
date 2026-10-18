@@ -132,3 +132,4 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 .setting .src-edited { color: var(--accent); }
 @media (max-width: 560px) { .setting { grid-template-columns: 1fr auto auto; } .setting > span:first-child { grid-column: 1 / -1; } .setting input { grid-column: 1; } }
 button.link.warn { color: var(--warn); }
+button.danger-link { color: var(--danger); margin-left: auto; }

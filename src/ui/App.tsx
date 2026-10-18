@@ -199,6 +199,29 @@ export function App() {
     await finishSession(rt, source, stoppedAt);
   };
 
+  /** Clear the dashboard and stage states for a fresh start; past sessions stay in the list. */
+  const newSession = () => {
+    setCurrent(null);
+    setNodeStates({});
+    setStateTypes({});
+    setNotice('');
+  };
+
+  /** Remove a session from the list and, for a recorded live session, its file on disk. */
+  const deleteSession = async (id: string, s?: Session) => {
+    const onDisk = (!s || s.traj.meta.mode === 'live') && serverSessions.includes(id);
+    if (!confirm(onDisk ? `Delete session ${id}? Its file on disk is deleted too.` : `Remove ${s?.traj.meta.mode === 'replay' ? 'replay' : 'session'} ${id} from the list?`)) return;
+    if (onDisk) {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => null);
+      if (!res?.ok) return setNotice(`could not delete ${id} from disk`);
+      setServerSessions((l) => l.filter((x) => x !== id));
+    }
+    if (s) {
+      setSessions((ss) => ss.filter((x) => x !== s));
+      if (current === s) newSession();
+    }
+  };
+
   const loadServerSession = async (id: string) => {
     const res = await fetch(`/api/sessions/${id}`);
     const traj = decodeBundle(new Uint8Array(await res.arrayBuffer()));
@@ -254,6 +277,9 @@ export function App() {
           Open…
           <input type="file" accept=".json,.fvs,.zip" hidden onChange={(e) => e.target.files?.[0] && importFile(e.target.files[0])} />
         </label>
+        <button disabled={!!running || !current} onClick={newSession} title="Clear the dashboard; past sessions stay in the list">
+          New session
+        </button>
         <button onClick={() => confirm('Reset every stage to its default settings?') && setConfig(defaultConfig())}>Reset config</button>
         <span className="spacer" />
         {health === null ? (
@@ -336,6 +362,9 @@ export function App() {
                 <button disabled={!!running} onClick={() => setConfig(configFromGraph(s.traj.meta.graph))} title="Set every stage to what this session ran with">
                   Use its config
                 </button>
+                <button className="danger-link" disabled={!!running && current === s} onClick={() => deleteSession(s.traj.meta.id, s)}>
+                  Delete
+                </button>
               </span>
             </li>
           ))}
@@ -347,6 +376,11 @@ export function App() {
                   ⤓ {id}
                 </button>
                 <small>on disk</small>
+                <span>
+                  <button className="danger-link" onClick={() => deleteSession(id)}>
+                    Delete
+                  </button>
+                </span>
               </li>
             ))}
         </ul>
