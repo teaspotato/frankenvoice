@@ -1,12 +1,49 @@
-import { useMemo } from 'react';
-import { Background, ReactFlow, type Edge } from '@xyflow/react';
-import '@xyflow/react/dist/style.css';
 import { registry } from '../nodes';
 import type { Json } from '../core/types';
-import { buildGraph, STAGES, type PipelineConfig, type StageId } from '../pipeline';
-import { FvNode, type FvFlowNode } from './FvNode';
+import { activeStages, STAGES, stageParams, stageType, type PipelineConfig, type StageId } from '../pipeline';
 
-const nodeTypes = { fv: FvNode };
+const W = 150;
+const H = 64;
+
+/**
+ * Fixed layout: one column per step, VAD and ASR stacked in the second. The
+ * playback feedback runs above the main row, where nothing else is drawn.
+ */
+const POS: Record<StageId, [number, number]> = {
+  mic: [10, 88],
+  vad: [220, 10],
+  asr: [220, 166],
+  turn: [430, 88],
+  llm: [640, 88],
+  tts: [850, 88],
+  speaker: [1060, 88],
+};
+const VIEW_W = 1220;
+const VIEW_H = 240;
+const FEEDBACK_Y = 60;
+
+function summarize(v: Json): string {
+  if (v === null) return '–';
+  if (typeof v === 'object') return Array.isArray(v) ? `[${v.length}]` : '{…}';
+  const s = String(v);
+  return s.length > 22 ? `${s.slice(0, 21)}…` : s;
+}
+
+interface Edge {
+  d: string;
+  label: string;
+  lx: number;
+  ly: number;
+}
+
+const right = (id: StageId): [number, number] => [POS[id][0] + W, POS[id][1] + H / 2];
+const left = (id: StageId): [number, number] => [POS[id][0], POS[id][1] + H / 2];
+
+function link(a: [number, number], b: [number, number], label: string): Edge {
+  if (a[1] === b[1]) return { d: `M${a[0]},${a[1]} L${b[0] - 2},${b[1]}`, label, lx: (a[0] + b[0]) / 2, ly: a[1] - 6 };
+  const mx = (a[0] + b[0]) / 2;
+  return { d: `M${a[0]},${a[1]} C${mx},${a[1]} ${mx},${b[1]} ${b[0] - 2},${b[1]}`, label, lx: mx, ly: (a[1] + b[1]) / 2 - 6 };
+}
 
 /** Read-only diagram of the fixed pipeline with each stage's live state. */
 export function PipelineView({
@@ -25,55 +62,83 @@ export function PipelineView({
   selected: StageId | null;
   onSelect(id: StageId | null): void;
 }) {
-  const graph = useMemo(() => buildGraph(config), [config]);
-  const nodes: FvFlowNode[] = graph.nodes.map((n) => {
-    const stage = STAGES.find((s) => s.id === n.id)!;
-    const variant = config[stage.id].variant;
-    const provider = typeof n.params.provider === 'string' ? n.params.provider : undefined;
-    return {
-      id: n.id,
-      type: 'fv' as const,
-      position: n.ui ?? { x: 0, y: 0 },
-      selected: n.id === selected,
-      draggable: false,
-      connectable: false,
-      data: {
-        def: registry[n.type],
-        label: stage.label,
-        subtitle: provider ?? (Object.keys(stage.variants).length > 1 ? variant : undefined),
-        state: stateTypes[n.id] === n.type ? states[n.id] : undefined,
-        active: running,
-      },
-    };
+  const stages = activeStages(config);
+  const out: StageId = stages.some((s) => s.id === 'speaker') ? 'speaker' : 'tts';
+  const edges: Edge[] = [
+    link(right('mic'), left('vad'), 'audio'),
+    link(right('mic'), left('asr'), 'audio'),
+    link(right('vad'), left('turn'), 'speech'),
+    link(right('asr'), left('turn'), 'transcript'),
+    link(right('turn'), left('llm'), 'turn'),
+    link(right('llm'), left('tts'), 'text'),
+    ...(out === 'speaker' ? [link(right('tts'), left('speaker'), 'audio')] : []),
+  ];
+  // Playback feedback: up from the output stage, back over the row, down into turn-taking.
+  const [ox, oy] = [POS[out][0] + W / 2, POS[out][1]];
+  const [tx, ty] = [POS.turn[0] + W / 2, POS.turn[1]];
+  const r = 10;
+  edges.push({
+    d: `M${ox},${oy} L${ox},${FEEDBACK_Y + r} Q${ox},${FEEDBACK_Y} ${ox - r},${FEEDBACK_Y} L${tx + r},${FEEDBACK_Y} Q${tx},${FEEDBACK_Y} ${tx},${FEEDBACK_Y + r} L${tx},${ty - 2}`,
+    label: 'playback (what was heard)',
+    lx: (ox + tx) / 2,
+    ly: FEEDBACK_Y - 6,
   });
-  const edges: Edge[] = graph.edges.map((e) => ({
-    id: `${e.from.node}.${e.from.port}->${e.to.node}.${e.to.port}`,
-    source: e.from.node,
-    sourceHandle: e.from.port,
-    target: e.to.node,
-    targetHandle: e.to.port,
-    animated: running,
-    focusable: false,
-  }));
+
   return (
-    <ReactFlow
-      key={graph.nodes.map((n) => n.type).join()}
-      nodes={nodes}
-      edges={edges}
-      nodeTypes={nodeTypes}
-      nodesDraggable={false}
-      nodesConnectable={false}
-      edgesFocusable={false}
-      elementsSelectable={false}
-      deleteKeyCode={null}
-      onNodeClick={(_e, n) => onSelect(n.id as StageId)}
-      onPaneClick={() => onSelect(null)}
-      fitView
-      onInit={(rf) => setTimeout(() => rf.fitView({ padding: 0.08 }), 50)}
-      fitViewOptions={{ padding: 0.08 }}
-      minZoom={0.3}
-    >
-      <Background />
-    </ReactFlow>
+    <svg className={`pipeline${running ? ' running' : ''}`} viewBox={`0 0 ${VIEW_W} ${VIEW_H}`} preserveAspectRatio="xMidYMid meet" onClick={() => onSelect(null)}>
+      <defs>
+        <marker id="fv-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" className="pipeline-arrowhead" />
+        </marker>
+      </defs>
+      {edges.map((e) => (
+        <g key={e.d}>
+          <path d={e.d} className="pipeline-edge" markerEnd="url(#fv-arrow)" />
+          <text x={e.lx} y={e.ly} className="pipeline-edge-label" textAnchor="middle">
+            {e.label}
+          </text>
+        </g>
+      ))}
+      {stages.map((s) => {
+        const type = stageType(config, s.id);
+        const def = registry[type];
+        const [x, y] = POS[s.id];
+        const params = stageParams(config, s.id);
+        const variant = config[s.id].variant;
+        const impl = typeof params.provider === 'string' ? params.provider : Object.keys(STAGES.find((d) => d.id === s.id)!.variants).length > 1 ? variant : '';
+        const state = stateTypes[s.id] === type ? states[s.id] : undefined;
+        const lines = Object.entries(state ?? {})
+          .filter(([k, v]) => k !== 'provider' && (typeof v !== 'object' || v === null))
+          .slice(0, 2);
+        return (
+          <g
+            key={s.id}
+            className={`pipeline-stage cat-${def.category}${selected === s.id ? ' selected' : ''}`}
+            transform={`translate(${x},${y})`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onSelect(s.id);
+            }}
+          >
+            <title>{def.description}</title>
+            <rect width={W} height={H} rx={8} className="pipeline-box" />
+            <rect width={4} height={H - 12} x={0} y={6} rx={2} className="pipeline-accent" />
+            <text x={12} y={18} className="pipeline-title">
+              {s.label}
+            </text>
+            {impl && (
+              <text x={W - 8} y={18} className="pipeline-impl" textAnchor="end">
+                {impl}
+              </text>
+            )}
+            {lines.map(([k, v], i) => (
+              <text key={k} x={12} y={38 + i * 15} className="pipeline-state">
+                <tspan className="k">{k}</tspan> {summarize(v)}
+              </text>
+            ))}
+          </g>
+        );
+      })}
+    </svg>
   );
 }

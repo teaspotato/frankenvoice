@@ -48,14 +48,13 @@ input, select, textarea { background: var(--bg); border: 1px solid var(--border)
 .app {
   display: grid; height: 100%;
   grid-template-columns: 1fr 330px;
-  grid-template-rows: auto 190px minmax(200px, 1fr) 28%;
+  grid-template-rows: auto 210px minmax(200px, 1fr) 26%;
   grid-template-areas: 'bar bar' 'diagram inspector' 'dash inspector' 'log inspector';
 }
 .toolbar { grid-area: bar; display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
 .toolbar .brand { font-weight: 700; letter-spacing: 0.02em; }
 .toolbar .spacer { flex: 1; }
 .diagram { grid-area: diagram; min-height: 0; border-bottom: 1px solid var(--border); }
-.diagram .react-flow__node { cursor: pointer; }
 .dash { grid-area: dash; min-height: 0; }
 .inspector h3 { margin: 4px 0 8px; font-size: 13px; }
 .inspector { grid-area: inspector; overflow: auto; padding: 10px; border-left: 1px solid var(--border); background: var(--panel); }
@@ -86,21 +85,21 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 .cat-control { --c: var(--cat-control); } .cat-llm { --c: var(--cat-llm); } .cat-tts { --c: var(--cat-tts); }
 .cat-sink { --c: var(--cat-sink); } .cat-mock { --c: var(--cat-mock); }
 
-.fv-node { position: relative; min-width: 190px; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-top: 4px solid var(--c); border-radius: 8px; font-size: 12px; box-shadow: 0 1px 3px rgb(0 0 0 / 0.08); }
-.fv-node.selected { outline: 2px solid var(--accent); }
-.fv-node-header { height: 30px; display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 6px 8px 0; }
-.fv-node-title { font-weight: 600; }
-.fv-node-type { color: var(--muted); font-family: var(--mono); font-size: 10px; }
-.fv-node-ports { position: relative; }
-.fv-port { position: absolute; height: 20px; line-height: 20px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
-.fv-port.in { left: 10px; }
-.fv-port.out { right: 10px; }
-.fv-node .react-flow__handle { width: 9px; height: 9px; background: var(--muted); }
-.fv-node .t-audio { background: var(--cat-source); } .fv-node .t-vad { background: var(--cat-vad); }
-.fv-node .t-transcript { background: var(--cat-asr); } .fv-node .t-turn { background: var(--cat-control); }
-.fv-node .t-text { background: var(--cat-llm); } .fv-node .t-playback { background: var(--cat-sink); }
-.fv-node-state { border-top: 1px solid var(--border); padding: 4px 8px 6px; font-family: var(--mono); font-size: 10.5px; }
-.fv-node-state .k { color: var(--muted); }
+.pipeline { display: block; width: 100%; height: 100%; background: var(--bg); }
+.pipeline-edge { fill: none; stroke: var(--muted); stroke-width: 1.5; }
+.pipeline.running .pipeline-edge { stroke-dasharray: 6 4; animation: fv-flow 0.6s linear infinite; }
+@keyframes fv-flow { to { stroke-dashoffset: -10; } }
+.pipeline-arrowhead { fill: var(--muted); }
+.pipeline-edge-label { fill: var(--muted); font: 10px var(--mono); }
+.pipeline-stage { cursor: pointer; }
+.pipeline-box { fill: var(--panel); stroke: var(--border); }
+.pipeline-stage:hover .pipeline-box { stroke: var(--c); }
+.pipeline-stage.selected .pipeline-box { stroke: var(--accent); stroke-width: 2; }
+.pipeline-accent { fill: var(--c); }
+.pipeline-title { fill: var(--text); font: 600 13px system-ui, sans-serif; }
+.pipeline-impl { fill: var(--muted); font: 10px var(--mono); }
+.pipeline-state { fill: var(--text); font: 10.5px var(--mono); }
+.pipeline-state .k { fill: var(--muted); }
 
 .event-log { display: flex; flex-direction: column; height: 100%; }
 .event-log-bar { display: flex; gap: 10px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--border); }
