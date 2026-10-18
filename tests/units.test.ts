@@ -4,7 +4,8 @@ import { Framer } from '../src/nodes/audio';
 import { SimScheduler } from '../src/core/scheduler';
 import { TrackStore } from '../src/core/tracks';
 import { EchoCanceller } from '../src/nodes/cleanup';
-import type { AudioMsg } from '../src/core/types';
+import type { AudioMsg, TrajEvent } from '../src/core/types';
+import { ActivityTracker } from '../src/ui/activity';
 
 describe('SentenceSplitter', () => {
   it('emits sentences as soon as their boundary is certain', () => {
@@ -158,5 +159,25 @@ describe('EchoCanceller', () => {
     expect(erle).toBeGreaterThan(20);
     // Before playback it passes audio through untouched.
     expect([...out.subarray(0, 4000)]).toEqual([...mic.subarray(0, 4000)]);
+  });
+});
+
+describe('ActivityTracker', () => {
+  const ev = (seq: number, node: string, port: string, data: Record<string, unknown>, kind: TrajEvent['kind'] = 'msg'): TrajEvent => ({ seq, t: seq, node, kind, port, data: data as never });
+  it('marks connections carrying data and stages switched on', () => {
+    const a = new ActivityTracker();
+    a.consume(ev(1, 'vad', 'vad', { type: 'vad.frame', p: 0.9 }), 0);
+    expect(a.snapshot(10).edges.has('vad.vad')).toBe(false); // telemetry is not data
+    a.consume(ev(2, 'vad', 'vad', { type: 'vad.speech_start' }), 0);
+    expect(a.snapshot(10).stages.get('vad')).toBe('speech');
+    expect(a.snapshot(10).edges.has('vad.vad')).toBe(true);
+    expect(a.snapshot(1000).edges.has('vad.vad')).toBe(false);
+    a.consume(ev(3, 'llm', 'text', { type: 'llm.start', rid: 'r1' }), 0);
+    expect(a.snapshot(5000).edges.has('llm.text')).toBe(true); // stream open
+    a.consume(ev(4, 'llm', 'text', { type: 'llm.end', rid: 'r1' }), 5000);
+    expect(a.snapshot(6000).edges.has('llm.text')).toBe(false);
+    expect(a.snapshot(6000).stages.has('llm')).toBe(false);
+    a.consume(ev(5, 'turn', '', { floor: 'thinking' }, 'state'), 6000);
+    expect(a.snapshot(6000).stages.get('turn')).toBe('thinking');
   });
 });

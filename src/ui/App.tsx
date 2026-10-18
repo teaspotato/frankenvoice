@@ -28,6 +28,7 @@ import { StagePanel } from './StagePanel';
 import { Dashboard } from './Dashboard';
 import { EventLog } from './EventLog';
 import { Splitter, useLayout } from './Splitter';
+import { ActivityTracker, NO_ACTIVITY, type Activity } from './activity';
 
 const CONFIG_KEY = 'frankenvoice.pipeline';
 const AUTOSAVE_KEY = 'frankenvoice.autosave';
@@ -96,6 +97,8 @@ export function App() {
   // Read when a run finishes, so toggling mid-run applies to that run.
   const autosaveRef = useRef(autosave);
   const [layout, setLayout] = useLayout();
+  const [activity, setActivity] = useState<Activity>(NO_ACTIVITY);
+  const stopActivity = useRef<() => void>(() => {});
   const runtimeRef = useRef<Runtime | null>(null);
   const schedRef = useRef<Scheduler | null>(null);
   const simRef = useRef<SimScheduler | null>(null);
@@ -138,6 +141,15 @@ export function App() {
     setStateTypes(Object.fromEntries(rt.trajectory.meta.graph.nodes.map((n) => [n.id, n.type])));
     let pending: Record<string, Record<string, Json>> = {};
     let raf = 0;
+    stopActivity.current();
+    const tracker = new ActivityTracker();
+    const unsub = rt.trajectory.subscribe((e) => tracker.consume(e, performance.now()));
+    const timer = setInterval(() => setActivity(tracker.snapshot(performance.now())), 100);
+    stopActivity.current = () => {
+      unsub();
+      clearInterval(timer);
+      setActivity(NO_ACTIVITY);
+    };
     rt.onState((node, state) => {
       pending[node] = state;
       if (!raf)
@@ -156,6 +168,7 @@ export function App() {
     setSessions((ss) => [s, ...ss]);
     setCurrent(s);
     setRunning(null);
+    stopActivity.current();
     if (rt.trajectory.meta.mode === 'live' && autosaveRef.current) await saveSession(s);
   };
 
@@ -374,7 +387,7 @@ export function App() {
 
       <section className="diagram">
         <Splitter layout={layout} onChange={setLayout} field="diagram" axis="y" sign={1} max={() => window.innerHeight - 260} />
-        <PipelineView config={config} states={nodeStates} stateTypes={stateTypes} running={!!running} selected={selected} onSelect={setSelected} />
+        <PipelineView config={config} states={nodeStates} stateTypes={stateTypes} activity={activity} running={!!running} selected={selected} onSelect={setSelected} />
       </section>
 
       <section className="dash">

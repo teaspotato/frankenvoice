@@ -15,7 +15,7 @@ Open http://localhost:5173 and press **Run live**. Allow microphone access. Pres
 
 ## The UI
 
-- **Pipeline diagram** (top): read-only, drawn to a fixed layout in `src/ui/PipelineView.tsx` (the playback feedback runs above the row so it never crosses a stage). Each stage shows its live state. Click a stage to configure it in the right panel.
+- **Pipeline diagram** (top): read-only, drawn to a fixed layout in `src/ui/PipelineView.tsx` (the playback feedback runs above the row so it never crosses a stage). Each stage shows its live state. While a session runs, a connection animates only while data is flowing on it, and a stage lights up while its on/off state is on (VAD hears speech, ASR mid-utterance, turn-taking thinking or speaking, LLM generating, TTS synthesizing, speaker playing, AEC double talk); see `src/ui/activity.ts`. Click a stage to configure it in the right panel.
 - **Dashboard** (middle): one lane per stage on a shared time axis, live while running and the same for replays and loaded sessions.
   - *Mic*: waveform. *Cleaned*: what the noise/echo stage passes on, with how much it removed (in − out, 0–30 dB line); red ticks mark double talk (echo canceller not adapting) or RNNoise gating. *VAD*: speech probability with the start/stop thresholds; detected speech is shaded across Mic and VAD.
   - *ASR*: each result drawn over the audio it covers (dashed while partial, solid when final), with a line to the tick where it arrived, so recognition latency is visible.

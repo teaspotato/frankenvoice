@@ -108,9 +108,11 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 
 .pipeline { display: block; width: 100%; height: 100%; background: var(--bg); }
 .pipeline-edge { fill: none; stroke: var(--muted); stroke-width: 1.5; }
-.pipeline.running .pipeline-edge { stroke-dasharray: 6 4; animation: fv-flow 0.6s linear infinite; }
+.flowing .pipeline-edge { stroke: var(--accent); stroke-dasharray: 6 4; animation: fv-flow 0.6s linear infinite; }
+.flowing .pipeline-edge-label { fill: var(--accent); }
+.pipeline-stage.on .pipeline-box { stroke: var(--c); stroke-width: 2.5; filter: drop-shadow(0 0 5px var(--c)); }
+.pipeline-on { fill: var(--c); font: 600 10px var(--mono); }
 @keyframes fv-flow { to { stroke-dashoffset: -10; } }
-.pipeline-arrowhead { fill: var(--muted); }
 .pipeline-edge-label { fill: var(--muted); font: 10px var(--mono); }
 .pipeline-stage { cursor: pointer; }
 .pipeline-box { fill: var(--panel); stroke: var(--border); }
