@@ -6,13 +6,14 @@ A research playground for full-duplex voice agents built by wiring existing comp
 
 ```bash
 pnpm install
-cp .env.example .env   # add keys for the providers you use
 pnpm dev               # local proxy on :8787 + Vite on :5173
 ```
 
+Open **Settings** in the toolbar to enter API keys and base URLs. The proxy saves them to `.frankenvoice/settings.json` (git-ignored, readable only by you); the page never gets a key back, only whether it is set. A `.env` file (see `.env.example`) still works, and values set in Settings override it. The proxy port (`FV_PROXY_PORT`) is the one thing that has to come from the environment, since the page needs it to reach the proxy.
+
 Open http://localhost:5173 and press **Run live**. Allow microphone access. Press **Stop** to finish. The session is saved to `./sessions/<id>.fvs` and appears in the Sessions list, where **Replay** runs it again.
 
-The pipeline runs in the browser. The small proxy in `server/` keeps API keys out of the page, avoids CORS, and stores session bundles. It forwards requests and streams responses unchanged, so the browser records exactly what each provider sent.
+The pipeline runs in the browser. The small proxy in `server/` keeps API keys out of the page, avoids CORS, and stores settings and session bundles. It only answers requests from the local UI: other websites (by `Origin`) and DNS-rebinding hosts (by `Host`) get 403. It forwards requests and streams responses unchanged, so the browser records exactly what each provider sent.
 
 ## Default pipeline
 
@@ -26,7 +27,7 @@ mic ─┬─> vad (Silero, in-browser) ──> turn ─> llm ─> tts ─> spea
 
 ASR, LLM and TTS are each one node with a **Provider** param, so swapping providers never means rewiring the graph:
 
-| node | providers | proxy env |
+| node | providers | setting (Settings panel or env) |
 | --- | --- | --- |
 | `asr` | `deepgram` | `DEEPGRAM_API_KEY` |
 | `llm` | `anthropic` | `ANTHROPIC_API_KEY` |
@@ -36,7 +37,7 @@ ASR, LLM and TTS are each one node with a **Provider** param, so swapping provid
 | | `openai-compatible` (`/audio/speech`, PCM), endpoint `openai` / `custom` | as above |
 | `tts.browser` | the browser's built-in `speechSynthesis` | none |
 
-For OpenRouter, set the LLM node to `openai-compatible`, endpoint `openrouter`, and a model slug. The toolbar shows which keys the current graph still needs.
+For OpenRouter, set the LLM node to `openai-compatible`, endpoint `openrouter`, and a model slug. The toolbar shows which keys the current graph still needs; click it to open Settings.
 
 Each provider is a small pure adapter (`src/nodes/{asr,llm,tts}/`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`src/drivers/index.ts`). Recordings keep the provider's raw payloads, so replay feeds the same bytes through the same adapter. Adding a provider means one adapter, plus a driver and proxy route if it speaks a new protocol.
 

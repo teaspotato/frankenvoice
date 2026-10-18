@@ -3,3 +3,4 @@ dist/
 sessions/
 .env
 *.log
+.frankenvoice/

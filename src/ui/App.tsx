@@ -23,6 +23,7 @@ import type { Trajectory } from '../core/trajectory';
 import type { Json } from '../core/types';
 import { paramActive, resolveParams } from '../core/node';
 import { browserDrivers } from '../drivers';
+import { SettingsPanel } from './Settings';
 import { FvNode, type FvFlowNode } from './FvNode';
 import { EventLog } from './EventLog';
 
@@ -67,6 +68,7 @@ export function App() {
   const [health, setHealth] = useState<Record<string, boolean> | null>(null);
   const [replayOpts, setReplayOpts] = useState({ audible: true, realtime: true, useCurrentGraph: false, liveChannels: '' });
   const [notice, setNotice] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
   const simRef = useRef<SimScheduler | null>(null);
   const [flowNodes, setFlowNodes] = useState<FvFlowNode[]>([]);
   const [serverSessions, setServerSessions] = useState<string[]>([]);
@@ -79,7 +81,7 @@ export function App() {
     }
   }, [graph]);
 
-  useEffect(() => {
+  const refreshProxy = useCallback(() => {
     fetch('/api/health')
       .then((r) => r.json())
       .then(setHealth)
@@ -89,6 +91,7 @@ export function App() {
       .then((list: { id: string }[]) => setServerSessions(list.map((s) => s.id)))
       .catch(() => {});
   }, []);
+  useEffect(refreshProxy, [refreshProxy]);
 
   // ---- graph <-> React Flow -------------------------------------------------
 
@@ -327,11 +330,15 @@ export function App() {
         {health === null ? (
           <span className="warn">proxy not reachable: run `pnpm dev`</span>
         ) : missingKeys.length ? (
-          <span className="warn">not configured in proxy .env: {missingKeys.join(', ')}</span>
+          <button className="link warn" onClick={() => setShowSettings(true)}>
+            needs keys: {missingKeys.join(', ')}
+          </button>
         ) : (
           <span className="ok">proxy ok</span>
         )}
+        <button onClick={() => setShowSettings(true)}>Settings</button>
       </header>
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} onSaved={refreshProxy} />}
 
       <aside className="palette">
         <h3>Nodes</h3>
