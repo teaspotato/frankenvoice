@@ -48,13 +48,25 @@ input, select, textarea { background: var(--bg); border: 1px solid var(--border)
 
 .app {
   display: grid; height: 100%;
-  grid-template-columns: 1fr 330px;
-  grid-template-rows: auto 220px minmax(200px, 1fr) 26%;
+  grid-template-columns: minmax(0, 1fr) var(--side-w, 330px);
+  grid-template-rows: auto var(--diagram-h, 220px) minmax(120px, 1fr) var(--log-h, 220px);
   grid-template-areas: 'bar bar' 'diagram inspector' 'dash inspector' 'log inspector';
 }
 .toolbar { grid-area: bar; display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--panel); }
 .toolbar .brand { font-weight: 700; letter-spacing: 0.02em; }
 .toolbar .spacer { flex: 1; }
+.app.log-collapsed { grid-template-rows: auto var(--diagram-h, 220px) minmax(120px, 1fr) auto; }
+.diagram, .log { position: relative; }
+.splitter { position: absolute; z-index: 5; touch-action: none; }
+.splitter::after { content: ''; position: absolute; background: var(--accent); opacity: 0; transition: opacity 0.1s; }
+.splitter:hover::after, .splitter:active::after { opacity: 0.6; }
+.splitter-y { left: 0; right: 0; height: 8px; cursor: row-resize; }
+.splitter-y::after { left: 0; right: 0; top: 3px; height: 2px; }
+.splitter-diagram { bottom: -4px; }
+.splitter-log { top: -4px; }
+.splitter-x { position: relative; grid-column: 2; grid-row: 2 / 5; justify-self: start; width: 8px; margin-left: -4px; cursor: col-resize; }
+.splitter-x::after { top: 0; bottom: 0; left: 3px; width: 2px; }
+.event-log-toggle { color: var(--text); font-family: inherit; display: flex; gap: 6px; align-items: center; }
 .diagram { grid-area: diagram; min-height: 0; border-bottom: 1px solid var(--border); }
 .dash { grid-area: dash; min-height: 0; }
 .inspector h3 { margin: 4px 0 8px; font-size: 13px; }
@@ -122,7 +134,7 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 .ev.k-state .kind { color: var(--cat-control); }
 .ev.k-io-recv .kind, .ev.k-io-send .kind, .ev.k-io-open .kind, .ev.k-io-close .kind { color: var(--cat-asr); }
 .ev.k-io-diverge, .ev.k-log .data { color: var(--warn); }
-.event-detail { position: absolute; right: 340px; bottom: 10px; z-index: 10; width: 520px; max-height: 50%; overflow: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font: 11px/1.35 var(--mono); box-shadow: 0 4px 16px rgb(0 0 0 / 0.15); cursor: pointer; }
+.event-detail { position: absolute; right: 10px; bottom: 10px; z-index: 10; width: 520px; max-height: 50vh; overflow: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font: 11px/1.35 var(--mono); box-shadow: 0 4px 16px rgb(0 0 0 / 0.15); cursor: pointer; }
 
 /* settings */
 .modal-backdrop { position: fixed; inset: 0; background: rgb(0 0 0 / 0.35); display: flex; align-items: flex-start; justify-content: center; padding: 48px 16px; z-index: 50; overflow: auto; }

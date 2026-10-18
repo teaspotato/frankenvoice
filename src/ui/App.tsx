@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { registry } from '../nodes';
 import { GRAPH_FORMAT, type GraphSpec } from '../core/graph';
 import { Runtime } from '../core/runtime';
@@ -27,6 +27,7 @@ import { PipelineView } from './PipelineView';
 import { StagePanel } from './StagePanel';
 import { Dashboard } from './Dashboard';
 import { EventLog } from './EventLog';
+import { Splitter, useLayout } from './Splitter';
 
 const CONFIG_KEY = 'frankenvoice.pipeline';
 const AUTOSAVE_KEY = 'frankenvoice.autosave';
@@ -94,6 +95,7 @@ export function App() {
   });
   // Read when a run finishes, so toggling mid-run applies to that run.
   const autosaveRef = useRef(autosave);
+  const [layout, setLayout] = useLayout();
   const runtimeRef = useRef<Runtime | null>(null);
   const schedRef = useRef<Scheduler | null>(null);
   const simRef = useRef<SimScheduler | null>(null);
@@ -328,7 +330,10 @@ export function App() {
     lane === null ? null : activeStages(config).some((s) => s.id === lane) ? (lane as StageId) : 'tts';
 
   return (
-    <div className="app">
+    <div
+      className={`app${layout.logOpen ? '' : ' log-collapsed'}`}
+      style={{ '--diagram-h': `${layout.diagram}px`, '--log-h': `${layout.log}px`, '--side-w': `${layout.side}px` } as CSSProperties}
+    >
       <header className="toolbar">
         <span className="brand">frankenvoice</span>
         {!running ? (
@@ -368,6 +373,7 @@ export function App() {
       {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} onSaved={refreshProxy} />}
 
       <section className="diagram">
+        <Splitter layout={layout} onChange={setLayout} field="diagram" axis="y" sign={1} max={() => window.innerHeight - 260} />
         <PipelineView config={config} states={nodeStates} stateTypes={stateTypes} running={!!running} selected={selected} onSelect={setSelected} />
       </section>
 
@@ -381,6 +387,7 @@ export function App() {
         />
       </section>
 
+      <Splitter layout={layout} onChange={setLayout} field="side" axis="x" sign={-1} max={() => window.innerWidth - 400} />
       <aside className="inspector">
         {selected ? (
           <StagePanel config={config} stage={selected} state={stateTypes[selected] === stageType(config, selected) ? nodeStates[selected] : undefined} disabled={!!running} onChange={setConfig} />
@@ -471,7 +478,8 @@ export function App() {
       </aside>
 
       <section className="log">
-        <EventLog trajectory={current?.traj} live={!!running} />
+        {layout.logOpen && <Splitter layout={layout} onChange={setLayout} field="log" axis="y" sign={-1} max={() => window.innerHeight - 260} />}
+        <EventLog trajectory={current?.traj} live={!!running} open={layout.logOpen} onToggle={() => setLayout({ ...layout, logOpen: !layout.logOpen })} />
       </section>
     </div>
   );

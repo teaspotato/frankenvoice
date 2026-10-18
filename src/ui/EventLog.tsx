@@ -24,7 +24,18 @@ function summary(e: TrajEvent): string {
   return s.length > 220 ? `${s.slice(0, 219)}…` : s;
 }
 
-export function EventLog({ trajectory, live }: { trajectory?: Trajectory; live: boolean }) {
+export function EventLog({
+  trajectory,
+  live,
+  open,
+  onToggle,
+}: {
+  trajectory?: Trajectory;
+  live: boolean;
+  /** Collapsed, only the header bar shows and live updates are skipped. */
+  open: boolean;
+  onToggle(): void;
+}) {
   const [, setTick] = useState(0);
   const [hideNoisy, setHideNoisy] = useState(true);
   const [node, setNode] = useState('');
@@ -34,7 +45,7 @@ export function EventLog({ trajectory, live }: { trajectory?: Trajectory; live: 
   const stick = useRef(true);
 
   useEffect(() => {
-    if (!trajectory || !live) return;
+    if (!trajectory || !live || !open) return;
     let raf = 0;
     const unsub = trajectory.subscribe(() => {
       if (!raf) raf = requestAnimationFrame(() => ((raf = 0), setTick((t) => t + 1)));
@@ -43,13 +54,15 @@ export function EventLog({ trajectory, live }: { trajectory?: Trajectory; live: 
       unsub();
       cancelAnimationFrame(raf);
     };
-  }, [trajectory, live]);
+  }, [trajectory, live, open]);
 
   const nodes = useMemo(() => trajectory?.meta.graph.nodes.map((n) => n.id) ?? [], [trajectory]);
   const events = trajectory?.events ?? [];
-  const shown = events.filter(
-    (e) => (!hideNoisy || !NOISY(e)) && (!node || e.node === node) && (!filter || `${e.kind} ${e.port ?? ''} ${JSON.stringify(e.data)}`.includes(filter)),
-  );
+  const shown = !open
+    ? []
+    : events.filter(
+        (e) => (!hideNoisy || !NOISY(e)) && (!node || e.node === node) && (!filter || `${e.kind} ${e.port ?? ''} ${JSON.stringify(e.data)}`.includes(filter)),
+      );
   const visible = shown.slice(-600);
 
   useEffect(() => {
@@ -59,44 +72,50 @@ export function EventLog({ trajectory, live }: { trajectory?: Trajectory; live: 
   return (
     <div className="event-log">
       <div className="event-log-bar">
-        <strong>Events</strong>
-        <span className="muted">
-          {shown.length} shown / {events.length} total
-        </span>
-        <select value={node} onChange={(e) => setNode(e.target.value)}>
-          <option value="">all nodes</option>
-          <option value="$runtime">$runtime</option>
-          {nodes.map((n) => (
-            <option key={n}>{n}</option>
+        <button className="link event-log-toggle" onClick={onToggle} title={open ? 'Collapse' : 'Expand'}>
+          {open ? '▾' : '▸'} <strong>Events</strong>
+        </button>
+        <span className="muted">{open ? `${shown.length} shown / ${events.length} total` : `${events.length} events`}</span>
+        {open && (
+          <>
+            <select value={node} onChange={(e) => setNode(e.target.value)}>
+              <option value="">all nodes</option>
+              <option value="$runtime">$runtime</option>
+              {nodes.map((n) => (
+                <option key={n}>{n}</option>
+              ))}
+            </select>
+            <input placeholder="filter text" value={filter} onChange={(e) => setFilter(e.target.value)} />
+            <label>
+              <input type="checkbox" checked={hideNoisy} onChange={(e) => setHideNoisy(e.target.checked)} /> hide frames & timers
+            </label>
+          </>
+        )}
+      </div>
+      {open && (
+        <div
+          className="event-log-body"
+          ref={bodyRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            stick.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+          }}
+        >
+          {visible.map((e) => (
+            <div key={e.seq} className={`ev k-${e.kind.replace('.', '-')}${selected?.seq === e.seq ? ' sel' : ''}`} onClick={() => setSelected(e)}>
+              <span className="t">{e.t.toFixed(1)}</span>
+              <span className="seq">#{e.seq}</span>
+              <span className="node">{e.node}</span>
+              <span className="kind">
+                {e.kind}
+                {e.port ? `:${e.port}` : ''}
+              </span>
+              <span className="data">{summary(e)}</span>
+            </div>
           ))}
-        </select>
-        <input placeholder="filter text" value={filter} onChange={(e) => setFilter(e.target.value)} />
-        <label>
-          <input type="checkbox" checked={hideNoisy} onChange={(e) => setHideNoisy(e.target.checked)} /> hide frames & timers
-        </label>
-      </div>
-      <div
-        className="event-log-body"
-        ref={bodyRef}
-        onScroll={(e) => {
-          const el = e.currentTarget;
-          stick.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
-        }}
-      >
-        {visible.map((e) => (
-          <div key={e.seq} className={`ev k-${e.kind.replace('.', '-')}${selected?.seq === e.seq ? ' sel' : ''}`} onClick={() => setSelected(e)}>
-            <span className="t">{e.t.toFixed(1)}</span>
-            <span className="seq">#{e.seq}</span>
-            <span className="node">{e.node}</span>
-            <span className="kind">
-              {e.kind}
-              {e.port ? `:${e.port}` : ''}
-            </span>
-            <span className="data">{summary(e)}</span>
-          </div>
-        ))}
-      </div>
-      {selected && (
+        </div>
+      )}
+      {open && selected && (
         <pre className="event-detail" onClick={() => setSelected(null)}>
           {JSON.stringify(selected, null, 2)}
         </pre>

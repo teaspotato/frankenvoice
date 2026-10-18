@@ -25,6 +25,7 @@ Open http://localhost:5173 and press **Run live**. Allow microphone access. Pres
   - Scroll to zoom, drag to pan, double-click or **Fit** for the whole session, **Follow** to track the live edge. Hover for details; click a lane to select its stage. Errors show as red dots on their stage's lane.
 - **Stage panel** (right): pick a stage's implementation (for example Silero or energy VAD, API or browser TTS) and edit its params. Saved in the browser; **Save config** / **Open…** move it as a file, and **Use its config** on a session restores what that session ran with.
 - **Event log** (bottom): every recorded event, filterable.
+- **Layout**: drag the edges between the diagram, dashboard, event log and side panel to resize them (double-click an edge to reset); the event log starts collapsed, click **Events** to open it. Sizes are remembered in the browser.
 - **Sessions** (right): **New session** clears the dashboard; click a session's name to rename it (a saved session's file is renamed too); **Save** writes an unsaved live session to `./sessions` when autosave is off; **Delete** removes a session from the list and, for a recorded session, its file in `./sessions`.
 
 The pipeline runs in the browser. The small proxy in `server/` keeps API keys out of the page, avoids CORS, and stores settings and session bundles. It only answers requests from the local UI: other websites (by `Origin`) and DNS-rebinding hosts (by `Host`) get 403. It forwards requests and streams responses unchanged, so the browser records exactly what each provider sent.
