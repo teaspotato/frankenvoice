@@ -45,6 +45,7 @@ export class SimScheduler implements Scheduler {
   private nextId = 0;
   private stopped = false;
   private realtimeTimer: ReturnType<typeof setTimeout> | undefined;
+  private onStop: (() => void) | undefined;
 
   now(): number {
     return this.cur;
@@ -76,6 +77,8 @@ export class SimScheduler implements Scheduler {
   /** Pace items against wall time. Resolves when the queue drains or stop() is called. */
   runRealtime(speed = 1, perf: { now(): number } = performance): Promise<void> {
     return new Promise((resolve) => {
+      // stop() cancels the pending tick, so it has to settle the promise itself.
+      this.onStop = resolve;
       const wall0 = perf.now();
       const sim0 = this.cur;
       const tick = () => {
@@ -98,6 +101,8 @@ export class SimScheduler implements Scheduler {
   stop(): void {
     this.stopped = true;
     if (this.realtimeTimer) clearTimeout(this.realtimeTimer);
+    this.onStop?.();
+    this.onStop = undefined;
   }
 
   private less(a: Item, b: Item) {

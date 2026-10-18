@@ -42,6 +42,17 @@ describe('SimScheduler', () => {
     expect(out).toEqual(['a', 'b', 'c']);
     expect(sim.now()).toBe(5);
   });
+
+  it('settles a real-time run when stopped mid-way', async () => {
+    const sim = new SimScheduler();
+    const out: number[] = [];
+    for (let t = 0; t <= 10_000; t += 100) sim.at(t, () => out.push(t));
+    const done = sim.runRealtime(1);
+    setTimeout(() => sim.stop(), 120);
+    await done;
+    expect(out.length).toBeGreaterThan(0);
+    expect(out.length).toBeLessThan(10);
+  });
 });
 
 describe('migrateGraph', () => {

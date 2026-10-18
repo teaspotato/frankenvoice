@@ -55,6 +55,20 @@ interface Session {
   traj: Trajectory;
   saved?: string;
   comparison?: Comparison;
+  /** Replay stopped by the user before the source ended: compare only what ran. */
+  stoppedAt?: number;
+}
+
+function describeComparison(s: Session): string {
+  const c = s.comparison!;
+  if (c.identical) return 'identical to source ✓';
+  if (s.stoppedAt !== undefined) {
+    // Everything before the stop turn should match; the stop itself is new.
+    const stopIdx = s.traj.events.findIndex((e) => e.kind === 'node.stop');
+    const sec = (s.stoppedAt / 1000).toFixed(1);
+    return c.matched >= stopIdx ? `stopped at ${sec} s · matches source so far ✓` : `stopped at ${sec} s · diverged at event ${c.matched}`;
+  }
+  return `diverged at event ${c.matched}`;
 }
 
 export function App() {
@@ -197,8 +211,8 @@ export function App() {
     });
   };
 
-  const finishSession = async (rt: Runtime, source?: Trajectory) => {
-    const s: Session = { traj: rt.trajectory };
+  const finishSession = async (rt: Runtime, source?: Trajectory, stoppedAt?: number) => {
+    const s: Session = { traj: rt.trajectory, stoppedAt };
     if (source) s.comparison = compareTrajectories(source, rt.trajectory);
     setSessions((ss) => [s, ...ss]);
     setCurrent(s);
@@ -265,8 +279,9 @@ export function App() {
     setRunning('replay');
     if (replayOpts.realtime) await sim.runRealtime(1);
     else sim.runFast();
+    const stoppedAt = rt.isRunning ? sim.now() : undefined;
     if (rt.isRunning) rt.stop();
-    await finishSession(rt, source);
+    await finishSession(rt, source, stoppedAt);
   };
 
   const loadServerSession = async (id: string) => {
@@ -450,7 +465,7 @@ export function App() {
               </button>
               <small>
                 {(s.traj.duration / 1000).toFixed(1)} s · {s.traj.events.length} events
-                {s.comparison && (s.comparison.identical ? ' · identical to source ✓' : ` · diverged at event ${s.comparison.matched}`)}
+                {s.comparison && ` · ${describeComparison(s)}`}
                 {s.saved && ' · saved'}
               </small>
               <span>
