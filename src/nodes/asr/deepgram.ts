@@ -5,6 +5,7 @@ import type { AsrAdapter, AsrEvent } from './types';
 interface DgResults {
   is_final?: boolean;
   speech_final?: boolean;
+  from_finalize?: boolean;
   start: number;
   duration: number;
   channel: { alternatives: { transcript: string; confidence?: number; words?: { word: string; start: number; end: number }[] }[] };
@@ -40,6 +41,7 @@ export const deepgramAdapter: AsrAdapter = {
   },
   encode: int16BytesFromF32,
   closeMessage: () => ({ type: 'CloseStream' }),
+  finalizeMessage: () => ({ type: 'Finalize' }),
   parse(data): AsrEvent[] {
     const m = data as JsonObject;
     switch (m.type) {
@@ -60,6 +62,7 @@ export const deepgramAdapter: AsrAdapter = {
             text: alt?.transcript ?? '',
             confidence: alt?.confidence ?? null,
             speechFinal: !!r.speech_final,
+            ...(r.from_finalize ? { fromFinalize: true } : {}),
             start: r.start,
             end: r.start + r.duration,
             words: alt?.words ?? [],

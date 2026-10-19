@@ -520,7 +520,9 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           collect(text, msg.start as number, msg.end as number);
           partial = null;
           if (eotWait) commit(eotWait.why);
-          else if (!useModel() && msg.speechFinal && p.commitOn === 'speech_final') commit('speech_final');
+          // A final flushed because the VAD heard the speech end is as good as ASR endpointing (and sooner).
+          else if (!useModel() && p.commitOn === 'speech_final' && (msg.speechFinal || (msg.fromFinalize && !speaking)))
+            commit(msg.speechFinal ? 'speech_final' : 'finalized on VAD speech end');
           else refreshDraft('ASR final');
         } else if (msg.type === 'asr.utterance_end') {
           commit('utterance_end');

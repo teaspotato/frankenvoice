@@ -9,9 +9,9 @@ function harness(def: NodeDef, params: Record<string, unknown> = {}) {
   let now = 0;
   const timers: { at: number; fn: () => void; live: boolean }[] = [];
   const out: { port: string; msg: Msg }[] = [];
-  const ios: { request: Json; h: IOHandlers; closed: boolean }[] = [];
+  const ios: { request: Json; h: IOHandlers; closed: boolean; sent: Json[] }[] = [];
   const ctx: NodeContext = {
-    id: def.type === 'llm' ? 'llm' : 'turn',
+    id: def.type === 'llm' ? 'llm' : def.type === 'asr' ? 'asr' : 'turn',
     params: resolveParams(def, params as never),
     now: () => now,
     cause: undefined,
@@ -25,9 +25,9 @@ function harness(def: NodeDef, params: Record<string, unknown> = {}) {
     },
     io: {
       open(_channel, request, h) {
-        const x = { request, h, closed: false };
+        const x = { request, h, closed: false, sent: [] as Json[] };
         ios.push(x);
-        return { xid: String(ios.length), send() {}, close: () => void (x.closed = true), get closed() { return x.closed; } };
+        return { xid: String(ios.length), send: (d) => void x.sent.push(d), close: () => void (x.closed = true), get closed() { return x.closed; } };
       },
     },
     media: {
@@ -198,5 +198,24 @@ describe('sessions recorded before drafts', () => {
     const { migrateGraph } = await import('../src/nodes');
     const g = migrateGraph({ format: 'frankenvoice-graph', formatVersion: 2, name: 'old', nodes: [{ id: 'turn', type: 'turn.duplex', params: {} }], edges: [] });
     expect(g.nodes[0].params).toEqual({ speculate: false });
+  });
+});
+
+describe('finalizing ASR on VAD speech end', () => {
+  it('commits a final flushed after the VAD heard the end, without waiting for ASR endpointing', () => {
+    const h = harness(duplexTurnNode);
+    h.send(0, 'vad', vad(true, 0));
+    h.send(800, 'transcript', asr(false, 800, 'what about'));
+    h.send(1000, 'vad', vad(false, 1000));
+    h.send(1150, 'transcript', { ...asr(true, 1150, 'what about Osaka?'), fromFinalize: true });
+    expect(h.of('turn.user')).toMatchObject([{ text: 'what about Osaka?' }]);
+  });
+
+  it('asks the ASR provider to finalize on speech end', async () => {
+    const { asrNode } = await import('../src/nodes/asr');
+    const h = harness(asrNode);
+    h.send(0, 'audio', { type: 'audio', track: 'mic', start: 0, end: 160, sampleRate: 16000, samples: new Float32Array(160) });
+    h.send(500, 'vad', vad(false, 500));
+    expect(h.ios[0].sent.filter((d) => d !== null)).toEqual([{ type: 'Finalize' }]);
   });
 });

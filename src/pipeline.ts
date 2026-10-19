@@ -117,6 +117,8 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     ...(hasSpeaker ? [e('speaker', 'played', 'turnmodel', 'played')] : []),
     ...(registry[stageType(c, 'turn')].inputs.some((p) => p.name === 'scores') ? [e('turnmodel', 'scores', 'turn', 'scores')] : []),
     e('vad', 'vad', 'turn', 'vad'),
+    // Speech end: ASR flushes its final words now rather than at its own endpointing.
+    e('vad', 'vad', 'asr', 'vad'),
     e('asr', 'transcript', 'turn', 'transcript'),
     e('turn', 'turn', 'llm', 'turn'),
     e('llm', 'text', 'tts', 'text'),
