@@ -75,6 +75,8 @@ export function App() {
   const [config, setConfig] = useState<PipelineConfig>(loadConfig);
   const [selected, setSelected] = useState<StageId | null>(null);
   const [running, setRunning] = useState<'live' | 'replay' | null>(null);
+  /** The running replay plays a session back as recorded: the dashboard keeps showing that session. */
+  const [playingBack, setPlayingBack] = useState(false);
   const [nodeStates, setNodeStates] = useState<Record<string, Record<string, Json>>>({});
   /** Node type behind each entry of nodeStates (the run they came from may predate a config change). */
   const [stateTypes, setStateTypes] = useState<Record<string, string>>({});
@@ -264,7 +266,8 @@ export function App() {
     });
     simRef.current = sim;
     attach(rt, sim);
-    setCurrent({ traj: rt.trajectory });
+    if (keep) setCurrent({ traj: rt.trajectory });
+    setPlayingBack(!keep);
     setRunning('replay');
     setPlayFrom(0);
     if (replayOpts.realtime) {
@@ -514,7 +517,7 @@ export function App() {
           onSelect={(lane, item) => selectStage(stageOf(lane), !item)}
           transport={transport}
           onSeek={seek}
-          playhead={running ? null : playFrom}
+          playhead={running === 'replay' && playingBack ? () => simRef.current?.now() ?? 0 : running ? null : playFrom}
           onFocusEvents={(seqs) => setFocus((f) => ({ seqs, n: (f?.n ?? 0) + 1 }))}
         />
       </section>

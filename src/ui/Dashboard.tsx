@@ -125,8 +125,8 @@ export function Dashboard({
   onFocusEvents(seqs: number[]): void;
   /** Empty timeline space or the time axis was clicked: seek there. */
   onSeek(t: number): void;
-  /** Where ▶ will start, shown while nothing runs. */
-  playhead: number | null;
+  /** Where ▶ will start while nothing runs; while a recorded session plays back, the current playback time. */
+  playhead: number | (() => number) | null;
   /** Play/pause/stop for the shown session. */
   transport: ReactNode;
 }) {
@@ -150,8 +150,19 @@ export function Dashboard({
   if (trajectory && modelRef.current?.traj !== trajectory) modelRef.current = new TimelineModel(trajectory);
   if (!trajectory) modelRef.current = null;
 
-  // A new session starts following again.
-  useEffect(() => setView((v) => ({ ...v, end: null })), [trajectory]);
+  // A new session starts following again, except a replay of the one on screen: the view stays put.
+  const prevTraj = useRef(trajectory);
+  useEffect(() => {
+    const prev = prevTraj.current;
+    prevTraj.current = trajectory;
+    if (trajectory?.meta.mode === 'replay' && trajectory.meta.replayOf === prev?.meta.id) return;
+    setView((v) => ({ ...v, end: null }));
+  }, [trajectory]);
+
+  // Playing back a recorded session shows all of it; following turns pages only when the playhead leaves the view.
+  const playing = typeof playhead === 'function';
+  const page = useRef<number | null>(null);
+  if (!playing) page.current = null;
 
   useEffect(() => {
     const el = wrapRef.current;
@@ -174,7 +185,14 @@ export function Dashboard({
   }, [running]);
 
   const window_ = (m: TimelineModel | null): [number, number] => {
-    const head = Math.max(m?.duration ?? 0, running && now ? now() : 0);
+    if (playing && view.end === null) {
+      const t = (playhead as () => number)();
+      let end = page.current ?? Math.max(m?.duration ?? 0, view.span);
+      if (t > end - view.span * 0.02 || t < end - view.span) end = t - view.span * 0.05 + view.span;
+      page.current = end;
+      return [Math.max(end, view.span) - view.span, Math.max(end, view.span)];
+    }
+    const head = Math.max(m?.duration ?? 0, running && !playing && now ? now() : 0);
     // Never show time before the session started.
     const end = Math.max(view.end ?? head, view.span);
     return [end - view.span, end];
@@ -695,9 +713,10 @@ export function Dashboard({
       setRelInfo(info);
     }
 
-    // where ▶ starts
-    if (playhead !== null && playhead > 0 && playhead >= t0 && playhead <= t1) {
-      const px = Math.round(x(playhead)) + 0.5;
+    // where ▶ starts, or where playback is
+    const cursor = typeof playhead === 'function' ? playhead() : playhead;
+    if (cursor !== null && (playing || cursor > 0) && cursor >= t0 && cursor <= t1) {
+      const px = Math.round(x(cursor)) + 0.5;
       g.strokeStyle = col.accent;
       g.fillStyle = col.accent;
       g.beginPath();
@@ -802,7 +821,7 @@ export function Dashboard({
   };
   const fit = () => {
     const d = modelRef.current?.duration ?? 0;
-    setView({ span: Math.max(MIN_SPAN, d * 1.02), end: running ? null : d * 1.01 });
+    setView({ span: Math.max(MIN_SPAN, d * 1.02), end: running && !playing ? null : d * 1.01 });
   };
 
   let tip: Hit | undefined;
@@ -849,7 +868,7 @@ export function Dashboard({
       <div className="dashboard-bar">
         {transport}
         <span className="muted">
-          {trajectory ? (trajectory.meta.mode === 'replay' ? `replay of ${trajectory.meta.replayOf}` : running ? 'live' : trajectory.meta.id) : 'no session yet: press Run live'}
+          {trajectory ? (trajectory.meta.mode === 'replay' ? `replay of ${trajectory.meta.replayOf}` : playing ? `playing ${trajectory.meta.id}` : running ? 'live' : trajectory.meta.id) : 'no session yet: press Run live'}
         </span>
         <span className="spacer" />
         <small className="muted">click to seek · scroll to zoom · drag to pan · click a lane's name to select its stage</small>
