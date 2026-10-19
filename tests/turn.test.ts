@@ -72,6 +72,20 @@ describe('full-duplex turn-taking', () => {
     expect(h.last('turn.user')?.text).toBe("I don't think they measured the arms. There's this other researcher");
   });
 
+  it('commits a held-back final after a silence even if ASR sends nothing more', () => {
+    const h = harness({ maxSilenceMs: 1500 });
+    const { sr } = h;
+    h.send(1000, 'vad', { type: 'vad.speech_start', at: 1000 * sr });
+    h.send(2000, 'vad', { type: 'vad.speech_end', at: 2000 * sr });
+    h.send(2100, 'vad', { type: 'vad.speech_start', at: 2100 * sr }); // a breath
+    h.send(2250, 'transcript', { type: 'asr.final', text: 'Is it raining?', start: 1000 * sr, end: 2000 * sr, speechFinal: true, fromFinalize: true });
+    h.send(2400, 'vad', { type: 'vad.speech_end', at: 2400 * sr });
+    h.advance(3800);
+    expect(h.last('turn.user')).toBeUndefined();
+    h.advance(4000);
+    expect(h.last('turn.user')?.text).toBe('Is it raining?');
+  });
+
   it('lets a short backchannel through and keeps the agent talking', () => {
     const h = harness();
     h.user(1000, 'tell me about Tokyo');

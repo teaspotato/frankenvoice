@@ -57,6 +57,8 @@ export interface Opener extends Span {
 export interface AudioBlock {
   t: number;
   peaks: Float32Array;
+  /** A backchannel: on its own output, so cutting the reply off doesn't cut it. */
+  cue?: boolean;
 }
 
 export interface CleanupFrame {
@@ -179,6 +181,7 @@ export class TimelineModel {
   private clipAgentAudio(at: number) {
     this.playbackSegments = this.playbackSegments.filter((s) => s.t < at);
     this.agentAudio = this.agentAudio.flatMap((b) => {
+      if (b.cue) return [b];
       if (b.t >= at) return [];
       const keep = Math.ceil((at - b.t) / PEAK_MS);
       return [keep < b.peaks.length ? { ...b, peaks: b.peaks.slice(0, keep) } : b];
@@ -258,12 +261,12 @@ export class TimelineModel {
     }
     if (e.kind === 'io.send' && d.payload?.cmd === 'cue' && e.media) {
       const samples = this.traj.tracks.readF32Range(e.media.track, e.media.start, e.media.end);
-      this.agentAudio.push({ t: d.payload.at, peaks: this.peaks(samples, d.payload.sampleRate) });
+      this.agentAudio.push({ t: d.payload.at, peaks: this.peaks(samples, d.payload.sampleRate), cue: true });
       return;
     }
     if (e.kind === 'io.send' && d.payload?.cmd === 'play' && e.media) {
       const samples = this.traj.tracks.readF32Range(e.media.track, e.media.start, e.media.end);
-      this.agentAudio.push({ t: d.payload.at, peaks: this.peaks(samples, d.payload.sampleRate) });
+      this.agentAudio.push({ t: d.payload.at, peaks: this.peaks(samples, d.payload.sampleRate), cue: true });
       this.playback[this.playback.length - 1]?.seqs.push(e.seq);
       return;
     }

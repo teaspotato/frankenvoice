@@ -858,6 +858,19 @@ export function Dashboard({
         hits.push({ lane: 'speaker', x0: x(s.t) - 3, x1: x(s.t) + 60, text: s.text, seqs: [s.seq] });
       }
       for (const b of m.boundaries) if (b >= t0 && b <= t1) mark('speaker', b, col.sink, 0.88, 'dot', 2);
+      // Backchannels: what was said (accent box over its audio) and what was held back (grey dot, reason on hover)
+      for (const b of m.backchannels) {
+        const end = b.t1 ?? b.t0 + 400;
+        if (end < t0 || b.t0 > t1) continue;
+        span('speaker', b.t0, end, col.accent, 0.3, b.text, 0.3, 0.7);
+        hits[hits.length - 1].text = `backchannel "${b.text}" (${b.why ?? ''})`;
+        tag(b.seqs);
+      }
+      for (const k of m.bcSkips) {
+        if (k.t < t0 || k.t > t1) continue;
+        mark('speaker', k.t, col.sink, 0.95, 'dot', 2);
+        hits.push({ lane: 'speaker', x0: x(k.t) - 3, x1: x(k.t) + 3, y0: laneY.speaker[0] + (laneY.speaker[1] - laneY.speaker[0]) * 0.85, y1: laneY.speaker[1], text: `backchannel held back (${k.why}): ${k.text}`, seqs: [k.seq] });
+      }
 
       for (const err of m.errors) {
         const lane = laneY[err.node] ? err.node : 'mic';

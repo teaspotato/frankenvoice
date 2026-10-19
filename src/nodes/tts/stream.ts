@@ -105,6 +105,8 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
       for (let i = 0; i < todo.length; i += per) renderBatch(todo.slice(i, i + per));
     };
 
+    /** Lines already re-sent once after their socket closed early. */
+    const retried = new Set<string>();
     const renderBatch = (todo: string[]) => {
       const queue = [...todo];
       let chunks: Float32Array[] = [];
@@ -124,6 +126,15 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
               io.send({ type: 'Close' });
               io.close();
             }
+          },
+          onClose(err) {
+            // Closed before every line came back: try those once more.
+            const left = queue.filter((l) => !retried.has(l));
+            queue.length = 0;
+            if (!left.length) return;
+            ctx.log('warn', 'canned lines not rendered; retrying', { lines: left, error: (err ?? null) as Json });
+            for (const l of left) retried.add(l);
+            renderBatch(left);
           },
         },
       );
@@ -282,7 +293,8 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
             prerender(msg.lines as string[]);
             break;
           case 'bc.say':
-            playCue(msg.id as string, (msg.take ?? msg.line) as string, Number(msg.tailMs ?? 0));
+            // The take, or else the line itself if that take never rendered.
+            playCue(msg.id as string, (canned.has(msg.take as string) ? msg.take : msg.line) as string, Number(msg.tailMs ?? 0));
             break;
           case 'opener.say':
           case 'llm.delta': {

@@ -101,6 +101,19 @@ export const speakerNode: NodeDef<Record<string, never>> = {
     const announce = (r: string | null, s: PlayedSegment) =>
       ctx.emit('playback', { type: 'playback.segment', rid: r as string, seg: s.seg, text: s.text, at: s.announced! });
 
+    /** Backchannels playing or recently played; they play on their own output, which a flush doesn't stop. */
+    let cues: Chunk[] = [];
+    /** The reply's output was flushed at `at`: cut the echo reference there, but put back the cues still sounding. */
+    const flushPlayed = (at: number) => {
+      ctx.emit('played', { type: 'played.flush', at });
+      cues = cues.filter((c) => c.at + (c.samples.length / c.sampleRate) * 1000 > at);
+      for (const c of cues) {
+        const cut = Math.max(0, Math.round(((at - c.at) / 1000) * c.sampleRate));
+        const samples = c.samples.subarray(cut);
+        ctx.emit('played', { type: 'audio', track: c.track, start: c.start + cut, end: c.end, sampleRate: c.sampleRate, samples, at: Math.max(at, c.at), cue: true });
+      }
+    };
+
     const pause = () => {
       const at = ctx.now();
       io?.send({ cmd: 'flush' });
@@ -117,7 +130,7 @@ export const speakerNode: NodeDef<Record<string, never>> = {
       paused = at;
       endAt = Math.max(endAt, at);
       ctx.setState('paused', true);
-      ctx.emit('played', { type: 'played.flush', at });
+      flushPlayed(at);
       ctx.emit('playback', { type: 'playback.paused', rid, at });
     };
     const resume = () => {
@@ -216,7 +229,7 @@ export const speakerNode: NodeDef<Record<string, never>> = {
             ctx.setState('playing', false);
             ctx.emit('playback', { type: 'playback.interrupted', rid, at, heard });
             // Paused, the device was flushed (and the echo reference cut) at the pause.
-            if (!wasPaused) ctx.emit('played', { type: 'played.flush', at });
+            if (!wasPaused) flushPlayed(at);
           }
           return;
         }
@@ -245,6 +258,7 @@ export const speakerNode: NodeDef<Record<string, never>> = {
             logBin: false,
           });
           ctx.emit('played', { type: 'audio', track: msg.track, start: msg.start, end: msg.end, sampleRate: msg.sampleRate, samples: msg.samples, at, cue: true });
+          cues = [...cues.filter((c) => c.at + (c.samples.length / c.sampleRate) * 1000 > at), { at, track: msg.track, start: msg.start, end: msg.end, sampleRate: msg.sampleRate, samples: msg.samples }];
           ctx.emit('playback', { type: 'playback.cue', rid: msg.rid as Json, at, end: at + (msg.samples.length / msg.sampleRate) * 1000 });
           return;
         }

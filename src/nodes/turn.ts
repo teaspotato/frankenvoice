@@ -358,6 +358,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let model = false;
     /** With the model: commits the words if the user stays silent this long without its end of turn. */
     let silence: TimerHandle | null = null;
+    /** A Finalize'd final was held back because the user went on: their next silence commits it, ASR final or not. */
+    let heldFinal = false;
     /** The user is talking (VAD). */
     let speaking = false;
     /** ASR has caught up with the silence: a result arrived during it, or the words before it were all final. */
@@ -482,6 +484,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     };
     /** Commit the turn. `tail`: its last words are an ASR partial whose final may still come. */
     const commit = (why: string, tail?: Partial_, extra: Record<string, Json> = {}) => {
+      heldFinal = false;
       eotWait?.timer.clear();
       eotWait = null;
       silence?.clear();
@@ -527,12 +530,12 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     const armSilence = () => {
       silence?.clear();
       silence = null;
-      if (!useModel() || p.maxSilenceMs <= 0 || state !== 'listening' || speaking) return;
+      if ((!useModel() && !heldFinal) || p.maxSilenceMs <= 0 || state !== 'listening' || speaking) return;
       silence = ctx.setTimer(
         p.maxSilenceMs,
         () => {
           silence = null;
-          if (state === 'listening' && !speaking && (parts.length || partial)) endOfTurn(`${p.maxSilenceMs} ms of silence without the model's end of turn`);
+          if (state === 'listening' && !speaking && (parts.length || partial)) endOfTurn(`${p.maxSilenceMs} ms of silence without ${useModel() ? "the model's end of turn" : 'another ASR final'}`);
         },
         'silence',
       );
@@ -823,7 +826,10 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           // Finalize marks even a short pause speech_final), and the next speech end commits it all.
           else if (!useModel() && p.commitOn === 'speech_final' && (msg.fromFinalize ? !speaking : msg.speechFinal))
             commit(msg.speechFinal ? 'speech_final' : 'finalized on VAD speech end');
-          else refreshDraft('ASR final');
+          else {
+            if (!useModel() && msg.fromFinalize && speaking) heldFinal = true;
+            refreshDraft('ASR final');
+          }
         } else if (msg.type === 'asr.utterance_end') {
           if (speaking) ctx.log('debug', 'utterance end ignored: the VAD still hears speech');
           else commit('utterance_end');

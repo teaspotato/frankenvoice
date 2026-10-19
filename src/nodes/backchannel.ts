@@ -177,6 +177,10 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
     let draftOut = false;
     /** When the VAD last heard the user stop; ASR said they finished (speech_final) since then. */
     let silentSince: number | null = null;
+    /** The VAD hears the user now, whoever has the floor. */
+    let vadSpeech = false;
+    /** Counts user turns, so an encoder answer can tell its turn is over. */
+    let turnNo = 0;
     let asrDone = false;
     let eotUser = 0;
     let lastBc = -Infinity;
@@ -211,11 +215,11 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
     const talkedMs = (now: number) => speechMs + (speechFrom !== null ? now - speechFrom : 0);
 
     /** Why not now, or null when a backchannel may be said. */
-    const blocked = (now: number): string | null => {
+    const blocked = (now: number, gap = true): string | null => {
       if (floor !== 'listening') return `agent is ${floor}`;
       if (turnStart === null) return 'no user turn';
       if (talkedMs(now) < p.minTurnMs) return `user has talked ${Math.round(talkedMs(now))} ms`;
-      if (now - lastBc < p.minGapMs) return `last backchannel ${Math.round(now - lastBc)} ms ago`;
+      if (gap && now - lastBc < p.minGapMs) return `last backchannel ${Math.round(now - lastBc)} ms ago`;
       if (silentSince !== null && now - silentSince > p.maxSilenceMs) return `user silent for ${Math.round(now - silentSince)} ms`;
       if (asrDone) return 'ASR heard the end of the utterance';
       if (draftOut) return 'a reply is being drafted';
@@ -252,7 +256,9 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       }
       const recent = words(`${finals} ${partial}`).slice(-12).join(' ');
       // Claim the slot now, so a second proposal during the encoder call is gated.
+      const prevBc = lastBc;
       lastBc = now;
+      const turn = turnNo;
       if (!recent || !exampleVecs || !lines.examples.length) {
         const c = nextContinuer();
         if (c) say(c, why, data);
@@ -262,14 +268,20 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
         const pick = vecs?.[0] ? pickLine(vecs[0], lines.examples, exampleVecs!, Number(p.minScore)) : null;
         const pickData: JsonObject = pick ? { words: recent, score: pick.score, example: pick.example } : { words: recent };
         // The moment may have passed while the encoder ran.
-        if (floor !== 'listening' || draftOut) return void ctx.emit('text', { type: 'bc.skip', why, reason: 'moment passed', ...data });
+        const late = turn !== turnNo ? 'the turn ended' : blocked(ctx.now(), false);
+        if (late) {
+          lastBc = prevBc;
+          return void ctx.emit('text', { type: 'bc.skip', why, reason: `moment passed: ${late}`, ...data });
+        }
         const line = pick?.line ?? nextContinuer();
         if (line) say(line, why, { ...data, ...pickData });
       });
     };
 
     const endTurn = () => {
+      turnNo++;
       turnStart = null;
+      silentSince = null;
       speechMs = 0;
       speechFrom = null;
       finals = partial = '';
@@ -298,12 +310,18 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
           if (msg.type === 'turn.transition') {
             floor = String(msg.to).replace('+user', '');
             if (floor !== 'listening') endTurn();
+            else if (vadSpeech && turnStart === null) {
+              // They took the floor by talking over the agent: their turn started with that speech.
+              turnStart = now;
+              speechFrom = now;
+            }
           } else if (msg.type === 'turn.draft') draftOut = true;
           else if (msg.type === 'turn.draft_drop') draftOut = false;
           return;
         }
         if (port === 'vad') {
           if (msg.type === 'vad.speech_start') {
+            vadSpeech = true;
             pause?.clear();
             if (floor !== 'listening') return;
             turnStart ??= now;
@@ -311,6 +329,7 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
             silentSince = null;
             asrDone = false;
           } else if (msg.type === 'vad.speech_end') {
+            vadSpeech = false;
             if (speechFrom !== null) speechMs += now - speechFrom;
             speechFrom = null;
             silentSince = now;

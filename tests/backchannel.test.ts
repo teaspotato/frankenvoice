@@ -135,6 +135,31 @@ describe('backchannels', () => {
   });
 });
 
+describe('backchannel turns', () => {
+  it('counts a turn that started by talking over the agent', () => {
+    const h = bc({ minTurnMs: 2000 });
+    h.send(0, 'turn', { type: 'turn.transition', from: 'listening', to: 'speaking' });
+    h.send(1000, 'vad', { type: 'vad.speech_start' });
+    h.send(1300, 'turn', { type: 'turn.transition', from: 'speaking+user', to: 'listening' });
+    fire(h, 3500);
+    expect(h.of('bc.say')).toHaveLength(1);
+  });
+
+  it("drops a line whose encoder answer comes after the user's turn ended", () => {
+    const h = bc({ lines: 'Mm-hmm.\nOh no. = my laptop died', minTurnMs: 0 });
+    const enc = () => h.ios.filter((x) => x.channel === 'embed');
+    enc()[0].h.onRecv?.({ vectors: [[1, 0]] }, undefined);
+    h.send(0, 'vad', { type: 'vad.speech_start' });
+    h.send(500, 'transcript', { type: 'asr.final', text: 'my laptop died' });
+    fire(h, 600);
+    h.send(700, 'turn', { type: 'turn.transition', from: 'listening', to: 'thinking' });
+    h.send(800, 'turn', { type: 'turn.transition', from: 'thinking', to: 'listening' });
+    enc()[1].h.onRecv?.({ vectors: [[1, 0]] }, undefined);
+    expect(h.of('bc.say')).toEqual([]);
+    expect(String(h.of('bc.skip').at(-1)?.reason)).toMatch(/moment passed/);
+  });
+});
+
 describe('speaker cues', () => {
   it('plays a backchannel at once without starting a reply', () => {
     const h = harness(speakerNode as NodeDef<never>);
@@ -144,6 +169,20 @@ describe('speaker cues', () => {
     expect(h.of('playback.cue')[0]).toMatchObject({ rid: 'bc0', at: 100, end: 200 });
     expect(h.ios[0].sent.at(-1)).toMatchObject({ cmd: 'cue', at: 100 });
     expect(h.out.filter((o) => o.port === 'played')).toHaveLength(1);
+  });
+
+  it('keeps a cue in the echo reference when the reply is cut off under it', () => {
+    const h = harness(speakerNode as NodeDef<never>);
+    const rate = 24000;
+    h.send(0, 'audio', { type: 'audio', track: 'tts.audio', start: 0, end: rate, sampleRate: rate, samples: new Float32Array(rate), rid: 'r0', seg: 0 } as Msg);
+    h.send(100, 'audio', { type: 'audio', track: 'tts.audio', start: rate, end: rate + 9600, sampleRate: rate, samples: new Float32Array(9600), rid: 'bc0', cue: true } as Msg);
+    h.send(300, 'control', { type: 'cancel' });
+    const played = h.out.filter((o) => o.port === 'played').map((o) => o.msg);
+    const flush = played.findIndex((m) => m.type === 'played.flush');
+    expect(flush).toBeGreaterThan(0);
+    // After the flush, the rest of the cue (from 300 ms; it runs to 500 ms) goes back in.
+    expect(played[flush + 1]).toMatchObject({ cue: true, at: 300, start: rate + 4800 });
+    expect((played[flush + 1].samples as Float32Array).length).toBe(4800);
   });
 });
 
