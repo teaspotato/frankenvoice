@@ -306,6 +306,8 @@ const speechSynthesisDriver: LiveDriver = (req, sink) => {
   u.lang = voice?.lang ?? r.lang;
   u.rate = r.rate;
   u.pitch = r.pitch;
+  // Browser speech can't change volume mid-sentence: a mute applies from the next sentence.
+  u.volume = muted.agent ? 0 : 1;
   let done = false;
   const finish = (data: Json) => {
     if (done) return;
@@ -346,6 +348,60 @@ export function setOutputSuppressed(on: boolean) {
   if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
 }
 
+/** Muted outputs: the agent's voice (speaker and browser speech) and the recorded mic during replay. */
+const muted = { agent: false, mic: false };
+const gains = { agent: new Set<GainNode>(), mic: new Set<GainNode>() };
+
+export function setOutputMuted(which: 'agent' | 'mic', on: boolean) {
+  muted[which] = on;
+  for (const g of gains[which]) g.gain.value = on ? 0 : 1;
+}
+
+/** An output context whose audio goes through a gain that follows the mute switch for `which`. */
+function outputContext(which: 'agent' | 'mic') {
+  const ctx = new AudioContext({ latencyHint: 'interactive' });
+  const gain = ctx.createGain();
+  gain.gain.value = muted[which] ? 0 : 1;
+  gain.connect(ctx.destination);
+  outputContexts.add(ctx);
+  gains[which].add(gain);
+  return {
+    ctx,
+    out: gain,
+    close() {
+      outputContexts.delete(ctx);
+      gains[which].delete(gain);
+      void ctx.close();
+    },
+  };
+}
+
+/**
+ * Plays the recorded mic while a replay runs in real time, so both sides of the conversation are heard.
+ * Frames are queued back to back from a short initial delay; `now` is the replay's session clock.
+ */
+export function micMonitor() {
+  const { ctx, out, close } = outputContext('mic');
+  let next = 0;
+  return {
+    play(samples: Float32Array<ArrayBuffer>, sampleRate: number) {
+      if (outputSuppressed || !samples.length) return;
+      const buf = ctx.createBuffer(1, samples.length, sampleRate);
+      buf.copyToChannel(samples, 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(out);
+      src.onended = () => playingSources.delete(src);
+      playingSources.add(src);
+      // Restart the queue after a gap (seek, pause) instead of drifting further behind.
+      if (next < ctx.currentTime || next > ctx.currentTime + 0.5) next = ctx.currentTime + 0.08;
+      src.start(next);
+      next += buf.duration;
+    },
+    close,
+  };
+}
+
 /** Pause or resume every playing output (speaker audio and browser speech). */
 export function setOutputPaused(paused: boolean) {
   for (const ctx of outputContexts) void (paused ? ctx.suspend() : ctx.resume());
@@ -356,8 +412,7 @@ export function setOutputPaused(paused: boolean) {
 }
 
 const speaker: LiveDriver = (_req, sink, env) => {
-  const ctx = new AudioContext({ latencyHint: 'interactive' });
-  outputContexts.add(ctx);
+  const { ctx, out, close } = outputContext('agent');
   const playing = new Set<AudioBufferSourceNode>();
   setTimeout(() => sink.recv({ type: 'ready', sampleRate: ctx.sampleRate, baseLatency: ctx.baseLatency, outputLatency: ctx.outputLatency ?? null }), 0);
   return {
@@ -375,7 +430,7 @@ const speaker: LiveDriver = (_req, sink, env) => {
       buf.copyToChannel(samples, 0);
       const src = ctx.createBufferSource();
       src.buffer = buf;
-      src.connect(ctx.destination);
+      src.connect(out);
       src.onended = () => {
         playing.delete(src);
         playingSources.delete(src);
@@ -384,10 +439,7 @@ const speaker: LiveDriver = (_req, sink, env) => {
       playingSources.add(src);
       src.start(Math.max(ctx.currentTime, ctx.currentTime + (d.at! - env.now()) / 1000));
     },
-    close() {
-      outputContexts.delete(ctx);
-      void ctx.close();
-    },
+    close,
   };
 };
 

@@ -9,7 +9,7 @@ import { decodeBundle, encodeBundle } from '../core/bundle';
 import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
 import type { Json } from '../core/types';
-import { browserDrivers, setOutputPaused, setOutputSuppressed } from '../drivers';
+import { browserDrivers, micMonitor, setOutputMuted, setOutputPaused, setOutputSuppressed } from '../drivers';
 import {
   CONFIG_FORMAT,
   activeStages,
@@ -32,6 +32,7 @@ import { ActivityTracker, NO_ACTIVITY, type Activity } from './activity';
 
 const CONFIG_KEY = 'frankenvoice.pipeline';
 const AUTOSAVE_KEY = 'frankenvoice.autosave';
+const MUTE_KEY = 'frankenvoice.mute';
 
 function loadConfig(): PipelineConfig {
   try {
@@ -75,6 +76,23 @@ export function App() {
   const [config, setConfig] = useState<PipelineConfig>(loadConfig);
   const [selected, setSelected] = useState<StageId | null>(null);
   const [running, setRunning] = useState<'live' | 'replay' | null>(null);
+  /** Mute switches on the Mic and Playback lanes: the recorded mic (heard during replay) and the agent's voice. */
+  const [muted, setMuted] = useState<{ mic: boolean; agent: boolean }>(() => {
+    try {
+      return { mic: false, agent: false, ...(JSON.parse(localStorage.getItem(MUTE_KEY) ?? '{}') as object) };
+    } catch {
+      return { mic: false, agent: false };
+    }
+  });
+  useEffect(() => {
+    setOutputMuted('mic', muted.mic);
+    setOutputMuted('agent', muted.agent);
+    try {
+      localStorage.setItem(MUTE_KEY, JSON.stringify(muted));
+    } catch {
+      /* storage unavailable: muting still works for this tab */
+    }
+  }, [muted]);
   /** The running replay plays a session back as recorded: the dashboard keeps showing that session. */
   const [playingBack, setPlayingBack] = useState(false);
   const [nodeStates, setNodeStates] = useState<Record<string, Record<string, Json>>>({});
@@ -271,9 +289,21 @@ export function App() {
     setRunning('replay');
     setPlayFrom(0);
     if (replayOpts.realtime) {
+      // Hear the user's side too: the mic frames as the replay reaches them.
+      const mic = replayOpts.audible ? micMonitor() : null;
+      const unsub = mic
+        ? rt.trajectory.subscribe((e) => {
+            if (e.kind === 'msg' && e.node === 'mic' && e.media) {
+              const d = e.data as { sampleRate?: number };
+              mic.play(new Float32Array(rt.trajectory.tracks.readF32Range(e.media.track, e.media.start, e.media.end)), d.sampleRate ?? 16000);
+            }
+          })
+        : () => {};
       const done = sim.runRealtime(1);
       if (from > 0) skipTo(sim, from);
       await done;
+      unsub();
+      mic?.close();
     } else sim.runFast();
     const stoppedAt = rt.isRunning ? sim.now() : undefined;
     if (rt.isRunning) rt.stop();
@@ -517,6 +547,8 @@ export function App() {
           onSelect={(lane, item) => selectStage(stageOf(lane), !item)}
           transport={transport}
           onSeek={seek}
+          muted={muted}
+          onMute={(which) => setMuted((m) => ({ ...m, [which]: !m[which] }))}
           playhead={running === 'replay' && playingBack ? () => simRef.current?.now() ?? 0 : running ? null : playFrom}
           onFocusEvents={(seqs) => setFocus((f) => ({ seqs, n: (f?.n ?? 0) + 1 }))}
         />

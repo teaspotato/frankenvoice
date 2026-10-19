@@ -113,6 +113,8 @@ export function Dashboard({
   onSeek,
   playhead,
   transport,
+  muted,
+  onMute,
 }: {
   trajectory?: Trajectory;
   running: boolean;
@@ -129,6 +131,9 @@ export function Dashboard({
   playhead: number | (() => number) | null;
   /** Play/pause/stop for the shown session. */
   transport: ReactNode;
+  /** Mute switches on the Mic lane (recorded mic, heard in replays) and the Playback lane (the agent). */
+  muted: { mic: boolean; agent: boolean };
+  onMute(which: 'mic' | 'agent'): void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -880,6 +885,22 @@ export function Dashboard({
         </button>
       </div>
       <div className="dashboard-body" ref={wrapRef}>
+        {LANES.map((l, i) => {
+          const which = l.id === 'mic' ? 'mic' : l.id === 'speaker' ? 'agent' : null;
+          if (!which) return null;
+          const top = AXIS + LANES.slice(0, i).reduce((a, x) => a + x.height, 0) + l.height / 2 + 7;
+          return (
+            <button
+              key={l.id}
+              className={`lane-mute${muted[which] ? ' on' : ''}`}
+              style={{ top }}
+              onClick={() => onMute(which)}
+              title={muted[which] ? `Unmute ${which === 'mic' ? 'the recorded mic' : 'the agent'}` : `Mute ${which === 'mic' ? 'the recorded mic (heard in replays)' : 'the agent'}`}
+            >
+              {muted[which] ? '🔇' : '🔊'}
+            </button>
+          );
+        })}
         <canvas
           ref={canvasRef}
           onMouseDown={onMouseDown}

@@ -166,3 +166,6 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 @media (max-width: 560px) { .setting { grid-template-columns: 1fr auto auto; } .setting > span:first-child { grid-column: 1 / -1; } .setting input { grid-column: 1; } }
 button.link.warn { color: var(--warn); }
 button.danger-link { color: var(--danger); margin-left: auto; }
+.lane-mute { position: absolute; left: 6px; z-index: 2; padding: 0 3px; height: 16px; line-height: 14px; font-size: 11px; border: 1px solid var(--border); border-radius: 3px; background: var(--panel); cursor: pointer; opacity: 0.75; }
+.lane-mute:hover { opacity: 1; }
+.lane-mute.on { opacity: 1; border-color: var(--danger, #c33); }
