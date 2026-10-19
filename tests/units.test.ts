@@ -82,6 +82,41 @@ describe('migrateGraph', () => {
     expect(g.nodes[2].params).toEqual({ provider: 'cartesia', 'cartesia.model': 'sonic-x', minSegmentChars: 5 });
     for (const n of g.nodes) expect(registry[n.type]).toBeDefined();
   });
+
+  it('moves the format-7 thinking filler out of the LLM into the opener stage', async () => {
+    const { migrateGraph } = await import('../src/nodes');
+    const e = (a: string, b: string) => ({ from: { node: a, port: 'text' }, to: { node: b, port: 'text' } });
+    const v7 = (llm: Record<string, import('../src/core/types').Json>): import('../src/core/graph').GraphSpec => ({
+      format: 'frankenvoice-graph',
+      formatVersion: 7,
+      name: 'v7',
+      nodes: [
+        { id: 'llm', type: 'llm', params: llm },
+        { id: 'tts', type: 'tts.stream', params: {} },
+      ],
+      edges: [e('llm', 'tts')],
+    });
+    const g = migrateGraph(v7({ provider: 'anthropic', fillerAfterMs: 800 }));
+    expect(g.nodes).toEqual([
+      { id: 'llm', type: 'llm', params: { provider: 'anthropic' } },
+      { id: 'tts', type: 'tts.stream', params: {} },
+      { id: 'opener', type: 'opener.filler', params: { afterMs: 800 } },
+    ]);
+    expect(g.edges).toEqual([e('llm', 'tts'), e('llm', 'opener'), e('opener', 'tts')]);
+    expect(configFromGraph(g).opener).toEqual({ variant: 'filler', params: { filler: { afterMs: 800 } } });
+    const canned = migrateGraph(v7({ provider: 'anthropic', opener: 'canned' }));
+    expect(canned.nodes.map((n) => n.type)).toEqual(['llm', 'tts.stream']);
+    expect(canned.nodes[0].params.opener).toBe('canned');
+    expect(configFromGraph(canned).opener.variant).toBe('off');
+  });
+
+  it('runs the opener stage between the LLM and TTS', () => {
+    const g = buildGraph(defaultConfig());
+    expect(g.nodes.find((n) => n.id === 'opener')?.type).toBe('opener.filler');
+    const to = (from: string) => g.edges.filter((x) => x.from.node === from && x.from.port === 'text').map((x) => x.to.node);
+    expect(to('llm')).toEqual(['tts', 'opener']);
+    expect(to('opener')).toEqual(['tts']);
+  });
 });
 
 describe('openai-compatible adapter', () => {

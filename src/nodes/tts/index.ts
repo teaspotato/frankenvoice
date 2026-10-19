@@ -145,10 +145,11 @@ export const ttsNode: NodeDef = {
             llmDone = false;
             splitter = new SentenceSplitter(p.minSegmentChars);
             break;
+          case 'opener.say':
           case 'llm.delta':
             if (msg.rid !== rid) return;
             for (const seg of splitter.push(msg.text as string)) speak(seg);
-            if (msg.opener) {
+            if (msg.opener || msg.type === 'opener.say') {
               // An opener is said as soon as it arrives, whatever its punctuation.
               const rest = splitter.flush();
               if (rest) speak(rest);

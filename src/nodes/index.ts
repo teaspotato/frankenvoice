@@ -9,6 +9,7 @@ import { asrNode } from './asr';
 import { duplexTurnNode, halfDuplexTurnNode } from './turn';
 import { noTurnModelNode, turnModelNode } from './turn-model';
 import { llmNode } from './llm';
+import { fillerOpenerNode, noOpenerNode } from './opener';
 import { ttsNode } from './tts';
 import { streamingTtsNode } from './tts/stream';
 import { speakerNode } from './speaker';
@@ -16,7 +17,7 @@ import { browserTtsNode } from './browser-tts';
 import { echoLlmNode, toneTtsNode } from './mocks';
 
 export const registry: NodeRegistry = Object.fromEntries(
-  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, energyVadNode, asrNode, turnModelNode, noTurnModelNode, duplexTurnNode, halfDuplexTurnNode, llmNode, ttsNode, streamingTtsNode, browserTtsNode, speakerNode, echoLlmNode, toneTtsNode].map(
+  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, energyVadNode, asrNode, turnModelNode, noTurnModelNode, duplexTurnNode, halfDuplexTurnNode, llmNode, fillerOpenerNode, noOpenerNode, ttsNode, streamingTtsNode, browserTtsNode, speakerNode, echoLlmNode, toneTtsNode].map(
     (d) => [d.type, d],
   ),
 );
@@ -35,6 +36,7 @@ export function migrateGraph(g: GraphSpec): GraphSpec {
     if (g.formatVersion < 6) n = oldModelRules(n);
     return n;
   };
+  if (g.formatVersion === 7) return fillerStage({ ...g, formatVersion: GRAPH_FORMAT_VERSION });
   if (g.formatVersion >= 2) return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: g.nodes.map(older) };
   const prefix = (provider: string, params: Record<string, Json>, rename: Record<string, string> = {}) => ({
     provider,
@@ -73,6 +75,27 @@ const noThinking = (n: NodeSpec): NodeSpec => {
 const noOpener = (n: NodeSpec): NodeSpec => (n.type === 'llm' ? { ...n, params: { ...n.params, opener: 'off' } } : n);
 /** Formats 5 and 6 defaulted to the canned opener (format 7: the thinking filler). */
 const cannedOpener = (n: NodeSpec): NodeSpec => (n.type === 'llm' ? { ...n, params: { opener: 'canned', ...n.params } } : n);
+/**
+ * Format 7 said the thinking filler from inside the LLM (its default opener, 'thinking').
+ * It is the opener stage now: the filler moves there, between the LLM and TTS.
+ */
+function fillerStage(g: GraphSpec): GraphSpec {
+  const llm = g.nodes.find((n) => n.type === 'llm');
+  const tts = g.edges.find((e) => e.from.node === llm?.id && e.from.port === 'text');
+  if (!llm) return g;
+  const { opener, fillerLines, fillerAfterMs, ...params } = llm.params;
+  const nodes = g.nodes.map((n) => (n === llm ? { ...n, params: opener === undefined || opener === 'thinking' ? params : { ...params, opener } } : n));
+  if (!tts || (opener !== undefined && opener !== 'thinking')) return { ...g, nodes };
+  const id = 'opener';
+  nodes.push({
+    id,
+    type: 'opener.filler',
+    params: { ...(fillerLines !== undefined ? { lines: fillerLines } : {}), ...(fillerAfterMs !== undefined ? { afterMs: fillerAfterMs } : {}) },
+    ...(llm.ui ? { ui: { ...llm.ui, y: llm.ui.y + 90 } } : {}),
+  });
+  const edges = [...g.edges, { from: { node: llm.id, port: 'text' }, to: { node: id, port: 'text' } }, { from: { node: id, port: 'text' }, to: tts.to }];
+  return { ...g, nodes, edges };
+}
 /** Before format 6 the turn model's floor takes counted without VAD speech, and silence never committed. */
 const oldModelRules = (n: NodeSpec): NodeSpec =>
   n.type === 'turn.duplex' ? { ...n, params: { modelNeedsVad: false, maxSilenceMs: 0, ...n.params } } : n;

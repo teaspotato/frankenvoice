@@ -9,7 +9,7 @@ import type { Json } from './core/types';
 import { migrateGraph, registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'llm' | 'tts' | 'speaker';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'llm' | 'opener' | 'tts' | 'speaker';
 
 export interface StageDef {
   id: StageId;
@@ -32,6 +32,7 @@ export const STAGES: StageDef[] = [
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
+  { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', off: 'opener.off' } },
   { id: 'tts', label: 'TTS', variants: { api: 'tts', 'deepgram-stream': 'tts.stream', browser: 'tts.browser', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
 ];
@@ -84,6 +85,7 @@ const COLUMN: Record<StageId, [number, number]> = {
   asr: [420, 200],
   turn: [630, 110],
   llm: [840, 110],
+  opener: [840, 200],
   tts: [1050, 110],
   speaker: [1260, 110],
 };
@@ -92,7 +94,7 @@ const e = (from: string, fp: string, to: string, tp: string): EdgeSpec => ({ fro
 
 /**
  * The fixed topology: mic → noise/echo cleanup → VAD + turn model + ASR → turn-taking → LLM → TTS → speaker,
- * with playback fed back to turn-taking and what was played to the turn model (the agent's channel).
+ * the opener watching the LLM and speaking through TTS too, with playback fed back to turn-taking and what was played to the turn model (the agent's channel).
  */
 export function buildGraph(c: PipelineConfig): GraphSpec {
   const stages = activeStages(c);
@@ -122,6 +124,8 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('asr', 'transcript', 'turn', 'transcript'),
     e('turn', 'turn', 'llm', 'turn'),
     e('llm', 'text', 'tts', 'text'),
+    e('llm', 'text', 'opener', 'text'),
+    e('opener', 'text', 'tts', 'text'),
     ...(hasSpeaker ? [e('tts', 'audio', 'speaker', 'audio'), e('speaker', 'playback', 'turn', 'playback')] : [e('tts', 'playback', 'turn', 'playback')]),
     ...(hasSpeaker && wantsReference ? [e('speaker', 'played', 'cleanup', 'ref')] : []),
     // Barge-in: turn-taking can stop the reply in flight.
@@ -143,6 +147,8 @@ export function configFromGraph(graph: GraphSpec): PipelineConfig {
   }
   // Sessions from before the turn model ran without one.
   if (!g.nodes.some((x) => x.type.startsWith('turnmodel.'))) c.turnmodel = { variant: 'off', params: {} };
+  // Sessions from before the opener stage had none (or had it inside the LLM).
+  if (!g.nodes.some((x) => x.type.startsWith('opener.'))) c.opener = { variant: 'off', params: {} };
   // Sessions from before the cleanup stage set browser processing on the mic.
   const mic = g.nodes.find((x) => x.type === 'mic');
   if (mic && !g.nodes.some((x) => x.type.startsWith('cleanup.'))) {

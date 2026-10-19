@@ -36,6 +36,8 @@ export interface LlmSpan extends Span {
   chunks: { t: number; text: string; seq: number }[];
   /** The reply was started early on a draft of the user's words, this long before the turn was committed. */
   headStartMs?: number;
+  /** When the model's first reasoning arrived. */
+  thinkingAt?: number;
 }
 
 /** A reply started on the user's words before their turn was committed. */
@@ -46,9 +48,13 @@ export interface Draft extends Span {
   why?: string;
 }
 
-/** A canned opener picked for the user's words: picked, spoken (said first in a reply) or none. */
+/**
+ * A filler the opener stage said while the model was thinking (from the reply's start to when it was said),
+ * or, in older sessions, a canned line the LLM picked for the user's words: picked, spoken or none.
+ */
 export interface Opener extends Span {
   rid: string;
+  filler?: boolean;
   status?: string;
   why?: string;
 }
@@ -357,6 +363,19 @@ export class TimelineModel {
           seqs: [e.seq],
         });
         break;
+      case 'opener.say': {
+        const l = this.llm.find((x) => x.rid === d.rid);
+        this.openers.push({ rid: d.rid, t0: l?.t0 ?? e.t, t1: e.t, text: d.line ?? '', status: 'spoken', filler: true, why: d.reason, seqs: [e.seq] });
+        break;
+      }
+      case 'llm.thinking': {
+        const l = this.llm.find((x) => x.rid === d.rid);
+        if (l) {
+          l.thinkingAt ??= e.t;
+          l.seqs.push(e.seq);
+        }
+        break;
+      }
       case 'llm.draft_end': {
         const r = this.drafts.find((x) => x.rid === d.rid);
         if (r) {

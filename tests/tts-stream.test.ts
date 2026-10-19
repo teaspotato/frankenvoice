@@ -79,9 +79,9 @@ describe('streaming TTS (Deepgram WebSocket)', () => {
     expect(h.ios[0].sent.slice(2)).toEqual([{ type: 'Speak', text: 'It is 391.' }, { type: 'Flush' }]);
   });
 
-  it('synthesizes canned opener lines ahead and plays one without a request', () => {
+  it('synthesizes the opener\'s lines ahead and plays one without a request', () => {
     const h = harness();
-    h.send(0, 'text', { type: 'llm.opener_lines', lines: ['Hmm, let me think.', 'Let me see.'] });
+    h.send(0, 'text', { type: 'opener.lines', lines: ['Hmm, let me think.', 'Let me see.'] });
     const pre = h.ios[0];
     expect(pre.sent).toEqual([{ type: 'Speak', text: 'Hmm, let me think.' }, { type: 'Flush' }, { type: 'Speak', text: 'Let me see.' }, { type: 'Flush' }]);
     pre.h.onRecv!(null, h.pcm(30));
@@ -91,7 +91,7 @@ describe('streaming TTS (Deepgram WebSocket)', () => {
     expect(pre.closed).toBe(true);
     expect(h.out).toEqual([]);
     h.llm(1000, 'start');
-    h.send(1000, 'text', { type: 'llm.delta', rid: 'r0', text: 'Hmm, let me think. ', opener: true });
+    h.send(1000, 'text', { type: 'opener.say', rid: 'r0', text: 'Hmm, let me think. ', line: 'Hmm, let me think.' });
     expect(h.ios[1].sent).toEqual([]);
     expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.segment_end']);
     expect((h.out[1].samples as Float32Array).length).toBe(30);

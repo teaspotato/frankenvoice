@@ -76,7 +76,7 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
     let reply: Reply | undefined;
     /** When recent flushes went out, for Deepgram's per-minute limit. */
     let flushes: number[] = [];
-    /** The LLM's canned opener lines, synthesized ahead so they play at once. */
+    /** Opener lines (fillers), synthesized ahead so they play at once. */
     const canned = new Map<string, Float32Array[]>();
 
     const decoder = () => {
@@ -251,16 +251,20 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
             cancel();
             start(msg.rid as string);
             break;
+          case 'opener.lines':
           case 'llm.opener_lines':
             prerender(msg.lines as string[]);
             break;
-          case 'llm.delta':
+          case 'opener.say':
+          case 'llm.delta': {
             if (!r || r.rid !== msg.rid) return;
-            if (msg.opener && !r.buf && playCanned(r, (msg.text as string).trim())) return;
+            const opener = msg.type === 'opener.say' || !!msg.opener;
+            if (opener && !r.buf && playCanned(r, (msg.text as string).trim())) return;
             r.buf += msg.text as string;
             // An opener is said as soon as it arrives, whatever its punctuation.
-            send(r, !!msg.opener);
+            send(r, opener);
             break;
+          }
           case 'llm.end':
             if (!r || r.rid !== msg.rid) return;
             r.llmDone = true;
