@@ -819,7 +819,9 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           partial = null;
           if (eotWait) commit(eotWait.why);
           // A final flushed because the VAD heard the speech end is as good as ASR endpointing (and sooner).
-          else if (!useModel() && p.commitOn === 'speech_final' && (msg.speechFinal || (msg.fromFinalize && !speaking)))
+          // But not if the VAD hears them again by the time it lands: they only paused and went on (our
+          // Finalize marks even a short pause speech_final), and the next speech end commits it all.
+          else if (!useModel() && p.commitOn === 'speech_final' && (msg.fromFinalize ? !speaking : msg.speechFinal))
             commit(msg.speechFinal ? 'speech_final' : 'finalized on VAD speech end');
           else refreshDraft('ASR final');
         } else if (msg.type === 'asr.utterance_end') {
