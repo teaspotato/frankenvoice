@@ -1,5 +1,6 @@
 import type { NodeDef, TimerHandle } from '../core/node';
 import type { Json, JsonObject } from '../core/types';
+import { askChoice, choiceRequest, optionLines, parseChoiceOptions, readChoice, rotator } from './typesafe';
 
 /**
  * Lines the agent can say while the user keeps talking. A bare line is a
@@ -14,6 +15,27 @@ Right.
 Oh wow. = and then I won the whole thing | it was the most amazing view | we finally got the offer | I got the job
 Oh no. = and then my laptop died | I lost my keys again | the flight got cancelled | it broke on the first day
 I see. = so that's why it never worked | it turns out it was the cable all along | that's the reason I left`;
+
+export const DEFAULT_BC_OPTIONS = `# One option per line: what to say = when it fits. "a | b = …" says a, then b next time. "-" says nothing.
+Mm-hmm. | Yeah. | Right. = A neutral continuer: the user just finished a statement or a point while telling, describing or explaining something.
+Oh wow. = The user just said something surprising, impressive or exciting.
+Oh no. = The user just described a mishap, a problem, bad luck or a frustration.
+I see. = The user just explained a reason or a cause, or corrected something.
+- = Nothing: a question or request, a greeting, thanks or goodbye, a reaction to what the agent said, only a word or two, or a phrase broken off in the middle.`;
+
+export const DEFAULT_BC_INSTRUCTIONS =
+  'The text is a live speech-recognition transcript of what a user has said so far in their current turn of a spoken conversation with a voice agent (it may have recognition errors, and the last words may be missing or cut off). The user has just paused. Pick what the agent says right now, quietly, while the user keeps talking. A backchannel only shows the agent is listening; it never answers or takes the turn. Good listeners backchannel often, every sentence or two, whenever the speaker is telling, describing or explaining something of their own and has just finished a statement or a point, even if more is likely to come. Pick "-" when a backchannel would be wrong: the user asked a question or made a request (they want an answer), greeted, thanked or said goodbye, is only reacting to what the agent said ("okay", "that\'s great", "sounds good", "I see"), said only a word or two, or broke off in the middle of a phrase.';
+
+/** Added to the question when the state starts with when the agent last backchannelled. */
+export const BC_CONTEXT_NOTE =
+  'The first line, in brackets, is not speech: it says when the agent last backchannelled. Only avoid a backchannel within about 2 s of the last one; otherwise judge from the words alone.';
+
+/** The state TypeSafe reads: the last backchannel (if `context`), then the user's words. */
+export function bcState(text: string, last: { line: string; agoMs: number } | null, context: boolean): string {
+  if (!context) return text;
+  const head = last ? `[Agent's last backchannel: "${last.line}", ${Math.round(last.agoMs / 1000)} s ago]` : "[Agent hasn't backchannelled yet this turn]";
+  return `${head}\n${text}`;
+}
 
 /** A line with a user utterance it fits. */
 export interface LineExample {
@@ -88,6 +110,13 @@ export const allLines = (l: BackchannelLines) => [...new Set([...l.continuers, .
 
 interface BackchannelParams {
   source: string;
+  decide: string;
+  options: string;
+  instructions: string;
+  minConfidence: number;
+  model: string;
+  context: boolean;
+  gapMs: number;
   pauseMs: number;
   maxEot: number;
   minTurnMs: number;
@@ -134,19 +163,49 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       description:
         'turn model: when its backchannel score fires (needs a turn model with a backchannel head). pause: when the user pauses mid-turn and the end-of-turn score (if any) is low.',
     },
+    {
+      key: 'decide',
+      label: 'Decide',
+      type: 'select',
+      options: ['rules', 'typesafe'],
+      default: 'rules',
+      description:
+        "Whether and what to say at a proposed moment. rules: the gates below (talked long enough, end-of-turn score low, no draft, ASR hasn't endpointed), then a continuer or a line picked by meaning. typesafe: TypeSafe Choice reads the user's ASR words for this turn and picks a line or nothing; only the floor, the gap and the silence are checked.",
+    },
+    { key: 'options', label: 'Options', type: 'text', default: DEFAULT_BC_OPTIONS, when: { decide: ['typesafe'] }, description: 'line = when it fits ("-" says nothing). Sent to TypeSafe as the Choice criteria.' },
+    { key: 'instructions', label: 'Question', type: 'text', default: DEFAULT_BC_INSTRUCTIONS, when: { decide: ['typesafe'] }, description: "The Choice instructions. The state is only the user's ASR words for the turn so far." },
+    { key: 'minConfidence', label: 'Min confidence', type: 'number', default: 0.4, when: { decide: ['typesafe'] }, description: 'Say nothing when TypeSafe is less sure than this of its pick.' },
+    { key: 'model', label: 'TypeSafe model', type: 'string', default: 'jev-latest', when: { decide: ['typesafe'] } },
+    {
+      key: 'context',
+      label: 'Tell it the last backchannel',
+      type: 'boolean',
+      default: true,
+      when: { decide: ['typesafe'] },
+      description: 'Start the state with the last line said and how long ago, so TypeSafe can space them out itself.',
+    },
+    {
+      key: 'gapMs',
+      label: 'Min gap (ms)',
+      type: 'number',
+      default: 2000,
+      when: { decide: ['typesafe'] },
+      description: 'Time since the last backchannel. With the last backchannel in the state, 2 s gave gaps like people leave on TurnBench (median ~8 s, p10 ~3 s).',
+    },
     { key: 'pauseMs', label: 'Pause (ms)', type: 'number', default: 0, when: { source: ['pause'] }, description: 'Extra silence after the VAD hears speech end.' },
-    { key: 'maxEot', label: 'Max end-of-turn score', type: 'number', default: 0.3, description: "Don't backchannel when the user seems to be done: the turn model's end-of-turn score for the user is at least this." },
-    { key: 'minTurnMs', label: 'Min turn length (ms)', type: 'number', default: 3000, description: 'The user has been talking this long in the current turn.' },
-    { key: 'minGapMs', label: 'Min gap (ms)', type: 'number', default: 4000, description: 'Time since the last backchannel. People leave about 9 s (median), rarely under 3 s.' },
+    { key: 'maxEot', label: 'Max end-of-turn score', type: 'number', default: 0.3, when: { decide: ['rules'] }, description: "Don't backchannel when the user seems to be done: the turn model's end-of-turn score for the user is at least this." },
+    { key: 'minTurnMs', label: 'Min turn length (ms)', type: 'number', default: 3000, when: { decide: ['rules'] }, description: 'The user has been talking this long in the current turn.' },
+    { key: 'minGapMs', label: 'Min gap (ms)', type: 'number', default: 4000, when: { decide: ['rules'] }, description: 'Time since the last backchannel. People leave about 9 s (median), rarely under 3 s.' },
     {
       key: 'maxSilenceMs',
       label: 'Max silence (ms)',
       type: 'number',
       default: 700,
+      when: { decide: ['rules'] },
       description: "The VAD has heard the user within this long: most backchannels go over the user's speech, and a long silence means they may be done, whatever the turn model says.",
     },
-    { key: 'lines', label: 'Lines', type: 'text', default: DEFAULT_BACKCHANNEL_LINES, description: 'Bare lines are rotated; "line = example | …" is picked by meaning from the user\'s recent words.' },
-    { key: 'minScore', label: 'Min similarity', type: 'number', default: 0.45, description: 'A line with examples is said only when the recent words are at least this close; else a continuer.' },
+    { key: 'lines', label: 'Lines', type: 'text', default: DEFAULT_BACKCHANNEL_LINES, when: { decide: ['rules'] }, description: 'Bare lines are rotated; "line = example | …" is picked by meaning from the user\'s recent words.' },
+    { key: 'minScore', label: 'Min similarity', type: 'number', default: 0.45, when: { decide: ['rules'] }, description: 'A line with examples is said only when the recent words are at least this close; else a continuer.' },
     {
       key: 'takes',
       label: 'Takes per line',
@@ -160,13 +219,21 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       label: 'Encoder',
       type: 'string',
       default: 'Xenova/all-MiniLM-L6-v2',
+      when: { decide: ['rules'] },
       description: 'Sentence encoder for picking lines. Runs in the browser.',
     },
   ],
-  channels: [{ name: 'embed', description: 'Sentence encoder in the browser: texts out, unit vectors back' }],
+  channels: [
+    { name: 'embed', description: 'Sentence encoder in the browser: texts out, unit vectors back' },
+    { name: 'typesafe', description: "TypeSafe Choice over the user's words: one JSON request, one JSON answer" },
+  ],
+  requires: (p) => (p.decide === 'typesafe' ? ['typesafe'] : []),
   create(ctx) {
     const p = ctx.params;
-    const lines = parseBackchannelLines(String(p.lines));
+    const typesafe = p.decide === 'typesafe';
+    const lines = typesafe ? { continuers: [], examples: [] } : parseBackchannelLines(String(p.lines));
+    const opts = typesafe ? parseChoiceOptions(String(p.options)) : [];
+    const nextLine = rotator();
     let exampleVecs: number[][] | undefined;
     /** The agent's floor, from turn-taking's transitions. */
     let floor = 'listening';
@@ -184,6 +251,7 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
     let asrDone = false;
     let eotUser = 0;
     let lastBc = -Infinity;
+    let lastLine = '';
     let rot = 0;
     const lastTake = new Map<string, string>();
     let n = 0;
@@ -214,13 +282,15 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
 
     const talkedMs = (now: number) => speechMs + (speechFrom !== null ? now - speechFrom : 0);
 
-    /** Why not now, or null when a backchannel may be said. */
+    /** Why not now, or null when a backchannel may be said. TypeSafe judges the rest from the words. */
     const blocked = (now: number, gap = true): string | null => {
       if (floor !== 'listening') return `agent is ${floor}`;
       if (turnStart === null) return 'no user turn';
-      if (talkedMs(now) < p.minTurnMs) return `user has talked ${Math.round(talkedMs(now))} ms`;
-      if (gap && now - lastBc < p.minGapMs) return `last backchannel ${Math.round(now - lastBc)} ms ago`;
+      if (gap && now - lastBc < (typesafe ? p.gapMs : p.minGapMs)) return `last backchannel ${Math.round(now - lastBc)} ms ago`;
+      // TypeSafe answers in ~200 ms, and judges from the words whether the user is done.
+      if (typesafe) return null;
       if (silentSince !== null && now - silentSince > p.maxSilenceMs) return `user silent for ${Math.round(now - silentSince)} ms`;
+      if (talkedMs(now) < p.minTurnMs) return `user has talked ${Math.round(talkedMs(now))} ms`;
       if (asrDone) return 'ASR heard the end of the utterance';
       if (draftOut) return 'a reply is being drafted';
       if (eotUser >= p.maxEot) return `end-of-turn score ${eotUser}`;
@@ -236,6 +306,7 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       const pool = all.length > 1 ? all.filter((t) => t !== prev) : all;
       const take = pool[Math.floor(seededRandom(id)() * pool.length)];
       lastTake.set(line, take);
+      lastLine = line;
       ctx.emit('text', { type: 'bc.say', id, line, take, tailMs: p.tailMs, why, ...extra });
       ctx.setState('last', line);
       ctx.setState('count', n);
@@ -254,11 +325,12 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
         ctx.emit('text', { type: 'bc.skip', why, reason: no, ...data });
         return;
       }
-      const recent = words(`${finals} ${partial}`).slice(-12).join(' ');
       // Claim the slot now, so a second proposal during the encoder call is gated.
       const prevBc = lastBc;
       lastBc = now;
       const turn = turnNo;
+      if (typesafe) return decide(why, data, prevBc, turn);
+      const recent = words(`${finals} ${partial}`).slice(-12).join(' ');
       if (!recent || !exampleVecs || !lines.examples.length) {
         const c = nextContinuer();
         if (c) say(c, why, data);
@@ -278,6 +350,32 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       });
     };
 
+    /** TypeSafe reads the turn's words so far and picks a line, or nothing. */
+    const decide = (why: string, data: JsonObject, prevBc: number, turn: number) => {
+      // The ASR words as they came, the latest partial included; a long turn is cut to its end.
+      const text = `${finals} ${partial}`.trim().split(/\s+/).slice(-80).join(' ');
+      if (!text || !opts.length) {
+        lastBc = prevBc;
+        return void ctx.emit('text', { type: 'bc.skip', why, reason: 'no words yet', ...data });
+      }
+      const t0 = ctx.now();
+      const state = bcState(text, lastLine ? { line: lastLine, agoMs: t0 - prevBc } : null, !!p.context);
+      const instructions = p.context ? `${p.instructions} ${BC_CONTEXT_NOTE}` : String(p.instructions);
+      askChoice(ctx, choiceRequest(state, opts, instructions, String(p.model)), (res) => {
+        const got = res === null ? null : readChoice(res, opts, Number(p.minConfidence));
+        const pickData: JsonObject = got
+          ? { words: text, choice: got.choice, confidence: got.confidence, probabilities: got.probabilities, ms: Math.round(ctx.now() - t0) }
+          : { words: text, failed: true, ms: Math.round(ctx.now() - t0) };
+        const late = turn !== turnNo ? 'the turn ended' : blocked(ctx.now(), false);
+        const no = !got ? 'TypeSafe gave no answer' : !got.option ? `TypeSafe picked ${got.choice} at ${got.confidence}` : late ? `moment passed: ${late}` : null;
+        if (no || !got?.option) {
+          lastBc = prevBc;
+          return void ctx.emit('text', { type: 'bc.skip', why, reason: no ?? 'nothing picked', ...data, ...pickData });
+        }
+        say(nextLine(got.option), why, { ...data, ...pickData });
+      });
+    };
+
     const endTurn = () => {
       turnNo++;
       turnStart = null;
@@ -292,7 +390,7 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
 
     return {
       start() {
-        const all = allLines(lines);
+        const all = typesafe ? optionLines(opts) : allLines(lines);
         if (!all.length) return;
         ctx.emit('text', { type: 'bc.lines', lines: all.flatMap((l) => takes(l, p.takes)) });
         if (lines.examples.length)
