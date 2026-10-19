@@ -165,11 +165,21 @@ export function App() {
     });
   };
 
-  const finishSession = async (rt: Runtime, source?: Trajectory, stoppedAt?: number) => {
+  /**
+   * A live run or a replay with a changed config becomes a new session in the list. Playing a session
+   * back as recorded doesn't: the view returns to that session, with a notice only if the replay diverged.
+   */
+  const finishSession = async (rt: Runtime, origin?: Session, keep = true, stoppedAt?: number) => {
     const s: Session = { traj: rt.trajectory, stoppedAt };
-    if (source) s.comparison = compareTrajectories(source, rt.trajectory);
-    setSessions((ss) => [s, ...ss]);
-    setCurrent(s);
+    if (origin) s.comparison = compareTrajectories(origin.traj, rt.trajectory);
+    if (keep) {
+      setSessions((ss) => [s, ...ss]);
+      setCurrent(s);
+    } else {
+      setCurrent(origin!);
+      const verdict = describeComparison(s);
+      if (!verdict.includes('✓')) setNotice(`Playback of ${origin!.traj.meta.id} ${verdict}: the code changed since it was recorded.`);
+    }
     setRunning(null);
     stopActivity.current();
     setPaused(false);
@@ -236,7 +246,10 @@ export function App() {
     }
   };
 
-  const replay = async (source: Trajectory, from = 0) => {
+  const replay = async (origin: Session, from = 0) => {
+    const source = origin.traj;
+    const keep = replayOpts.useCurrentConfig;
+    setNotice('');
     const outputChannels = Object.values(registry).flatMap((d) => (d.channels ?? []).filter((c) => c.output).map((c) => c.name));
     const liveChannels = replayOpts.liveChannels
       .split(',')
@@ -266,9 +279,9 @@ export function App() {
       // Seeking backwards: start over and skip to the new time; this partial run isn't kept.
       restartAt.current = null;
       stopActivity.current();
-      return replay(source, again);
+      return replay(origin, again);
     }
-    await finishSession(rt, source, stoppedAt);
+    await finishSession(rt, origin, keep, stoppedAt);
   };
 
   /** Seek: a replay jumps there (restarting if it's earlier); otherwise ▶ will start there. */
@@ -302,7 +315,7 @@ export function App() {
         </button>
       ) : (
         <button
-          onClick={() => current && replay(current.traj, playFrom)}
+          onClick={() => current && replay(current, playFrom)}
           disabled={!!running || !current}
           title={running === 'live' ? "A live session can't be paused" : 'Replay this session (space)'}
         >
@@ -317,7 +330,7 @@ export function App() {
 
   // Space plays, pauses or resumes, unless typing somewhere.
   const spaceRef = useRef(() => {});
-  spaceRef.current = () => (running === 'replay' ? togglePause() : !running && current && replay(current.traj, playFrom));
+  spaceRef.current = () => (running === 'replay' ? togglePause() : !running && current && replay(current, playFrom));
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.code !== 'Space' || (e.target as HTMLElement).closest('input, textarea, select, button, [contenteditable]')) return;
@@ -525,7 +538,7 @@ export function App() {
           <label>
             <input type="checkbox" checked={replayOpts.audible} onChange={(e) => setReplayOpts({ ...replayOpts, audible: e.target.checked })} /> audible
           </label>
-          <label>
+          <label title="Run the recording through the current stage config instead of the one it was recorded with. The result is kept as a new entry in the list, compared with the original.">
             <input
               type="checkbox"
               checked={replayOpts.useCurrentConfig}
@@ -561,7 +574,7 @@ export function App() {
                 {s.saved && ' · saved'}
               </small>
               <span>
-                <button disabled={!!running} onClick={() => replay(s.traj)}>
+                <button disabled={!!running} onClick={() => replay(s)}>
                   Replay
                 </button>
                 {!s.saved && s.traj.meta.mode === 'live' && (
