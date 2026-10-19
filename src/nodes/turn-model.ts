@@ -159,11 +159,17 @@ export const turnModelNode: NodeDef<TurnModelParams> = {
             onRecv(data) {
               const d = data as { type: string; [k: string]: Json };
               if (d.type === 'progress') {
-                const pct = d.total ? Math.round(((d.done as number) / (d.total as number)) * 100) : null;
-                ctx.setState('status', d.cached ? `${d.label} cached` : `downloading ${d.label}${pct !== null ? ` ${pct}%` : ''}`);
-              } else if (d.type === 'status') ctx.setState('status', d.text);
-              else if (d.type === 'ready') {
+                const mb = (n: Json) => Math.round((n as number) / 2 ** 20);
+                const total = (d.total as number) || 0;
+                ctx.setState('status', d.cached ? `${d.label} cached` : `downloading ${d.label}`);
+                // What the diagram's progress bar and the lane show while the model loads.
+                ctx.setState('download', d.cached ? null : { label: d.label, done: mb(d.done), total: mb(total), fraction: total ? Math.round(((d.done as number) / total) * 100) / 100 : null });
+              } else if (d.type === 'status') {
+                ctx.setState('download', null);
+                ctx.setState('status', d.text);
+              } else if (d.type === 'ready') {
                 ready = true;
+                ctx.setState('download', null);
                 ctx.setState('status', `running (${d.ep})`);
                 ctx.emit('scores', { type: 'turnmodel.status', status: 'ready', ep: d.ep });
               } else if (d.type === 'frames') {
@@ -174,6 +180,7 @@ export const turnModelNode: NodeDef<TurnModelParams> = {
             onClose(data) {
               ready = false;
               const err = (data as { error?: Json } | null)?.error;
+              ctx.setState('download', null);
               ctx.setState('status', err ? 'failed' : 'closed');
               if (err) {
                 ctx.log('error', `turn model: ${typeof err === 'string' ? err : JSON.stringify(err)}`, data);

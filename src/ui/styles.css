@@ -131,6 +131,8 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 .pipeline-impl { fill: var(--muted); font: 10px var(--mono); }
 .pipeline-state { fill: var(--text); font: 10.5px var(--mono); }
 .pipeline-state .k { fill: var(--muted); }
+.pipeline-progress .track { fill: var(--border); }
+.pipeline-progress .bar { fill: var(--accent); }
 
 .event-log { display: flex; flex-direction: column; height: 100%; }
 .event-log-bar { display: flex; gap: 10px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--border); }

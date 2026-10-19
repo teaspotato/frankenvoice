@@ -488,6 +488,28 @@ export function Dashboard({
         }
         g.globalAlpha = 1;
         g.lineWidth = 1;
+        // While the model loads (download, then compile), say so across the lane.
+        const tm = m.state.turnmodel;
+        const dl = tm?.download as { label: string; done: number; total: number; fraction: number | null } | null | undefined;
+        const loading = dl
+          ? `downloading the turn model ${dl.label}: ${dl.fraction !== null ? `${Math.round(dl.fraction * 100)}% · ` : ''}${dl.done}${dl.total ? ` / ${dl.total}` : ''} MB`
+          : typeof tm?.status === 'string' && !/^running|closed/.test(tm.status)
+            ? `turn model: ${tm.status}`
+            : '';
+        if (loading) {
+          const lx = LABEL_W + 8;
+          const ym = (ly0 + ly1) / 2;
+          if (dl?.fraction != null) {
+            g.fillStyle = col.border;
+            g.fillRect(lx, ym + 8, 200, 4);
+            g.fillStyle = col.accent;
+            g.fillRect(lx, ym + 8, 200 * dl.fraction, 4);
+          }
+          g.fillStyle = col.panel;
+          g.fillRect(lx - 4, ym - 12, g.measureText(loading).width + 8, 16);
+          g.fillStyle = col.text;
+          g.fillText(loading, lx, ym - 4);
+        }
         for (const ev of m.turnEvents) {
           if (ev.t < t0 || ev.t > t1) continue;
           const c = ev.kind === 'eot' ? col.accent : col.turn;

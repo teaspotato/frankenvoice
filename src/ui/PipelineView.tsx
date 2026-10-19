@@ -168,8 +168,9 @@ export function PipelineView({
         const impl = typeof params.provider === 'string' ? params.provider : Object.keys(STAGES.find((d) => d.id === s.id)!.variants).length > 1 ? variant : '';
         const state = stateTypes[s.id] === type ? states[s.id] : undefined;
         const on = activity.stages.get(s.id);
+        const dl = state?.download as { label: string; done: number; total: number; fraction: number | null } | null | undefined;
         const lines = Object.entries(state ?? {})
-          .filter(([k, v]) => k !== 'provider' && (typeof v !== 'object' || v === null))
+          .filter(([k, v]) => k !== 'provider' && k !== 'download' && (typeof v !== 'object' || v === null))
           .slice(0, 2);
         return (
           <g
@@ -197,7 +198,17 @@ export function PipelineView({
                 ● {on}
               </text>
             )}
-            {lines.map(([k, v], i) => (
+            {dl && (
+              <g className="pipeline-progress">
+                <title>{`downloading the ${dl.label}: ${dl.done} of ${dl.total} MB`}</title>
+                <text x={12} y={38} className="pipeline-state">
+                  <tspan className="k">{dl.label}</tspan> {dl.fraction !== null ? `${Math.round(dl.fraction * 100)}% of ${dl.total} MB` : `${dl.done} MB`}
+                </text>
+                <rect x={12} y={46} width={W - 24} height={5} rx={2} className="track" />
+                <rect x={12} y={46} width={(W - 24) * (dl.fraction ?? 0)} height={5} rx={2} className="bar" />
+              </g>
+            )}
+            {(dl ? [] : lines).map(([k, v], i) => (
               <text key={k} x={12} y={38 + i * 15} className="pipeline-state">
                 <tspan className="k">{k}</tspan> {summarize(v)}
               </text>

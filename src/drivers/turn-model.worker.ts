@@ -48,8 +48,8 @@ async function fetchCached(url: string, label: string): Promise<Uint8Array> {
     if (end) break;
     parts.push(value);
     done += value.length;
-    // Coarse progress: every message is recorded in the session log.
-    const pct = total ? Math.floor((done / total) * 10) : -1;
+    // Whole percents: every message is recorded in the session log.
+    const pct = total ? Math.floor((done / total) * 100) : Math.floor(done / 2 ** 20);
     if (pct !== lastPct) {
       lastPct = pct;
       post({ type: 'progress', label, done, total });
