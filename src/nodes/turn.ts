@@ -1,5 +1,5 @@
 import type { NodeDef, TimerHandle } from '../core/node';
-import type { Json } from '../core/types';
+import type { Json, Msg } from '../core/types';
 
 interface TurnParams {
   commitOn: string;
@@ -31,6 +31,7 @@ export const halfDuplexTurnNode: NodeDef<TurnParams> = {
     let to = -1;
     let turnNo = 0;
     const setFloor = (f: Floor, why: string) => {
+      if (f !== floor) ctx.emit('turn', { type: 'turn.transition', from: floor, to: f, why });
       floor = f;
       ctx.setState('floor', f);
       ctx.log('info', `floor -> ${f}`, { why });
@@ -69,6 +70,8 @@ export const halfDuplexTurnNode: NodeDef<TurnParams> = {
             if (from < 0) from = msg.start as number;
             to = msg.end as number;
             ctx.setState('pending', parts.join(' '));
+            // Words are waiting to be committed: the LLM holds its workers' news until they are.
+            if (parts.length === 1) ctx.emit('turn', { type: 'turn.pending', words: true });
           }
           if (msg.speechFinal && ctx.params.commitOn === 'speech_final') commit('speech_final');
         } else if (msg.type === 'asr.utterance_end') {
@@ -682,159 +685,173 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     ctx.setState('floor', holder(state));
     ctx.setState('state', state);
 
+    /** Whether the user has words not yet committed, told to the LLM when it changes (so news waits for them). */
+    let hadWords = false;
+    const syncPending = () => {
+      const has = parts.length > 0 || !!partial?.text;
+      if (has === hadWords) return;
+      hadWords = has;
+      ctx.emit('turn', { type: 'turn.pending', words: has });
+    };
+
+    const handle = (port: string, msg: Msg) => {
+      if (port === 'scores') {
+        if (msg.type === 'turnmodel.frame') {
+          eotUser = (msg.eot as number[])[0];
+          if (useModel() && eotUser >= p.draftAt) maybeDraft(`model: end of turn likely p=${eotUser}`);
+          return;
+        }
+        if (msg.type === 'turnmodel.status') {
+          model = msg.status === 'ready';
+          if (p.useModel) ctx.setState('using', model ? 'turn model' : 'rules');
+          return;
+        }
+        if (!useModel() || msg.who !== 'user') return;
+        const why = `model: ${msg.type === 'turnmodel.eot' ? 'end of turn' : 'take the floor'} p=${msg.p}`;
+        if (msg.type === 'turnmodel.int' && p.bargeIn && state !== 'listening') {
+          if (p.modelNeedsVad && !speaking) return void ctx.log('debug', 'model floor take ignored: the VAD hears no speech', { why });
+          const c = overlap(msg.at as number, why);
+          if (c) yieldFloor(c, why);
+        } else if (msg.type === 'turnmodel.eot' && state === 'listening') {
+          // Not while the VAD still hears them; if their speech ends right after, it stands.
+          if (speaking) eotHeld = { why, at: ctx.now() };
+          else endOfTurn(why);
+        }
+        return;
+      }
+      if (port === 'playback') {
+        if (msg.type === 'playback.start') {
+          go('playback_start', 'playback started');
+          // They started talking while it was thinking: don't talk over them while their words are judged.
+          if (candidate && classifies()) hold();
+        } else if (msg.type === 'playback.segment') {
+          if (msg.rid !== segRid) {
+            segRid = (msg.rid as string) ?? null;
+            segStarts = [];
+          }
+          segStarts.push(msg.at as number);
+          scheduleAside();
+        } else if (msg.type === 'playback.paused') {
+          // The sentences still to come are announced again, with their new times, on resume.
+          segStarts = segStarts.filter((t) => t < (msg.at as number));
+          if (aside?.timer) {
+            aside.timer.clear();
+            aside.timer = undefined;
+          }
+        } else if (msg.type === 'playback.end') {
+          const c = candidate;
+          if (!go('playback_end', 'playback ended')) return;
+          held = false;
+          if (c) {
+            // The agent finished while the user was already talking: just listen (a bare backchannel is dropped).
+            c.timer?.clear();
+            c.wait?.clear();
+            candidate = null;
+            if (!(p.overlap === 'classify' && c.text && isBackchannel(c.text))) for (const f of c.finals) collect(f.text, f.start, f.end);
+          }
+          if (aside) {
+            takeAside();
+            if (!c) commit('aside, after the agent finished', undefined, { aside: true });
+          }
+        } else if (msg.type === 'playback.interrupted') {
+          // What the user heard before we stopped, for the LLM's history.
+          if (last) ctx.emit('turn', { type: 'turn.heard', turnId: last.id, ...(msg.rid ? { rid: msg.rid as string } : {}), text: (msg.heard as string) ?? '' });
+          if (aside?.cutting) finishAside('aside at sentence end');
+        }
+        return;
+      }
+      if (port === 'vad') {
+        if (msg.type === 'vad.speech_start') {
+          ctx.setState('userSpeaking', true);
+          speaking = true;
+          caughtUp = false;
+          eotHeld = null;
+          silence?.clear();
+          silence = null;
+          if (state === 'thinking' || state === 'speaking') overlap(msg.at as number, 'user speech (VAD)');
+          else if (candidate?.ended !== undefined) {
+            // They went on before the words of the last bit came in: one stretch of speech.
+            const c = candidate;
+            c.ended = undefined;
+            c.wait?.clear();
+            c.timer?.clear();
+            if (c.check) c.timer = ctx.setTimer(Math.max(1, p.maxBackchannelMs - (ctx.now() - c.since)), c.check, 'barge-in');
+          } else if (eotWait) {
+            // They went on after the model called the end of their turn: wait for the next one.
+            eotWait.timer.clear();
+            eotWait = null;
+          }
+        } else if (msg.type === 'vad.speech_end') {
+          ctx.setState('userSpeaking', false);
+          speaking = false;
+          // A partial from before the silence usually lacks the last words: wait for ASR to catch up.
+          caughtUp = !partial;
+          if (state === 'listening') maybeDraft('silence, words final');
+          armSilence();
+          if (eotHeld && state === 'listening' && ctx.now() - eotHeld.at <= EOT_HOLD_MS) endOfTurn(`${eotHeld.why}, then VAD speech end`);
+          eotHeld = null;
+          if (candidate && classifies()) {
+            // Decide once its words are in.
+            const c = candidate;
+            c.ended = ctx.now();
+            c.endAt = msg.at as number;
+            c.wait?.clear();
+            c.wait = ctx.setTimer(p.classifyWaitMs, () => classify(c, 'no ASR final in time'), 'classify');
+          } else if (candidate) {
+            const c = candidate;
+            c.timer?.clear();
+            candidate = null;
+            const why = modelDecides() ? 'speech ended without the model calling a floor take' : 'speech ended before it counted';
+            decide('backchannel', { ms: ctx.now() - c.since, text: c.text, why });
+            go('backchannel', why);
+          }
+        }
+        return;
+      }
+      const text = ((msg.text as string) ?? '').trim();
+      if (candidate && (msg.type === 'asr.partial' || msg.type === 'asr.final') && (msg.end as number) > candidate.at - 4800) {
+        // Speech over the agent: decide on what it says.
+        const c = candidate;
+        // Classify judges all the words so far; the legacy rules, a partial on its own.
+        if (text) c.text = p.overlap === 'legacy' && msg.type === 'asr.partial' ? text : [...c.finals.map((f) => f.text), text].join(' ');
+        if (msg.type === 'asr.final' && text) c.finals.push({ text, start: msg.start as number, end: msg.end as number });
+        consider(c);
+        // Decide on the final that reaches the end of the speech (earlier finals, often empty, cover audio before it).
+        if (msg.type === 'asr.final' && c.ended !== undefined && (msg.end as number) >= (c.endAt ?? 0)) classify(c, 'ASR final');
+        return;
+      }
+      if (candidate?.ended !== undefined && msg.type === 'asr.utterance_end') return classify(candidate, 'ASR utterance end');
+      if (state !== 'listening') {
+        if (msg.type === 'asr.final' && text) ctx.log('info', 'ignored short speech while the agent has the floor', { text });
+        return;
+      }
+      if (!speaking) caughtUp = true;
+      if (msg.type === 'asr.partial') {
+        partial = text ? { text, start: msg.start as number, end: msg.end as number } : null;
+        if (text) refreshDraft('ASR partial');
+      } else if (msg.type === 'asr.final') {
+        collect(text, msg.start as number, msg.end as number);
+        partial = null;
+        if (eotWait) commit(eotWait.why);
+        // A final flushed because the VAD heard the speech end is as good as ASR endpointing (and sooner).
+        // But not if the VAD hears them again by the time it lands: they only paused and went on (our
+        // Finalize marks even a short pause speech_final), and the next speech end commits it all.
+        else if (!useModel() && p.commitOn === 'speech_final' && (msg.fromFinalize ? !speaking : msg.speechFinal))
+          commit(msg.speechFinal ? 'speech_final' : 'finalized on VAD speech end');
+        else {
+          if (!useModel() && msg.fromFinalize && speaking) heldFinal = true;
+          refreshDraft('ASR final');
+        }
+      } else if (msg.type === 'asr.utterance_end') {
+        if (speaking) ctx.log('debug', 'utterance end ignored: the VAD still hears speech');
+        else commit('utterance_end');
+      }
+    };
+
     return {
       onInput(port, msg) {
-        if (port === 'scores') {
-          if (msg.type === 'turnmodel.frame') {
-            eotUser = (msg.eot as number[])[0];
-            if (useModel() && eotUser >= p.draftAt) maybeDraft(`model: end of turn likely p=${eotUser}`);
-            return;
-          }
-          if (msg.type === 'turnmodel.status') {
-            model = msg.status === 'ready';
-            if (p.useModel) ctx.setState('using', model ? 'turn model' : 'rules');
-            return;
-          }
-          if (!useModel() || msg.who !== 'user') return;
-          const why = `model: ${msg.type === 'turnmodel.eot' ? 'end of turn' : 'take the floor'} p=${msg.p}`;
-          if (msg.type === 'turnmodel.int' && p.bargeIn && state !== 'listening') {
-            if (p.modelNeedsVad && !speaking) return void ctx.log('debug', 'model floor take ignored: the VAD hears no speech', { why });
-            const c = overlap(msg.at as number, why);
-            if (c) yieldFloor(c, why);
-          } else if (msg.type === 'turnmodel.eot' && state === 'listening') {
-            // Not while the VAD still hears them; if their speech ends right after, it stands.
-            if (speaking) eotHeld = { why, at: ctx.now() };
-            else endOfTurn(why);
-          }
-          return;
-        }
-        if (port === 'playback') {
-          if (msg.type === 'playback.start') {
-            go('playback_start', 'playback started');
-            // They started talking while it was thinking: don't talk over them while their words are judged.
-            if (candidate && classifies()) hold();
-          } else if (msg.type === 'playback.segment') {
-            if (msg.rid !== segRid) {
-              segRid = (msg.rid as string) ?? null;
-              segStarts = [];
-            }
-            segStarts.push(msg.at as number);
-            scheduleAside();
-          } else if (msg.type === 'playback.paused') {
-            // The sentences still to come are announced again, with their new times, on resume.
-            segStarts = segStarts.filter((t) => t < (msg.at as number));
-            if (aside?.timer) {
-              aside.timer.clear();
-              aside.timer = undefined;
-            }
-          } else if (msg.type === 'playback.end') {
-            const c = candidate;
-            if (!go('playback_end', 'playback ended')) return;
-            held = false;
-            if (c) {
-              // The agent finished while the user was already talking: just listen (a bare backchannel is dropped).
-              c.timer?.clear();
-              c.wait?.clear();
-              candidate = null;
-              if (!(p.overlap === 'classify' && c.text && isBackchannel(c.text))) for (const f of c.finals) collect(f.text, f.start, f.end);
-            }
-            if (aside) {
-              takeAside();
-              if (!c) commit('aside, after the agent finished', undefined, { aside: true });
-            }
-          } else if (msg.type === 'playback.interrupted') {
-            // What the user heard before we stopped, for the LLM's history.
-            if (last) ctx.emit('turn', { type: 'turn.heard', turnId: last.id, ...(msg.rid ? { rid: msg.rid as string } : {}), text: (msg.heard as string) ?? '' });
-            if (aside?.cutting) finishAside('aside at sentence end');
-          }
-          return;
-        }
-        if (port === 'vad') {
-          if (msg.type === 'vad.speech_start') {
-            ctx.setState('userSpeaking', true);
-            speaking = true;
-            caughtUp = false;
-            eotHeld = null;
-            silence?.clear();
-            silence = null;
-            if (state === 'thinking' || state === 'speaking') overlap(msg.at as number, 'user speech (VAD)');
-            else if (candidate?.ended !== undefined) {
-              // They went on before the words of the last bit came in: one stretch of speech.
-              const c = candidate;
-              c.ended = undefined;
-              c.wait?.clear();
-              c.timer?.clear();
-              if (c.check) c.timer = ctx.setTimer(Math.max(1, p.maxBackchannelMs - (ctx.now() - c.since)), c.check, 'barge-in');
-            } else if (eotWait) {
-              // They went on after the model called the end of their turn: wait for the next one.
-              eotWait.timer.clear();
-              eotWait = null;
-            }
-          } else if (msg.type === 'vad.speech_end') {
-            ctx.setState('userSpeaking', false);
-            speaking = false;
-            // A partial from before the silence usually lacks the last words: wait for ASR to catch up.
-            caughtUp = !partial;
-            if (state === 'listening') maybeDraft('silence, words final');
-            armSilence();
-            if (eotHeld && state === 'listening' && ctx.now() - eotHeld.at <= EOT_HOLD_MS) endOfTurn(`${eotHeld.why}, then VAD speech end`);
-            eotHeld = null;
-            if (candidate && classifies()) {
-              // Decide once its words are in.
-              const c = candidate;
-              c.ended = ctx.now();
-              c.endAt = msg.at as number;
-              c.wait?.clear();
-              c.wait = ctx.setTimer(p.classifyWaitMs, () => classify(c, 'no ASR final in time'), 'classify');
-            } else if (candidate) {
-              const c = candidate;
-              c.timer?.clear();
-              candidate = null;
-              const why = modelDecides() ? 'speech ended without the model calling a floor take' : 'speech ended before it counted';
-              decide('backchannel', { ms: ctx.now() - c.since, text: c.text, why });
-              go('backchannel', why);
-            }
-          }
-          return;
-        }
-        const text = ((msg.text as string) ?? '').trim();
-        if (candidate && (msg.type === 'asr.partial' || msg.type === 'asr.final') && (msg.end as number) > candidate.at - 4800) {
-          // Speech over the agent: decide on what it says.
-          const c = candidate;
-          // Classify judges all the words so far; the legacy rules, a partial on its own.
-          if (text) c.text = p.overlap === 'legacy' && msg.type === 'asr.partial' ? text : [...c.finals.map((f) => f.text), text].join(' ');
-          if (msg.type === 'asr.final' && text) c.finals.push({ text, start: msg.start as number, end: msg.end as number });
-          consider(c);
-          // Decide on the final that reaches the end of the speech (earlier finals, often empty, cover audio before it).
-          if (msg.type === 'asr.final' && c.ended !== undefined && (msg.end as number) >= (c.endAt ?? 0)) classify(c, 'ASR final');
-          return;
-        }
-        if (candidate?.ended !== undefined && msg.type === 'asr.utterance_end') return classify(candidate, 'ASR utterance end');
-        if (state !== 'listening') {
-          if (msg.type === 'asr.final' && text) ctx.log('info', 'ignored short speech while the agent has the floor', { text });
-          return;
-        }
-        if (!speaking) caughtUp = true;
-        if (msg.type === 'asr.partial') {
-          partial = text ? { text, start: msg.start as number, end: msg.end as number } : null;
-          if (text) refreshDraft('ASR partial');
-        } else if (msg.type === 'asr.final') {
-          collect(text, msg.start as number, msg.end as number);
-          partial = null;
-          if (eotWait) commit(eotWait.why);
-          // A final flushed because the VAD heard the speech end is as good as ASR endpointing (and sooner).
-          // But not if the VAD hears them again by the time it lands: they only paused and went on (our
-          // Finalize marks even a short pause speech_final), and the next speech end commits it all.
-          else if (!useModel() && p.commitOn === 'speech_final' && (msg.fromFinalize ? !speaking : msg.speechFinal))
-            commit(msg.speechFinal ? 'speech_final' : 'finalized on VAD speech end');
-          else {
-            if (!useModel() && msg.fromFinalize && speaking) heldFinal = true;
-            refreshDraft('ASR final');
-          }
-        } else if (msg.type === 'asr.utterance_end') {
-          if (speaking) ctx.log('debug', 'utterance end ignored: the VAD still hears speech');
-          else commit('utterance_end');
-        }
+        handle(port, msg);
+        syncPending();
       },
     };
   },

@@ -85,6 +85,8 @@ export function workerUpdate(msg: JsonObject): string {
 export interface WorkerInfo {
   status: 'running' | 'done' | 'stopped' | 'error';
   task: string;
+  /** The reply that started it. */
+  rid: string;
   t0: number;
   /** The latest tool steps, newest last. */
   steps: string[];

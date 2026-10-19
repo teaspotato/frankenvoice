@@ -149,7 +149,9 @@ export class Runtime {
       // Stamp it with its own arrival time, so live and replay order it identically.
       const t = this.opts.scheduler.now();
       this.pendingTurns.push(() => {
+        this.fireOverdue(t);
         this.t = Math.max(this.t, t);
+        this.cause = undefined;
         fn();
       });
       return;
