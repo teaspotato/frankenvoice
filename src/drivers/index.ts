@@ -314,41 +314,130 @@ const rnnoise: LiveDriver = (req, sink) => {
   };
 };
 
-/**
- * The ssl_turn turn-taking model, in a worker. Each send is one 80 ms block: 1280 user samples
- * then 1280 agent samples (16 kHz). Replies: progress while downloading, `ready` once the
- * model is compiled, then `frames` with per-frame scores as inference catches up.
- */
-const turnModel: LiveDriver = (req, sink) => {
-  const r = req as { encoderUrl: string; headUrl: string; frames: number; ep: string };
+type TurnModelRequest = { encoderUrl: string; headUrl: string; frames: number; ep: string };
+type WorkerMsg = { type: string; text?: string; [k: string]: unknown };
+
+/** Where a loaded (or loading) turn model is, for the page to show before any session runs. */
+export interface TurnModelLoad {
+  /** 'loading' until compiled, then 'ready'; 'failed' with the error. */
+  state: 'loading' | 'ready' | 'failed';
+  /** The latest progress or status message from the worker. */
+  last?: WorkerMsg;
+  error?: string;
+}
+
+/** A turn model worker, kept across sessions so the model is downloaded and compiled once. */
+interface TurnModelWorker {
+  key: string;
+  worker: Worker;
+  load: TurnModelLoad;
+  /** The session using it, if any: it gets the worker's messages. */
+  session?: (m: WorkerMsg) => void;
+}
+
+const turnModels = new Map<string, TurnModelWorker>();
+const turnModelWatchers = new Set<() => void>();
+
+function startTurnModel(r: TurnModelRequest): TurnModelWorker {
+  const key = JSON.stringify([r.encoderUrl, r.headUrl, r.frames, r.ep]);
+  const existing = turnModels.get(key);
+  if (existing) return existing;
   const worker = new Worker(new URL('./turn-model.worker.ts', import.meta.url), { type: 'module' });
-  let closed = false;
-  worker.onmessage = (e: MessageEvent<{ type: string; text?: string }>) => {
-    if (closed) return;
-    if (e.data.type === 'error') {
-      closed = true;
-      worker.terminate();
-      sink.close({ error: e.data.text ?? 'turn model failed' });
-    } else sink.recv(toJson(e.data));
+  const tm: TurnModelWorker = { key, worker, load: { state: 'loading' } };
+  const fail = (error: string) => {
+    // Forget a failed model so the next session or preload starts over.
+    if (turnModels.get(key) === tm) turnModels.delete(key);
+    worker.terminate();
+    tm.load = { state: 'failed', last: tm.load.last, error };
+  };
+  worker.onmessage = (e: MessageEvent<WorkerMsg>) => {
+    const m = e.data;
+    if (m.type === 'error') fail(m.text ?? 'turn model failed');
+    else if (m.type === 'ready') tm.load = { state: 'ready', last: m };
+    else if (m.type === 'progress' || m.type === 'status') tm.load = { state: 'loading', last: m };
+    tm.session?.(m);
+    if (m.type !== 'frames') for (const w of turnModelWatchers) w();
   };
   worker.onerror = (e) => {
-    if (closed) return;
-    closed = true;
-    worker.terminate();
-    sink.close({ error: e.message || 'turn model worker failed to start' });
+    fail(e.message || 'turn model worker failed to start');
+    tm.session?.({ type: 'error', text: tm.load.error });
+    for (const w of turnModelWatchers) w();
   };
   worker.postMessage({ type: 'init', ...r });
+  turnModels.set(key, tm);
+  for (const w of turnModelWatchers) w();
+  return tm;
+}
+
+/** Download and compile the turn model ahead of a session; returns its load state and a way to watch it. */
+export function preloadTurnModel(r: TurnModelRequest): TurnModelLoad {
+  return startTurnModel(r).load;
+}
+
+/** Load state of the turn model for these settings (undefined: never started). */
+export function turnModelLoad(r: TurnModelRequest): TurnModelLoad | undefined {
+  return turnModels.get(JSON.stringify([r.encoderUrl, r.headUrl, r.frames, r.ep]))?.load;
+}
+
+export function watchTurnModels(fn: () => void): () => void {
+  turnModelWatchers.add(fn);
+  return () => turnModelWatchers.delete(fn);
+}
+
+/**
+ * The ssl_turn turn-taking model, in a worker that outlives the session (see preloadTurnModel).
+ * Each send is one 80 ms block: 1280 user samples then 1280 agent samples (16 kHz). Replies:
+ * progress while it still downloads, `ready` once compiled and reset for this session, then
+ * `frames` with per-frame scores as inference catches up.
+ */
+const turnModel: LiveDriver = (req, sink) => {
+  const r = req as TurnModelRequest;
+  let tm = startTurnModel(r);
+  // Another session (say, a replay running alongside) holds it: give this one its own worker.
+  if (tm.session) {
+    turnModels.delete(tm.key);
+    tm = startTurnModel(r);
+  }
+  const own = tm;
+  let closed = false;
+  /** Frames are this session's only after the worker has been reset for it. */
+  let ready = false;
+  const release = () => {
+    if (own.session === onMsg) own.session = undefined;
+    // A second worker made for an overlapping session isn't kept.
+    if (turnModels.get(own.key) !== own) own.worker.terminate();
+  };
+  const onMsg = (m: WorkerMsg) => {
+    if (closed) return;
+    if (m.type === 'error') {
+      closed = true;
+      release();
+      sink.close({ error: m.text ?? 'turn model failed' });
+    } else if (m.type === 'ready') {
+      ready = true;
+      sink.recv(toJson(m));
+    } else if (m.type !== 'frames' || ready) sink.recv(toJson(m));
+  };
+  own.session = onMsg;
+  if (own.load.state === 'ready') {
+    setTimeout(() => !closed && sink.recv({ type: 'status', text: 'preloaded' }), 0);
+    own.worker.postMessage({ type: 'reset' });
+  } else if (own.load.last?.type === 'progress' || own.load.last?.type === 'status') {
+    // Still loading from a preload: pick up where it is.
+    const last = own.load.last;
+    setTimeout(() => !closed && !ready && sink.recv(toJson(last)), 0);
+  }
   return {
     send(_data, bin) {
-      if (closed || !bin) return;
+      if (closed || !bin || !ready) return;
       const x = new Float32Array(bin.slice().buffer);
       const a = x.slice(0, x.length / 2);
       const b = x.slice(x.length / 2);
-      worker.postMessage({ type: 'block', a, b }, [a.buffer, b.buffer]);
+      own.worker.postMessage({ type: 'block', a, b }, [a.buffer, b.buffer]);
     },
     close() {
       closed = true;
-      worker.terminate();
+      release();
     },
   };
 };

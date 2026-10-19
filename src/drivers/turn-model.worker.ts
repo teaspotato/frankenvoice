@@ -15,12 +15,15 @@ const CACHE = 'frankenvoice-turn-model';
 
 export type ToWorker =
   | { type: 'init'; encoderUrl: string; headUrl: string; frames: number; ep: string }
-  | { type: 'block'; a: Float32Array; b: Float32Array };
+  | { type: 'block'; a: Float32Array; b: Float32Array }
+  /** A new session: forget the audio so far, then say `ready` again. */
+  | { type: 'reset' };
 
 let ts: TurnStream | null = null;
 let queue: { a: Float32Array; b: Float32Array }[] = [];
 let busy = false;
 let dead = false;
+let readyMsg: unknown = null;
 
 const post = (m: unknown) => postMessage(m);
 
@@ -82,7 +85,17 @@ async function init(m: Extract<ToWorker, { type: 'init' }>) {
   for (let i = 0; i < m.frames; i++) await s.push(new Float32Array(1280), new Float32Array(1280));
   s.reset();
   ts = s;
-  post({ type: 'ready', ep, frames: m.frames, threads: ort.env.wasm.numThreads ?? 1 });
+  readyMsg = { type: 'ready', ep, frames: m.frames, threads: ort.env.wasm.numThreads ?? 1 };
+  post(readyMsg);
+}
+
+async function reset() {
+  if (!ts) return; // still loading: `ready` follows when it is done
+  queue = [];
+  while (busy) await new Promise((r) => setTimeout(r, 5));
+  ts.reset();
+  dead = false;
+  post(readyMsg);
 }
 
 async function pump() {
@@ -106,6 +119,7 @@ async function pump() {
 onmessage = (e: MessageEvent<ToWorker>) => {
   const m = e.data;
   if (m.type === 'init') init(m).catch((err) => post({ type: 'error', text: err instanceof Error ? err.message : String(err) }));
+  else if (m.type === 'reset') void reset();
   else if (m.type === 'block' && !dead) {
     queue.push({ a: m.a, b: m.b });
     if (queue.length > MAX_BACKLOG) {

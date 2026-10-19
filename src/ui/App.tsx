@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState, type CSSProperties } from 'react';
 import { registry } from '../nodes';
 import { GRAPH_FORMAT, type GraphSpec } from '../core/graph';
 import { Runtime } from '../core/runtime';
@@ -9,7 +9,9 @@ import { decodeBundle, encodeBundle } from '../core/bundle';
 import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
 import type { Json } from '../core/types';
-import { browserDrivers, micMonitor, sessionTitle, setOutputMuted, setOutputPaused, setOutputSuppressed } from '../drivers';
+import { browserDrivers, micMonitor, preloadTurnModel, sessionTitle, setOutputMuted, setOutputPaused, setOutputSuppressed, turnModelLoad, watchTurnModels } from '../drivers';
+import { resolveParams } from '../core/node';
+import { turnModelRequest } from '../nodes/turn-model';
 import {
   CONFIG_FORMAT,
   activeStages,
@@ -18,6 +20,7 @@ import {
   defaultConfig,
   normalizeConfig,
   requiredUpstreams,
+  stageParams,
   stageType,
   type PipelineConfig,
   type StageId,
@@ -99,6 +102,19 @@ function describeComparison(s: Session): string {
 export function App() {
   const [config, setConfig] = useState<PipelineConfig>(loadConfig);
   const [selected, setSelected] = useState<StageId | null>(null);
+  // The turn model is big: download and compile it as soon as it is configured, not when a session starts.
+  const [, turnModelChanged] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => watchTurnModels(turnModelChanged), []);
+  const turnModelReq =
+    stageType(config, 'turnmodel') === 'turnmodel.ssl'
+      ? turnModelRequest(resolveParams(registry['turnmodel.ssl'], stageParams(config, 'turnmodel')) as { modelUrl: string; encoder: string; ep: string })
+      : null;
+  const turnModelKey = JSON.stringify(turnModelReq);
+  useEffect(() => {
+    if (turnModelReq) preloadTurnModel(turnModelReq);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turnModelKey]);
+  const turnModel = turnModelReq ? turnModelLoad(turnModelReq) : undefined;
   const [running, setRunning] = useState<'live' | 'replay' | null>(null);
   /** Mute switches on the Mic and Playback lanes: the recorded mic (heard during replay) and the agent's voice. */
   const [muted, setMuted] = useState<{ mic: boolean; agent: boolean }>(() => {
@@ -614,7 +630,7 @@ export function App() {
 
       <section className="diagram">
         <Splitter layout={layout} onChange={setLayout} field="diagram" axis="y" sign={1} max={() => window.innerHeight - 260} />
-        <PipelineView config={config} states={nodeStates} stateTypes={stateTypes} activity={activity} running={!!running} selected={selected} onSelect={selectStage} />
+        <PipelineView config={config} turnModel={turnModel} states={nodeStates} stateTypes={stateTypes} activity={activity} running={!!running} selected={selected} onSelect={selectStage} />
       </section>
 
       <section className="dash">

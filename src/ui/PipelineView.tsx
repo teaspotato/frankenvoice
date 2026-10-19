@@ -1,6 +1,8 @@
 import { registry } from '../nodes';
 import type { Json } from '../core/types';
 import type { Activity } from './activity';
+import type { TurnModelLoad } from '../drivers';
+import { loadingState } from '../nodes/turn-model';
 import { activeStages, STAGES, stageParams, stageType, type PipelineConfig, type StageId } from '../pipeline';
 
 const W = 150;
@@ -37,6 +39,14 @@ function summarize(v: Json): string {
   return s.length > 22 ? `${s.slice(0, 21)}…` : s;
 }
 
+/** The turn model's preload, in the shape the turn model stage reports while a session runs. */
+function preloadState(l: TurnModelLoad): Record<string, Json> {
+  const m = l.last as { type?: string; label?: string; done?: number; total?: number; cached?: boolean; text?: string } | undefined;
+  if (l.state === 'failed') return { status: 'failed', error: l.error ?? null };
+  if (l.state === 'ready') return { status: `preloaded (${(m as { ep?: string } | undefined)?.ep ?? '?'})` };
+  return m ? loadingState(m) : { status: 'loading' };
+}
+
 interface Edge {
   /** The output port feeding this connection, `stage.port`. */
   src: string;
@@ -58,6 +68,7 @@ function link(src: string, a: [number, number], b: [number, number], label: stri
 /** Read-only diagram of the fixed pipeline with each stage's live state. */
 export function PipelineView({
   config,
+  turnModel,
   states,
   stateTypes,
   activity,
@@ -66,6 +77,8 @@ export function PipelineView({
   onSelect,
 }: {
   config: PipelineConfig;
+  /** The preloaded turn model, shown on its stage while no session runs. */
+  turnModel?: TurnModelLoad;
   /** Latest state per stage; only shown for stages that still run the same node type. */
   states: Record<string, Record<string, Json>>;
   stateTypes: Record<string, string>;
@@ -166,7 +179,7 @@ export function PipelineView({
         const params = stageParams(config, s.id);
         const variant = config[s.id].variant;
         const impl = typeof params.provider === 'string' ? params.provider : Object.keys(STAGES.find((d) => d.id === s.id)!.variants).length > 1 ? variant : '';
-        const state = stateTypes[s.id] === type ? states[s.id] : undefined;
+        const state = s.id === 'turnmodel' && !running && turnModel ? preloadState(turnModel) : stateTypes[s.id] === type ? states[s.id] : undefined;
         const on = activity.stages.get(s.id);
         const dl = state?.download as { label: string; done: number; total: number; fraction: number | null } | null | undefined;
         const lines = Object.entries(state ?? {})

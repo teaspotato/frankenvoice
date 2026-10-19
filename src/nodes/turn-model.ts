@@ -42,6 +42,21 @@ export class Committer {
   }
 }
 
+/** What the 'turn-model' channel is opened with; the page preloads the same thing. */
+export function turnModelRequest(p: { modelUrl: string; encoder: string; ep: string }) {
+  return { encoderUrl: p.modelUrl + p.encoder, headUrl: `${p.modelUrl}head.onnx`, frames: Number(/_k(\d+)_/.exec(p.encoder)?.[1] ?? 2), ep: p.ep };
+}
+
+/** Stage state for a loading message from the model worker: a status line and, while downloading, the progress bar's numbers. */
+export function loadingState(d: { type?: string; label?: string; done?: number; total?: number; cached?: boolean; text?: string }): { status: string; download: Json } {
+  if (d.type === 'progress' && !d.cached) {
+    const mb = (n = 0) => Math.round(n / 2 ** 20);
+    const fraction = d.total ? Math.round(((d.done ?? 0) / d.total) * 100) / 100 : null;
+    return { status: `downloading ${d.label}`, download: { label: d.label ?? '', done: mb(d.done), total: mb(d.total), fraction } };
+  }
+  return { status: d.type === 'progress' ? `${d.label} cached` : (d.text ?? 'loading'), download: null };
+}
+
 interface TurnModelParams {
   modelUrl: string;
   encoder: string;
@@ -108,7 +123,6 @@ export const turnModelNode: NodeDef<TurnModelParams> = {
   channels: [{ name: 'turn-model', description: '80 ms stereo blocks (user, agent) in, per-frame scores out' }],
   create(ctx) {
     const p = ctx.params;
-    const frames = Number(/_k(\d+)_/.exec(p.encoder)?.[1] ?? 2);
     const framer = new Framer(BLOCK);
     const played = new PlayedTrack(RATE);
     let io: IOHandle | undefined;
@@ -139,6 +153,39 @@ export const turnModelNode: NodeDef<TurnModelParams> = {
     };
 
     return {
+      // Open the model at session start: it may already be loaded (see preloadTurnModel).
+      start() {
+        ctx.setState('status', 'loading');
+        io = ctx.io.open('turn-model', turnModelRequest(p), {
+          onRecv(data) {
+            const d = data as { type: string; [k: string]: Json };
+            if (d.type === 'progress' || d.type === 'status') {
+              // What the diagram's progress bar and the lane show while the model loads.
+              const l = loadingState(d as Parameters<typeof loadingState>[0]);
+              ctx.setState('status', l.status);
+              ctx.setState('download', l.download);
+            } else if (d.type === 'ready') {
+              ready = true;
+              ctx.setState('download', null);
+              ctx.setState('status', `running (${d.ep})`);
+              ctx.emit('scores', { type: 'turnmodel.status', status: 'ready', ep: d.ep });
+            } else if (d.type === 'frames') {
+              ctx.setState('lag', `${d.backlog} blocks`);
+              onFrames(d.outs as unknown as Frame[]);
+            }
+          },
+          onClose(data) {
+            ready = false;
+            const err = (data as { error?: Json } | null)?.error;
+            ctx.setState('download', null);
+            ctx.setState('status', err ? 'failed' : 'closed');
+            if (err) {
+              ctx.log('error', `turn model: ${typeof err === 'string' ? err : JSON.stringify(err)}`, data);
+              ctx.emit('scores', { type: 'turnmodel.status', status: 'failed' });
+            }
+          },
+        });
+      },
       onInput(port, msg: Msg) {
         if (port === 'played') {
           if (isAudioMsg(msg) && typeof msg.at === 'number') played.add(msg.at, msg.samples, msg.sampleRate);
@@ -153,44 +200,8 @@ export const turnModelNode: NodeDef<TurnModelParams> = {
         }
         // Mic sample 0 is placed at the arrival of the first frame minus its length (as the AEC does).
         t0 ??= ctx.now() - (msg.end / msg.sampleRate) * 1000;
-        if (!io) {
-          ctx.setState('status', 'loading');
-          io = ctx.io.open('turn-model', { encoderUrl: p.modelUrl + p.encoder, headUrl: `${p.modelUrl}head.onnx`, frames, ep: p.ep }, {
-            onRecv(data) {
-              const d = data as { type: string; [k: string]: Json };
-              if (d.type === 'progress') {
-                const mb = (n: Json) => Math.round((n as number) / 2 ** 20);
-                const total = (d.total as number) || 0;
-                ctx.setState('status', d.cached ? `${d.label} cached` : `downloading ${d.label}`);
-                // What the diagram's progress bar and the lane show while the model loads.
-                ctx.setState('download', d.cached ? null : { label: d.label, done: mb(d.done), total: mb(total), fraction: total ? Math.round(((d.done as number) / total) * 100) / 100 : null });
-              } else if (d.type === 'status') {
-                ctx.setState('download', null);
-                ctx.setState('status', d.text);
-              } else if (d.type === 'ready') {
-                ready = true;
-                ctx.setState('download', null);
-                ctx.setState('status', `running (${d.ep})`);
-                ctx.emit('scores', { type: 'turnmodel.status', status: 'ready', ep: d.ep });
-              } else if (d.type === 'frames') {
-                ctx.setState('lag', `${d.backlog} blocks`);
-                onFrames(d.outs as unknown as Frame[]);
-              }
-            },
-            onClose(data) {
-              ready = false;
-              const err = (data as { error?: Json } | null)?.error;
-              ctx.setState('download', null);
-              ctx.setState('status', err ? 'failed' : 'closed');
-              if (err) {
-                ctx.log('error', `turn model: ${typeof err === 'string' ? err : JSON.stringify(err)}`, data);
-                ctx.emit('scores', { type: 'turnmodel.status', status: 'failed' });
-              }
-            },
-          });
-        }
         // Audio before the model is ready isn't scored; its stream starts at the first block after.
-        if (!ready) return;
+        if (!ready || !io) return;
         framer.push(msg, (frame, tr, start, end) => {
           if (base < 0) base = start;
           track = tr;
