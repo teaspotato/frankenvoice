@@ -330,15 +330,18 @@ export function Dashboard({
     g.clip();
 
     const label = (text: string, x0: number, x1: number, yc: number, color: string) => {
+      // a span that starts off screen is labelled from the left edge, so only the visible part counts as room
+      x0 = Math.max(x0, LABEL_W);
       const room = x1 - x0 - 6;
       if (room < 12 || !text) return;
       let s = text;
       while (s.length > 1 && g.measureText(s).width > room) s = s.slice(0, Math.max(1, Math.floor(s.length * (room / g.measureText(s).width)) - 1));
       if (s !== text) s = s.slice(0, -1) + '…';
       g.fillStyle = color;
-      g.fillText(s, Math.max(x0, LABEL_W) + 3, yc);
+      g.fillText(s, x0 + 3, yc);
     };
-    const span = (lane: string, a: number, b: number, color: string, alpha: number, text: string, top = 0.2, bot = 0.8) => {
+    /** A bar from `a` to `b`; its label stops at `labelEnd` (a time) when that comes first, e.g. where the next bar starts. */
+    const span = (lane: string, a: number, b: number, color: string, alpha: number, text: string, top = 0.2, bot = 0.8, labelEnd = Infinity) => {
       const [ly0, ly1] = laneY[lane];
       const h = ly1 - ly0;
       const x0 = x(a);
@@ -347,7 +350,7 @@ export function Dashboard({
       g.fillStyle = color;
       g.fillRect(x0, ly0 + h * top, x1 - x0, h * (bot - top));
       g.globalAlpha = 1;
-      label(text, x0, x1, ly0 + (h * (top + bot)) / 2, col.text);
+      label(text, x0, Math.min(x1, x(labelEnd)), ly0 + (h * (top + bot)) / 2, col.text);
       hits.push({ lane, x0, x1, text });
     };
     const vline = (lane: string, t: number, color: string, from = 0, to = 1) => {
@@ -736,12 +739,14 @@ export function Dashboard({
           seqs: [r.seq],
         });
       }
-      for (const s of m.tts) {
+      // Sentences overlap when several are requested before the first finishes: each label stops where the next sentence starts.
+      m.tts.forEach((s, i) => {
         const end = s.t1 ?? head;
-        if (end < t0 || s.t0 > t1) continue;
-        span('tts', s.t0, end, col.tts, 0.35, s.text, 0.15, 0.7);
+        if (end < t0 || s.t0 > t1) return;
+        const next = m.tts.slice(i + 1).find((n) => n.t0 > s.t0);
+        span('tts', s.t0, end, col.tts, 0.35, s.text, 0.15, 0.7, next?.t0);
         tag(s.seqs);
-      }
+      });
 
       // playback: what was heard
       for (const p of m.playback) {
