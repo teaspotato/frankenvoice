@@ -3,6 +3,15 @@ import type { ChatTurn, LlmAdapter, LlmStreamEvent } from './types';
 
 type Block = JsonObject & { type: string };
 
+/** How a model turns thinking off; Opus models cannot, so nothing is sent for them. */
+export function thinkingOff(p: JsonObject): JsonObject {
+  if (p.thinking !== 'off') return {};
+  const model = String(p.model ?? '');
+  if (model.includes('haiku')) return { thinking: { type: 'disabled' } };
+  if (model.includes('sonnet')) return { thinking: { type: 'between_tools' } };
+  return {};
+}
+
 /** Claude Messages API. Payloads are the SDK's raw stream events. */
 export const anthropicAdapter: LlmAdapter = {
   provider: 'anthropic',
@@ -23,6 +32,7 @@ export const anthropicAdapter: LlmAdapter = {
       system: p.system,
       messages: messages as Json,
       output_config: { effort: p.effort },
+      ...thinkingOff(p),
       ...(p.fallbacks ? { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' } : {}),
     };
   },
