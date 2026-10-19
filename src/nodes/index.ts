@@ -31,7 +31,9 @@ export function migrateGraph(g: GraphSpec): GraphSpec {
     if (g.formatVersion < 3) n = noDrafts(n);
     if (g.formatVersion < 4) n = noThinking(n);
     if (g.formatVersion < 5) n = noOpener(n);
-    return oldModelRules(n);
+    else if (g.formatVersion < 7) n = cannedOpener(n);
+    if (g.formatVersion < 6) n = oldModelRules(n);
+    return n;
   };
   if (g.formatVersion >= 2) return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: g.nodes.map(older) };
   const prefix = (provider: string, params: Record<string, Json>, rename: Record<string, string> = {}) => ({
@@ -69,6 +71,8 @@ const noThinking = (n: NodeSpec): NodeSpec => {
 };
 /** Before format 5 there was no canned opener (format 4's opener asked an LLM, and is gone). */
 const noOpener = (n: NodeSpec): NodeSpec => (n.type === 'llm' ? { ...n, params: { ...n.params, opener: 'off' } } : n);
+/** Formats 5 and 6 defaulted to the canned opener (format 7: the thinking filler). */
+const cannedOpener = (n: NodeSpec): NodeSpec => (n.type === 'llm' ? { ...n, params: { opener: 'canned', ...n.params } } : n);
 /** Before format 6 the turn model's floor takes counted without VAD speech, and silence never committed. */
 const oldModelRules = (n: NodeSpec): NodeSpec =>
   n.type === 'turn.duplex' ? { ...n, params: { modelNeedsVad: false, maxSilenceMs: 0, ...n.params } } : n;

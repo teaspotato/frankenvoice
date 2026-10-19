@@ -11,4 +11,10 @@ describe('anthropic thinking param', () => {
     expect(req('claude-opus-5-5', 'off').thinking).toBeUndefined();
     expect(req('claude-haiku-5-5', 'model default').thinking).toBeUndefined();
   });
+
+  it('reports a thinking block as thinking, before any text', () => {
+    const parser = anthropicAdapter.parser();
+    expect(parser.recv({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } })).toEqual([{ type: 'thinking' }]);
+    expect(parser.recv({ type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } })).toEqual([]);
+  });
 });

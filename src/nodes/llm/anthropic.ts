@@ -44,9 +44,11 @@ export const anthropicAdapter: LlmAdapter = {
       recv(data): LlmStreamEvent[] {
         const ev = data as JsonObject;
         switch (ev.type) {
-          case 'content_block_start':
-            blocks[ev.index as number] = { ...(ev.content_block as Block) };
-            return [];
+          case 'content_block_start': {
+            const b = { ...(ev.content_block as Block) };
+            blocks[ev.index as number] = b;
+            return b.type === 'thinking' || b.type === 'redacted_thinking' ? [{ type: 'thinking' }] : [];
+          }
           case 'content_block_delta': {
             const b = blocks[ev.index as number];
             const d = ev.delta as JsonObject;

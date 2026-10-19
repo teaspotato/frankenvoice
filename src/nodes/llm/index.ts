@@ -93,9 +93,26 @@ export const llmNode: NodeDef = {
       key: 'opener',
       label: 'Opener',
       type: 'select',
-      options: ['canned', 'choice', 'off'],
-      default: 'canned',
-      description: 'Say a canned line the moment the turn commits; the model is told it was said. canned: picked in the browser from the user\'s words by a sentence encoder. choice: picked by TypeSafe Choice from the whole conversation.',
+      options: ['thinking', 'canned', 'choice', 'off'],
+      default: 'thinking',
+      description:
+        'thinking: when a reasoning model is still thinking a while after the turn, say a filler ("Let me see.") the model never hears of. canned / choice: say a line picked for the user\'s words the moment the turn commits, and tell the model (picked in the browser by a sentence encoder, or by TypeSafe Choice from the whole conversation).',
+    },
+    {
+      key: 'fillerLines',
+      label: 'Fillers',
+      type: 'text',
+      default: 'Let me see.\nHmm, let me think.\nOne moment.\nLet me think about that.',
+      when: { opener: ['thinking'] },
+      description: 'One per line, taken in turn, never the same twice in a row.',
+    },
+    {
+      key: 'fillerAfterMs',
+      label: 'Filler after thinking (ms)',
+      type: 'number',
+      default: 500,
+      when: { opener: ['thinking'] },
+      description: 'Say a filler if the model is still thinking this long after the turn was committed, with no words yet.',
     },
     {
       key: 'openerChoices',
@@ -173,6 +190,12 @@ export const llmNode: NodeDef = {
       stopReason: string | null;
       /** The opener was said as the start of this reply. */
       opened?: boolean;
+      /** The model is reasoning (a thinking block or reasoning tokens came back). */
+      thinking?: boolean;
+      /** When the reply went live (its turn was committed). */
+      liveAt?: number;
+      /** A filler said while the model was thinking: spoken, but not part of the model's reply. */
+      filler?: string;
     }
     let active: Reply | undefined;
     let draft: Reply | undefined;
@@ -273,9 +296,11 @@ export const llmNode: NodeDef = {
       if (a.io && !a.io.closed) a.io.close({ status });
       // Keep whatever the model produced, so the next request continues from it.
       // The opener isn't in the model's own content blocks, so a reply that began with one is kept as plain text.
+      // A filler is left out: the model never knew of it.
       const native = a.opened || !a.parser ? null : a.parser.native();
-      if (a.text || native)
-        history.push({ role: 'assistant', text: a.text, turnId: a.turnId, ...(native ? { native: { provider: adapter.provider, content: native } } : {}) });
+      const said = a.filler ? a.text.slice(a.filler.length) : a.text;
+      if (said || native)
+        history.push({ role: 'assistant', text: said, turnId: a.turnId, ...(native ? { native: { provider: adapter.provider, content: native } } : {}) });
       ctx.emit('text', { type: 'llm.end', rid: a.rid, status, stopReason: a.stopReason, text: a.text, ...(error ? { error } : {}) });
       ctx.setState('status', status === 'error' ? 'error' : 'idle');
       ctx.setState('turns', history.length);
@@ -291,7 +316,7 @@ export const llmNode: NodeDef = {
         } else if (ev.type === 'end') {
           active.stopReason = ev.stopReason;
           finish('done');
-        } else finish('error', ev.error);
+        } else if (ev.type === 'error') finish('error', ev.error);
       }
     };
 
@@ -342,7 +367,36 @@ export const llmNode: NodeDef = {
         if (r.live) speakOpener(r);
       });
     };
+    // Fillers: said when a reasoning model keeps the user waiting.
+    const fillers = String(p.fillerLines ?? '')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    let fillerNo = 0;
+    let lastFiller = '';
+    const maybeFiller = (r: Reply) => {
+      if (p.opener !== 'thinking' || !fillers.length || r !== active || r.text || !r.thinking || r.filler || r.liveAt === undefined) return;
+      const waited = ctx.now() - r.liveAt;
+      if (waited < Number(p.fillerAfterMs)) return;
+      let line = fillers[fillerNo++ % fillers.length];
+      if (line === lastFiller && fillers.length > 1) line = fillers[fillerNo++ % fillers.length];
+      lastFiller = line;
+      r.filler = `${line} `;
+      r.text = r.filler;
+      ctx.emit('text', { type: 'llm.opener', text: r.user.text, line, reason: `still thinking ${Math.round(waited)} ms after the turn` });
+      ctx.emit('text', { type: 'llm.delta', rid: r.rid, text: r.filler, opener: true });
+    };
+    /** The reply's turn is committed: from now on the user is waiting for it. */
+    const goLive = (r: Reply) => {
+      r.live = true;
+      r.liveAt = ctx.now();
+      if (p.opener === 'thinking') ctx.setTimer(Number(p.fillerAfterMs), () => maybeFiller(r), 'filler');
+    };
     const route = (r: Reply, events: Events) => {
+      if (events.some((e) => e.type === 'thinking') && !r.thinking) {
+        r.thinking = true;
+        maybeFiller(r);
+      }
       if (r === active) handle(events);
       else if (r === draft) r.held.push(...events);
     };
@@ -371,6 +425,7 @@ export const llmNode: NodeDef = {
     return {
       start() {
         const lines = [...examples, ...choices].map((e) => e.line).filter((l): l is string => !!l);
+        if (p.opener === 'thinking') lines.push(...fillers);
         // Tell TTS the lines, so it can have them ready.
         if (lines.length) ctx.emit('text', { type: 'llm.opener_lines', lines: [...new Set(lines)] });
         if (!examples.length) return;
@@ -432,19 +487,20 @@ export const llmNode: NodeDef = {
           ctx.emit('text', { type: 'llm.draft_end', rid: kept.rid, draftId: kept.draftId!, status: 'kept', chunks: held.filter((e) => e.type === 'delta').length });
           ctx.emit('text', { type: 'llm.start', rid: kept.rid, turnId: turnId ?? null, draft: kept.draftId!, headStartMs: Math.round(ctx.now() - kept.t0) });
           ctx.setState('status', 'generating');
-          kept.live = true;
           kept.turnId = turnId;
           active = kept;
+          goLive(kept);
           if (kept.io) speakOpener(kept);
           handle(held);
           return;
         }
         const user: ChatTurn = { role: 'user', text: msg.text as string, turnId };
         history.push(user);
-        const r = reply(user, { live: true, turnId });
+        const r = reply(user, { turnId });
         ctx.emit('text', { type: 'llm.start', rid: r.rid, turnId: turnId ?? null });
         ctx.setState('status', 'generating');
         active = r;
+        goLive(r);
         launch(r, [...history]);
       },
       stop() {

@@ -353,7 +353,7 @@ export class TimelineModel {
           t1: e.t,
           text: d.line ?? '',
           status: d.line ? 'picked' : 'none',
-          why: `similarity ${d.score} to "${d.example}" · user: ${d.text}`,
+          why: d.reason ? `${d.reason} · user: ${d.text}` : `${d.score} for "${d.example}" · user: ${d.text}`,
           seqs: [e.seq],
         });
         break;

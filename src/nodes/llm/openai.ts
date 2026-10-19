@@ -46,7 +46,11 @@ export const openaiCompatAdapter: LlmAdapter = {
         const out: LlmStreamEvent[] = [];
         for (const choice of (c.choices as JsonObject[] | undefined) ?? []) {
           if ((choice.index ?? 0) !== 0) continue;
-          const text = (choice.delta as JsonObject | undefined)?.content;
+          const delta = choice.delta as JsonObject | undefined;
+          // Reasoning models stream their thinking as `reasoning` (OpenRouter) or `reasoning_content` (DeepSeek, vLLM).
+          const reasoning = delta?.reasoning ?? delta?.reasoning_content;
+          if (typeof reasoning === 'string' && reasoning) out.push({ type: 'thinking' });
+          const text = delta?.content;
           if (typeof text === 'string' && text) out.push({ type: 'delta', text });
           if (choice.finish_reason) stopReason = choice.finish_reason as string;
         }

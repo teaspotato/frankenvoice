@@ -42,7 +42,7 @@ function harness(params: Record<string, unknown>) {
 }
 
 const lines = 'Hmm, let me think. = why is that | which one\n- = thanks';
-const params = { provider: 'openai-compatible', model: 'big', system: 'sys', openerLines: lines, openerMinScore: 0.5 };
+const params = { provider: 'openai-compatible', model: 'big', system: 'sys', opener: 'canned', openerLines: lines, openerMinScore: 0.5 };
 const vecs = { why: [1, 0, 0], which: [0.8, 0.6, 0], thanks: [0, 0, 1] };
 const tok = (text: string) => ({ choices: [{ index: 0, delta: { content: text } }] });
 const done = { $done: true };
@@ -189,5 +189,52 @@ describe('openers picked by TypeSafe Choice', () => {
     h.send(1000, { type: 'turn.draft', draftId: 'd0', text: 'yeah' });
     h.send(1100, { type: 'turn.draft', draftId: 'd1', text: 'yeah' });
     expect(h.choices()).toHaveLength(1);
+  });
+});
+
+describe('fillers while a reasoning model thinks', () => {
+  const fparams = { provider: 'openai-compatible', model: 'big', system: 'sys', fillerLines: 'Let me see.\nOne moment.', fillerAfterMs: 500 };
+  const think = { choices: [{ index: 0, delta: { reasoning: 'hmm' } }] };
+
+  it('says a filler when the model is still thinking 500 ms after the turn, and keeps it out of the history', () => {
+    const h = harness(fparams);
+    expect(h.of('llm.opener_lines')).toEqual([{ type: 'llm.opener_lines', lines: ['Let me see.', 'One moment.'] }]);
+    h.send(1000, { type: 'turn.user', turnId: 'u0', text: 'plan a week in Japan' });
+    const main = h.chat()[0];
+    expect(body(main.request).messages[0].content).toBe('sys');
+    main.h.onRecv!(think, undefined);
+    h.advance(1499);
+    expect(h.of('llm.delta')).toHaveLength(0);
+    h.advance(1500);
+    expect(h.of('llm.delta')).toMatchObject([{ text: 'Let me see. ', opener: true }]);
+    main.h.onRecv!(tok('Day one: Tokyo.'), undefined);
+    main.h.onRecv!(done, undefined);
+    expect(h.of('llm.end')).toMatchObject([{ text: 'Let me see. Day one: Tokyo.' }]);
+    h.send(5000, { type: 'turn.user', turnId: 'u1', text: 'and then?' });
+    expect(body(h.chat()[1].request).messages.map((m) => m.content)).toEqual(['sys', 'plan a week in Japan', 'Day one: Tokyo.', 'and then?']);
+  });
+
+  it('says nothing when the model answers without thinking, or starts talking in time', () => {
+    const h = harness(fparams);
+    h.send(1000, { type: 'turn.user', turnId: 'u0', text: 'hi' });
+    h.advance(3000);
+    expect(h.of('llm.delta')).toHaveLength(0);
+    h.send(4000, { type: 'turn.user', turnId: 'u1', text: 'why?' });
+    h.chat()[1].h.onRecv!(think, undefined);
+    h.chat()[1].h.onRecv!(tok('Because.'), undefined);
+    h.advance(5000);
+    expect(h.of('llm.delta').map((d) => d.text)).toEqual(['Because.']);
+  });
+
+  it('fills at once when thinking starts late, and does not repeat the last filler', () => {
+    const h = harness(fparams);
+    h.send(1000, { type: 'turn.user', turnId: 'u0', text: 'a' });
+    h.advance(2000);
+    h.chat()[0].h.onRecv!(think, undefined);
+    h.chat()[0].h.onRecv!(done, undefined);
+    h.send(3000, { type: 'turn.user', turnId: 'u1', text: 'b' });
+    h.chat()[1].h.onRecv!(think, undefined);
+    h.advance(3500);
+    expect(h.of('llm.delta').map((d) => d.text)).toEqual(['Let me see. ', 'One moment. ']);
   });
 });
