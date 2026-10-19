@@ -8,6 +8,7 @@ import { prepareReplay } from '../core/replay';
 import { decodeBundle, encodeBundle } from '../core/bundle';
 import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
+import { SpanDetails } from './SpanDetails';
 import type { Json } from '../core/types';
 import { browserDrivers, micMonitor, preloadTurnModel, sessionTitle, setOutputMuted, setOutputPaused, setOutputSuppressed, turnModelLoad, watchTurnModels } from '../drivers';
 import { resolveParams } from '../core/node';
@@ -188,6 +189,8 @@ export function App() {
   const [paused, setPaused] = useState(false);
   /** Events of the timeline item last clicked, to show in the event log. */
   const [focus, setFocus] = useState<{ seqs: number[]; n: number } | null>(null);
+  /** The timeline item last clicked, shown in full in the side panel. */
+  const [picked, setPicked] = useState<number[] | null>(null);
   const stopActivity = useRef<() => void>(() => {});
   const runtimeRef = useRef<Runtime | null>(null);
   const schedRef = useRef<Scheduler | null>(null);
@@ -350,6 +353,7 @@ export function App() {
   const restartAt = useRef<number | null>(null);
   // A different session starts from its beginning.
   useEffect(() => setPlayFrom(0), [current?.traj]);
+  useEffect(() => setPicked(null), [current?.traj]);
 
   /** Run everything before `t` at once with outputs silenced, then let the replay carry on from there. */
   const skipTo = (sim: SimScheduler, t: number) => {
@@ -645,12 +649,16 @@ export function App() {
           muted={muted}
           onMute={(which) => setMuted((m) => ({ ...m, [which]: !m[which] }))}
           playhead={running === 'replay' && playingBack ? () => simRef.current?.now() ?? 0 : running ? null : playFrom}
-          onFocusEvents={(seqs) => setFocus((f) => ({ seqs, n: (f?.n ?? 0) + 1 }))}
+          onFocusEvents={(seqs) => {
+            setFocus((f) => ({ seqs, n: (f?.n ?? 0) + 1 }));
+            setPicked(seqs);
+          }}
         />
       </section>
 
       <Splitter layout={layout} onChange={setLayout} field="side" axis="x" sign={-1} max={() => window.innerWidth - 400} />
       <aside className="inspector">
+        {picked && current && <SpanDetails trajectory={current.traj} seqs={picked} onClose={() => setPicked(null)} />}
         {selected ? (
           <StagePanel config={config} stage={selected} state={stateTypes[selected] === stageType(config, selected) ? nodeStates[selected] : undefined} disabled={!!running} onChange={setConfig} />
         ) : (
