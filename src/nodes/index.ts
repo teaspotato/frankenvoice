@@ -1,5 +1,5 @@
 import type { NodeRegistry } from '../core/node';
-import type { GraphSpec } from '../core/graph';
+import type { GraphSpec, NodeSpec } from '../core/graph';
 import type { Json } from '../core/types';
 import { GRAPH_FORMAT_VERSION } from '../core/graph';
 import { micNode } from './mic';
@@ -20,9 +20,13 @@ export const registry: NodeRegistry = Object.fromEntries(
   ),
 );
 
-/** Upgrade graphs saved by older versions (format 1 had one node type per provider). */
+/**
+ * Upgrade graphs saved by older versions, so they run as they did: format 1 had
+ * one node type per provider; before format 3, full-duplex turns did not draft replies early.
+ */
 export function migrateGraph(g: GraphSpec): GraphSpec {
   if (g.formatVersion >= GRAPH_FORMAT_VERSION) return g;
+  if (g.formatVersion >= 2) return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: g.nodes.map(noDrafts) };
   const prefix = (provider: string, params: Record<string, Json>, rename: Record<string, string> = {}) => ({
     provider,
     ...Object.fromEntries(Object.entries(params).map(([k, v]) => [`${provider}.${rename[k] ?? k}`, v])),
@@ -45,5 +49,7 @@ export function migrateGraph(g: GraphSpec): GraphSpec {
         return n;
     }
   });
-  return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes };
+  return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: nodes.map(noDrafts) };
 }
+
+const noDrafts = (n: NodeSpec): NodeSpec => (n.type === 'turn.duplex' && n.params.speculate === undefined ? { ...n, params: { ...n.params, speculate: false } } : n);

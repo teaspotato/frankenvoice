@@ -60,6 +60,12 @@ export class ActivityTracker {
       case 'asr.final':
         this.set('asr', null);
         break;
+      case 'llm.draft':
+        this.set('llm', 'drafting');
+        break;
+      case 'llm.draft_end':
+        if (d.status === 'dropped') this.set('llm', null);
+        break;
       case 'llm.start':
         this.set('llm', 'generating');
         this.stream(key, rid, true);

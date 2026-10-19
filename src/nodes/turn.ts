@@ -87,6 +87,8 @@ interface DuplexParams {
   minSpeechMs: number;
   backchannels: string;
   maxBackchannelMs: number;
+  speculate: boolean;
+  draftAt: number;
 }
 
 /** Who holds the floor, and whether the user is talking over the agent while it does. */
@@ -119,6 +121,12 @@ type Candidate = {
 };
 
 const words = (s: string) => s.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? [];
+const FILLERS = new Set(['um', 'umm', 'uh', 'uhh', 'er', 'erm', 'ah']);
+/** What a draft must match: the words, without case, punctuation or fillers. */
+export const draftKey = (s: string) =>
+  words(s)
+    .filter((w) => !FILLERS.has(w))
+    .join(' ');
 
 /**
  * Full-duplex turn taking, as the state machine in FLOOR. The user can take
@@ -136,6 +144,16 @@ const words = (s: string) => s.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? [];
  *
  * Every barge-in decision is also emitted as a `turn.decision` message
  * (candidate, backchannel, interrupt, continue) so the timeline can show it.
+ *
+ * Speculative replies: while the user is silent and their turn looks like it
+ * is ending (the model's end-of-turn score reaches `draftAt`, or just silence
+ * without the model), and ASR has caught up (a result arrived during the
+ * silence, or the words are all final), the words so far go out as a
+ * `turn.draft` so the LLM can start early. A draft is redone whenever the
+ * words change during the silence and dropped (`turn.draft_drop`) if the user goes on. At commit the turn
+ * names the draft (`draft`) when the words still match, and the LLM keeps the
+ * reply it already started; otherwise the draft is dropped and the turn is
+ * sent as usual.
  */
 export const duplexTurnNode: NodeDef<DuplexParams> = {
   type: 'turn.duplex',
@@ -201,6 +219,22 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       description: 'Speech over the agent longer than this interrupts, whatever the words or the model say',
       when: { bargeIn: [true] },
     },
+    {
+      key: 'speculate',
+      label: 'Draft replies early',
+      type: 'boolean',
+      default: true,
+      description:
+        'Start the LLM on the words so far while the user is silent, before the turn is committed. Kept if the final words match, else dropped and resent. Costs the tokens of dropped drafts.',
+    },
+    {
+      key: 'draftAt',
+      label: 'Draft at end-of-turn score',
+      type: 'number',
+      default: 0.3,
+      description: 'With the turn model: draft once its end-of-turn score for the user reaches this (it commits at its own threshold). Without it, any silence drafts.',
+      when: { speculate: [true], useModel: [true] },
+    },
   ],
   create(ctx) {
     const p = ctx.params;
@@ -219,6 +253,15 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let eotWait: { why: string; timer: TimerHandle } | null = null;
     /** The turn model is loaded and scoring. */
     let model = false;
+    /** The user is talking (VAD). */
+    let speaking = false;
+    /** ASR has caught up with the silence: a result arrived during it, or the words before it were all final. */
+    let caughtUp = false;
+    /** The model's latest end-of-turn score for the user. */
+    let eotUser = 0;
+    /** The reply being drafted on the words so far, before the turn is committed. */
+    let draft: { id: string; key: string } | null = null;
+    let draftNo = 0;
     const useModel = () => p.useModel && model;
     /**
      * The model decides barge-in only over the agent's speech: while the agent is
@@ -275,13 +318,43 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       to = end;
       ctx.setState('pending', parts.join(' '));
     };
+    const dropDraft = (why: string) => {
+      if (!draft) return;
+      ctx.emit('turn', { type: 'turn.draft_drop', draftId: draft.id, why });
+      draft = null;
+      ctx.setState('draft', '');
+    };
+    /** Draft a reply on the words so far, if the turn looks like it is ending and they changed. */
+    const maybeDraft = (why: string) => {
+      if (!p.speculate || state !== 'listening' || speaking || !caughtUp) return;
+      if (useModel() && eotUser < p.draftAt) return;
+      const text = [...parts, partial?.text ?? ''].join(' ').trim();
+      const key = draftKey(text);
+      if (!key || draft?.key === key) return;
+      dropDraft('words changed');
+      draft = { id: `${ctx.id}-d${draftNo++}`, key };
+      const span = partial ? { from: from < 0 ? partial.start : from, to: partial.end } : { from, to };
+      ctx.emit('turn', { type: 'turn.draft', draftId: draft.id, text, ...span, why, ...(replaces ? { replaces } : {}) });
+      ctx.setState('draft', text);
+    };
+    /** The words changed: redo the draft during silence, drop it if the user is still talking. */
+    const refreshDraft = (why: string) => {
+      if (draft && speaking && draftKey([...parts, partial?.text ?? ''].join(' ')) !== draft.key) return dropDraft('user went on');
+      maybeDraft(why);
+    };
     const commit = (why: string) => {
       eotWait?.timer.clear();
       eotWait = null;
       const text = parts.join(' ').trim();
       if (!text || state !== 'listening') return;
       const turnId = `${ctx.id}-u${turnNo++}`;
-      ctx.emit('turn', { type: 'turn.user', turnId, text, from, to, ...(replaces ? { replaces } : {}) });
+      let kept: string | null = null;
+      if (draft && draft.key === draftKey(text)) {
+        kept = draft.id;
+        draft = null;
+        ctx.setState('draft', '');
+      } else dropDraft('final words differ');
+      ctx.emit('turn', { type: 'turn.user', turnId, text, from, to, ...(replaces ? { replaces } : {}), ...(kept ? { draft: kept } : {}) });
       last = { id: turnId, text, from, to };
       replaces = null;
       parts = [];
@@ -365,6 +438,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     return {
       onInput(port, msg) {
         if (port === 'scores') {
+          if (msg.type === 'turnmodel.frame') {
+            eotUser = (msg.eot as number[])[0];
+            if (useModel() && eotUser >= p.draftAt) maybeDraft(`model: end of turn likely p=${eotUser}`);
+            return;
+          }
           if (msg.type === 'turnmodel.status') {
             model = msg.status === 'ready';
             if (p.useModel) ctx.setState('using', model ? 'turn model' : 'rules');
@@ -397,6 +475,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         if (port === 'vad') {
           if (msg.type === 'vad.speech_start') {
             ctx.setState('userSpeaking', true);
+            speaking = true;
+            caughtUp = false;
             if (state === 'thinking' || state === 'speaking') overlap(msg.at as number, 'user speech (VAD)');
             else if (eotWait) {
               // They went on after the model called the end of their turn: wait for the next one.
@@ -405,6 +485,10 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             }
           } else if (msg.type === 'vad.speech_end') {
             ctx.setState('userSpeaking', false);
+            speaking = false;
+            // A partial from before the silence usually lacks the last words: wait for ASR to catch up.
+            caughtUp = !partial;
+            if (state === 'listening') maybeDraft('silence, words final');
             if (candidate) {
               const c = candidate;
               c.timer?.clear();
@@ -428,13 +512,16 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           if (msg.type === 'asr.final' && text) ctx.log('info', 'ignored short speech while the agent has the floor', { text });
           return;
         }
+        if (!speaking) caughtUp = true;
         if (msg.type === 'asr.partial') {
           partial = text ? { text, start: msg.start as number, end: msg.end as number } : null;
+          if (text) refreshDraft('ASR partial');
         } else if (msg.type === 'asr.final') {
           collect(text, msg.start as number, msg.end as number);
           partial = null;
           if (eotWait) commit(eotWait.why);
           else if (!useModel() && msg.speechFinal && p.commitOn === 'speech_final') commit('speech_final');
+          else refreshDraft('ASR final');
         } else if (msg.type === 'asr.utterance_end') {
           commit('utterance_end');
         }

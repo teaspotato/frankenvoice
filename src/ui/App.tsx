@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef, useState, type CSSProperties } from 'react';
-import { registry } from '../nodes';
+import { migrateGraph, registry } from '../nodes';
 import { GRAPH_FORMAT, type GraphSpec } from '../core/graph';
 import { Runtime } from '../core/runtime';
 import { LiveScheduler, type Scheduler, type SimScheduler } from '../core/scheduler';
@@ -376,7 +376,7 @@ export function App() {
       .filter(Boolean);
     const { runtime: rt, sim } = prepareReplay(source, {
       registry,
-      graph: replayOpts.useCurrentConfig ? buildGraph(config) : source.meta.graph,
+      graph: replayOpts.useCurrentConfig ? buildGraph(config) : migrateGraph(source.meta.graph),
       drivers: browserDrivers,
       liveChannels,
       monitorChannels: replayOpts.audible && replayOpts.realtime ? outputChannels : [],

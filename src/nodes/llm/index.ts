@@ -1,5 +1,5 @@
 import type { NodeDef } from '../../core/node';
-import type { Json, JsonObject } from '../../core/types';
+import type { Json, JsonObject, Msg } from '../../core/types';
 import { anthropicAdapter } from './anthropic';
 import { openaiCompatAdapter } from './openai';
 import type { ChatTurn, LlmAdapter, LlmStreamParser } from './types';
@@ -21,6 +21,13 @@ const openai = { provider: ['openai-compatible'] };
  * the node's ports or messages. The request (full history included) is the
  * io.open payload and every raw stream payload is an io.recv, so a replay sees
  * the identical token stream with identical timing.
+ *
+ * A `turn.draft` (the user's words before their turn is committed) starts a
+ * request early, without touching the history or emitting anything but
+ * `llm.draft` / `llm.draft_end`: the stream is held back. When the committed
+ * `turn.user` names the draft, the held stream is emitted at once as an
+ * ordinary reply (llm.start with `draft`, then its deltas) and the rest
+ * streams as usual. Any other turn, a new draft or a drop discards it.
  */
 export const llmNode: NodeDef = {
   type: 'llm',
@@ -67,8 +74,13 @@ export const llmNode: NodeDef = {
     const reqParams: JsonObject = { ...p, model: (p.model as string) || adapter?.defaultModel || '' };
     const history: ChatTurn[] = [];
     let n = 0;
+    type Events = ReturnType<LlmStreamParser['recv']>;
     let active:
       | { io: ReturnType<typeof ctx.io.open>; rid: string; turnId?: string; parser: LlmStreamParser; text: string; stopReason: string | null }
+      | undefined;
+    /** A reply started on a draft: its request, and what came back so far, held until the turn is committed. */
+    let draft:
+      | { id: string; rid: string; io: ReturnType<typeof ctx.io.open>; parser: LlmStreamParser; user: ChatTurn; replaces?: string; held: Events; t0: number }
       | undefined;
 
     const finish = (status: 'done' | 'cancelled' | 'error', error?: Json) => {
@@ -99,13 +111,69 @@ export const llmNode: NodeDef = {
       }
     };
 
+    /** The history a request for `user` sees: up to the turn it replaces, if any. */
+    const historyFor = (user: ChatTurn, replaces?: unknown) => {
+      const i = replaces ? history.findIndex((t) => t.role === 'user' && t.turnId === replaces) : -1;
+      return [...(i >= 0 ? history.slice(0, i) : history), user];
+    };
+    const open = (request: Json) => {
+      const parser = adapter.parser();
+      const io = ctx.io.open(adapter.channel, request, {
+        onRecv(data) {
+          route(io, parser.recv(data));
+        },
+        onClose(data) {
+          route(io, parser.close(data));
+        },
+      });
+      return { io, parser };
+    };
+    const route = (io: ReturnType<typeof ctx.io.open>, events: Events) => {
+      if (active?.io === io) handle(events);
+      else if (draft?.io === io) draft.held.push(...events);
+    };
+    const dropDraft = (why: string) => {
+      if (!draft) return;
+      const d = draft;
+      draft = undefined;
+      if (!d.io.closed) d.io.close({ status: 'cancelled' });
+      const tokens = d.held.filter((e) => e.type === 'delta').length;
+      ctx.emit('text', { type: 'llm.draft_end', rid: d.rid, draftId: d.id, status: 'dropped', why, chunks: tokens });
+      ctx.log('debug', 'draft dropped', { draftId: d.id, why, chunks: tokens });
+    };
+    const startDraft = (msg: Msg) => {
+      dropDraft('redrafted');
+      const user: ChatTurn = { role: 'user', text: msg.text as string };
+      let request: Json;
+      try {
+        request = adapter.buildRequest(historyFor(user, msg.replaces), reqParams);
+      } catch (e) {
+        ctx.log('error', `could not build request: ${String(e)}`);
+        return;
+      }
+      const rid = `${ctx.id}-r${n++}`;
+      ctx.emit('text', { type: 'llm.draft', rid, draftId: msg.draftId as string, text: user.text });
+      draft = { id: msg.draftId as string, rid, ...open(request), user, ...(msg.replaces ? { replaces: msg.replaces as string } : {}), held: [], t0: ctx.now() };
+    };
+
     if (!adapter) ctx.log('error', `unknown LLM provider "${String(p.provider)}"`);
     ctx.setState('provider', p.provider);
 
     return {
       onInput(port, msg) {
         if (port === 'control') {
-          if (msg.type === 'cancel') finish('cancelled');
+          if (msg.type === 'cancel') {
+            dropDraft('cancelled');
+            finish('cancelled');
+          }
+          return;
+        }
+        if (msg.type === 'turn.draft') {
+          if (adapter && reqParams.model) startDraft(msg);
+          return;
+        }
+        if (msg.type === 'turn.draft_drop') {
+          if (draft?.id === msg.draftId) dropDraft((msg.why as string) ?? 'dropped');
           return;
         }
         if (msg.type === 'turn.heard') {
@@ -125,10 +193,24 @@ export const llmNode: NodeDef = {
           return;
         }
         finish('cancelled');
+        const kept = msg.draft && draft?.id === msg.draft ? draft : undefined;
+        if (!kept) dropDraft('turn committed without it');
         if (msg.replaces) {
           // The user wasn't done: this turn replaces an earlier one and whatever followed it.
           const i = history.findIndex((t) => t.role === 'user' && t.turnId === msg.replaces);
           if (i >= 0) history.splice(i);
+        }
+        if (kept) {
+          // The draft's words stand: keep its reply. The history records what the request said.
+          draft = undefined;
+          history.push({ ...kept.user, turnId: msg.turnId as string });
+          const held = kept.held;
+          ctx.emit('text', { type: 'llm.draft_end', rid: kept.rid, draftId: kept.id, status: 'kept', chunks: held.filter((e) => e.type === 'delta').length });
+          ctx.emit('text', { type: 'llm.start', rid: kept.rid, turnId: (msg.turnId as string) ?? null, draft: kept.id, headStartMs: Math.round(ctx.now() - kept.t0) });
+          ctx.setState('status', 'generating');
+          active = { io: kept.io, rid: kept.rid, turnId: msg.turnId as string, parser: kept.parser, text: '', stopReason: null };
+          handle(held);
+          return;
         }
         history.push({ role: 'user', text: msg.text as string, turnId: msg.turnId as string });
 
@@ -142,18 +224,10 @@ export const llmNode: NodeDef = {
         }
         ctx.emit('text', { type: 'llm.start', rid, turnId: (msg.turnId as string) ?? null });
         ctx.setState('status', 'generating');
-        const parser = adapter.parser();
-        const io = ctx.io.open(adapter.channel, request, {
-          onRecv(data) {
-            if (active?.io === io) handle(parser.recv(data));
-          },
-          onClose(data) {
-            if (active?.io === io) handle(parser.close(data));
-          },
-        });
-        active = { io, rid, turnId: msg.turnId as string, parser, text: '', stopReason: null };
+        active = { ...open(request), rid, turnId: msg.turnId as string, text: '', stopReason: null };
       },
       stop() {
+        dropDraft('stopped');
         finish('cancelled');
       },
     };
