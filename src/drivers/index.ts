@@ -22,14 +22,23 @@ const mic: LiveDriver = (req, sink) => {
   const r = req as { sampleRate: number; frameSamples: number; echoCancellation: boolean; noiseSuppression: boolean; autoGainControl: boolean };
   let closed = false;
   let stream: MediaStream | undefined;
-  const ctx = new AudioContext();
+  // Capture at the target rate so the browser resamples with a proper filter (the worklet's own
+  // resampler has none). Browsers that can't feed a mic into a context at another rate get the default.
+  let ctx = new AudioContext({ sampleRate: r.sampleRate });
   (async () => {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: r.echoCancellation, noiseSuppression: r.noiseSuppression, autoGainControl: r.autoGainControl },
     });
     if (closed) return stream.getTracks().forEach((t) => t.stop());
+    let src: MediaStreamAudioSourceNode;
+    try {
+      src = ctx.createMediaStreamSource(stream);
+    } catch {
+      void ctx.close();
+      ctx = new AudioContext();
+      src = ctx.createMediaStreamSource(stream);
+    }
     await ctx.audioWorklet.addModule(captureWorkletUrl);
-    const src = ctx.createMediaStreamSource(stream);
     const node = new AudioWorkletNode(ctx, 'frankenvoice-capture', { processorOptions: { targetRate: r.sampleRate, frameSamples: r.frameSamples } });
     const sinkGain = ctx.createGain();
     sinkGain.gain.value = 0;
@@ -373,8 +382,13 @@ export function setOutputMuted(which: 'agent' | 'mic', on: boolean) {
 }
 
 /** An output context whose audio goes through a gain that follows the mute switch for `which`. */
-function outputContext(which: 'agent' | 'mic') {
-  const ctx = new AudioContext({ latencyHint: 'interactive' });
+function outputContext(which: 'agent' | 'mic', sampleRate?: number) {
+  let ctx: AudioContext;
+  try {
+    ctx = new AudioContext({ latencyHint: 'interactive', sampleRate });
+  } catch {
+    ctx = new AudioContext({ latencyHint: 'interactive' });
+  }
   const gain = ctx.createGain();
   gain.gain.value = muted[which] ? 0 : 1;
   gain.connect(ctx.destination);
@@ -392,29 +406,64 @@ function outputContext(which: 'agent' | 'mic') {
 }
 
 /**
- * Plays the recorded mic while a replay runs in real time, so both sides of the conversation are heard.
- * Frames are queued back to back from a short initial delay; `now` is the replay's session clock.
+ * Plays a stream of PCM chunks. The context runs at the audio's own rate, so no chunk is resampled on
+ * its own (that leaves a click at every chunk edge), and a chunk that continues the previous one starts
+ * exactly where it ended on the audio clock instead of at a time converted from the session clock,
+ * which jitters by a millisecond or so and left tiny gaps and overlaps: a steady crackle.
  */
-export function micMonitor() {
-  const { ctx, out, close } = outputContext('mic');
-  let next = 0;
+function pcmOutput(which: 'agent' | 'mic') {
+  let o: ReturnType<typeof outputContext> | null = null;
+  let next = 0; // audio-clock end of the last chunk
+  let nextAt = NaN; // and its session time, when chunks carry one
+  const playing = new Set<AudioBufferSourceNode>();
+  const stop = () => {
+    for (const src of playing) src.stop();
+    playing.clear();
+    nextAt = NaN;
+  };
   return {
-    play(samples: Float32Array<ArrayBuffer>, sampleRate: number) {
+    /** Play `samples`; at session time `at` (ms, with the session clock `now`), or else right after the previous chunk. */
+    play(samples: Float32Array<ArrayBuffer>, sampleRate: number, at?: number, now?: number) {
       if (outputSuppressed || !samples.length) return;
+      if (!o || o.ctx.sampleRate !== sampleRate) {
+        stop();
+        o?.close();
+        o = outputContext(which, sampleRate);
+      }
+      const { ctx, out } = o;
       const buf = ctx.createBuffer(1, samples.length, sampleRate);
       buf.copyToChannel(samples, 0);
       const src = ctx.createBufferSource();
       src.buffer = buf;
       src.connect(out);
-      src.onended = () => playingSources.delete(src);
+      src.onended = () => {
+        playing.delete(src);
+        playingSources.delete(src);
+      };
+      playing.add(src);
       playingSources.add(src);
-      // Restart the queue after a gap (seek, pause) instead of drifting further behind.
-      if (next < ctx.currentTime || next > ctx.currentTime + 0.5) next = ctx.currentTime + 0.08;
-      src.start(next);
-      next += buf.duration;
+      const live = next >= ctx.currentTime;
+      let t: number;
+      if (at === undefined) t = live && next <= ctx.currentTime + 0.5 ? next : ctx.currentTime + 0.08;
+      else if (live && Math.abs(at - nextAt) < 2) t = next;
+      else t = Math.max(ctx.currentTime, ctx.currentTime + (at - now!) / 1000);
+      src.start(t);
+      next = t + buf.duration;
+      nextAt = at === undefined ? NaN : at + buf.duration * 1000;
     },
-    close,
+    stop,
+    close() {
+      stop();
+      o?.close();
+      o = null;
+    },
   };
+}
+
+/** Plays the recorded mic while a replay runs in real time, so both sides of the conversation are heard. */
+export function micMonitor() {
+  const out = pcmOutput('mic');
+  return { play: (samples: Float32Array<ArrayBuffer>, sampleRate: number) => out.play(samples, sampleRate), close: out.close };
 }
 
 /** Pause or resume every playing output (speaker audio and browser speech). */
@@ -427,34 +476,16 @@ export function setOutputPaused(paused: boolean) {
 }
 
 const speaker: LiveDriver = (_req, sink, env) => {
-  const { ctx, out, close } = outputContext('agent');
-  const playing = new Set<AudioBufferSourceNode>();
-  setTimeout(() => sink.recv({ type: 'ready', sampleRate: ctx.sampleRate, baseLatency: ctx.baseLatency, outputLatency: ctx.outputLatency ?? null }), 0);
+  const out = pcmOutput('agent');
+  setTimeout(() => sink.recv({ type: 'ready' }), 0);
   return {
     send(data, bin) {
       const d = data as { cmd: string; at?: number; sampleRate?: number };
-      if (d.cmd === 'flush') {
-        for (const s of playing) s.stop();
-        playing.clear();
-        return;
-      }
-      if (d.cmd !== 'play' || !bin || outputSuppressed) return;
-      const samples = new Float32Array(bin.slice().buffer);
-      if (!samples.length) return;
-      const buf = ctx.createBuffer(1, samples.length, d.sampleRate!);
-      buf.copyToChannel(samples, 0);
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.connect(out);
-      src.onended = () => {
-        playing.delete(src);
-        playingSources.delete(src);
-      };
-      playing.add(src);
-      playingSources.add(src);
-      src.start(Math.max(ctx.currentTime, ctx.currentTime + (d.at! - env.now()) / 1000));
+      if (d.cmd === 'flush') return out.stop();
+      if (d.cmd !== 'play' || !bin) return;
+      out.play(new Float32Array(bin.slice().buffer), d.sampleRate!, d.at!, env.now());
     },
-    close,
+    close: () => out.close(),
   };
 };
 
