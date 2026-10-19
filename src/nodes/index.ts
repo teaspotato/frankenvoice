@@ -30,7 +30,7 @@ export function migrateGraph(g: GraphSpec): GraphSpec {
   if (g.formatVersion >= GRAPH_FORMAT_VERSION) return g;
   const older = (n: NodeSpec) => {
     if (g.formatVersion < 3) n = noDrafts(n);
-    if (g.formatVersion < 4) n = noThinking(n);
+    if (g.formatVersion < 4) n = format3Turns(noThinking(n));
     if (g.formatVersion < 5) n = noOpener(n);
     else if (g.formatVersion < 7) n = cannedOpener(n);
     if (g.formatVersion < 6) n = oldModelRules(n);
@@ -99,4 +99,7 @@ function fillerStage(g: GraphSpec): GraphSpec {
 /** Before format 6 the turn model's floor takes counted without VAD speech, and silence never committed. */
 const oldModelRules = (n: NodeSpec): NodeSpec =>
   n.type === 'turn.duplex' ? { ...n, params: { modelNeedsVad: false, maxSilenceMs: 0, ...n.params } } : n;
+/** Before format 4, turn-taking committed while the VAD heard speech, and drafts waited for the model's score. */
+const format3Turns = (n: NodeSpec): NodeSpec =>
+  n.type === 'turn.duplex' ? { ...n, params: { rules: 'format 3', draftAt: 0.3, ...n.params } } : n;
 const noDrafts = (n: NodeSpec): NodeSpec => (n.type === 'turn.duplex' && n.params.speculate === undefined ? { ...n, params: { ...n.params, speculate: false } } : n);
