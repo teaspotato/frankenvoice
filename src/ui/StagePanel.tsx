@@ -83,7 +83,7 @@ export function StagePanel({
           );
         })}
       </fieldset>
-      {def.managed && <p className="muted">Browser echo cancellation, noise suppression and gain are set by the Noise / echo stage.</p>}
+      {def.managedNote && <p className="muted">{def.managedNote}</p>}
       {state && (
         <>
           <h4>State</h4>

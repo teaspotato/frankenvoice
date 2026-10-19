@@ -82,20 +82,36 @@ function results(text: string, start: number, isFinal: boolean, speechFinal: boo
 }
 
 const anthropic: LiveDriver = (req, sink) => {
-  const r = req as { messages: { role: string }[] };
-  const reply = `Reply number ${r.messages.length}. This is a second sentence! And a third?`;
+  const r = req as { messages: { role: string; content: { type: string }[] }[]; tools?: { name: string }[] };
+  const tools = new Set((r.tools ?? []).map((x) => x.name));
+  const last = r.messages[r.messages.length - 1];
+  // The conversation delegates on the first user turn; the background agent thinks, then answers.
+  const delegate = tools.has('task_start') && r.messages.length === 1 && last.content[0]?.type === 'text';
+  const agent = tools.has('report_progress');
+  const reply = agent ? 'The answer is 42.' : delegate ? 'Let me look that up.' : `Reply number ${r.messages.length}. This is a second sentence! And a third?`;
   const tokens = reply.match(/\S+\s*/g)!;
   let closed = false;
-  let t = jitter(2, 3);
+  let t = jitter(2, 3) + (agent ? 150 : 0);
   const ev = (e: Json) => {
     t += jitter(0.5, 2);
     later(t, () => !closed && sink.recv(e));
   };
   ev({ type: 'message_start', message: { id: 'msg_fake', role: 'assistant', content: [] } });
-  ev({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-  for (const tok of tokens) ev({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: tok } });
-  ev({ type: 'content_block_stop', index: 0 });
-  ev({ type: 'message_delta', delta: { stop_reason: 'end_turn' } });
+  let i = 0;
+  if (agent) {
+    ev({ type: 'content_block_start', index: i, content_block: { type: 'thinking', thinking: '' } });
+    ev({ type: 'content_block_delta', index: i, delta: { type: 'thinking_delta', thinking: 'Deep thought.' } });
+    ev({ type: 'content_block_stop', index: i++ });
+  }
+  ev({ type: 'content_block_start', index: i, content_block: { type: 'text', text: '' } });
+  for (const tok of tokens) ev({ type: 'content_block_delta', index: i, delta: { type: 'text_delta', text: tok } });
+  ev({ type: 'content_block_stop', index: i++ });
+  if (delegate) {
+    ev({ type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: 'toolu_fake', name: 'task_start', input: {} } });
+    ev({ type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: '{"task":"the question"}' } });
+    ev({ type: 'content_block_stop', index: i++ });
+  }
+  ev({ type: 'message_delta', delta: { stop_reason: delegate ? 'tool_use' : 'end_turn' } });
   ev({ type: 'message_stop' });
   later(t + 1, () => !closed && sink.close());
   return { send() {}, close: () => void (closed = true) };

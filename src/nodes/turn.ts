@@ -109,7 +109,8 @@ export type FloorEvent = 'commit' | 'playback_start' | 'playback_end' | 'user_st
  * emitted as a `turn.transition` message with what triggered it.
  */
 export const FLOOR: Record<FloorState, Partial<Record<FloorEvent, FloorState>>> = {
-  listening: { commit: 'thinking' },
+  // playback_start: the agent speaks unprompted (a background task's result).
+  listening: { commit: 'thinking', playback_start: 'speaking' },
   thinking: { playback_start: 'speaking', user_start: 'thinking+user' },
   // aside: the agent finished the sentence the user spoke over, and stops to take in what they said.
   speaking: { playback_end: 'listening', user_start: 'speaking+user', aside: 'listening' },
@@ -740,7 +741,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             }
           } else if (msg.type === 'playback.interrupted') {
             // What the user heard before we stopped, for the LLM's history.
-            if (last) ctx.emit('turn', { type: 'turn.heard', turnId: last.id, text: (msg.heard as string) ?? '' });
+            if (last) ctx.emit('turn', { type: 'turn.heard', turnId: last.id, ...(msg.rid ? { rid: msg.rid as string } : {}), text: (msg.heard as string) ?? '' });
             if (aside?.cutting) finishAside('aside at sentence end');
           }
           return;

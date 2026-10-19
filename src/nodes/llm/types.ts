@@ -1,9 +1,9 @@
 import type { Json, JsonObject } from '../../core/types';
 
 /**
- * Conversation history kept by the LLM node. `text` is provider-neutral; for
- * assistant turns `native` keeps the provider's own content (e.g. Claude
- * thinking blocks) so the same provider gets it back verbatim.
+ * Conversation history kept by the LLM node. `text` is provider-neutral;
+ * `native` keeps the provider's own content (e.g. Claude thinking and tool_use
+ * blocks, or a user turn's tool_result blocks) so the same provider gets it back verbatim.
  */
 export interface ChatTurn {
   role: 'user' | 'assistant';
@@ -11,6 +11,8 @@ export interface ChatTurn {
   native?: { provider: string; content: Json };
   /** The user turn this belongs to (an assistant turn: the one it answers). */
   turnId?: string;
+  /** The reply this assistant turn is (part of): a reply that called tools spans several turns. */
+  rid?: string;
 }
 
 /** What every provider stream is reduced to. */

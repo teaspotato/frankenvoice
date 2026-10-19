@@ -18,6 +18,7 @@ export const LANES: Lane[] = [
   { id: 'turn', label: 'Turn', height: 52 },
   { id: 'llm', label: 'LLM', height: 60 },
   { id: 'opener', label: 'Opener', height: 28 },
+  { id: 'agent', label: 'Agent', height: 44 },
   { id: 'tts', label: 'TTS', height: 36 },
   { id: 'speaker', label: 'Playback', height: 48 },
 ];
@@ -35,6 +36,8 @@ const LEGEND: Record<string, string> = {
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   opener:
     'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
+  agent:
+    'Background tasks the LLM delegated, one row each. Bar: the task from start to its result (green), error (red) or cancel (grey); darker blocks are its requests, a grey tick where the model started reasoning. Dots: progress notes (amber), side answers (blue); diamonds: steering. On the LLM lane, a purple diamond is a task tool call, and a reply labelled "task news" is one the LLM gave on its own to a result.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
   speaker:
     'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged.',
@@ -753,7 +756,12 @@ export function Dashboard({
         span('llm', ft, end, col.llm, 0.35, stats, 0.06, 0.4);
         hits.pop();
         if (l.thinkingAt !== undefined) vline('llm', l.thinkingAt, col.muted, 0.04, 0.42);
-        hits.push({ lane: 'llm', x0: x(l.t0), x1: x(end), text: `${stats}\n${l.text}`, seqs: l.seqs });
+        if (l.tasks) label('task news', x(l.t0) + 1, x(ft), ly0 + h * 0.23, col.muted);
+        hits.push({ lane: 'llm', x0: x(l.t0), x1: x(end), text: `${l.tasks ? `on its own, for task ${l.tasks.join(', ')} · ` : ''}${stats}\n${l.text}`, seqs: l.seqs });
+        for (const tl of l.tools) {
+          mark('llm', tl.t, col.llm, 0.23, 'diamond', 4);
+          hits.push({ lane: 'llm', x0: x(tl.t) - 5, x1: x(tl.t) + 5, y0: ly0, y1: ly0 + h * 0.44, text: tl.text, seqs: [tl.seq] });
+        }
         let so = '';
         l.chunks.forEach((c, i) => {
           so += c.text;
@@ -779,6 +787,57 @@ export function Dashboard({
             text: `+${(c.t - l.t0).toFixed(0)} ms  ${JSON.stringify(c.text)}\n${so}`,
             seqs: [c.seq],
           });
+        });
+      }
+
+      // Background agent: each task on its own row, its requests inside, notes as marks
+      {
+        const [ly0, ly1] = laneY.agent;
+        const rows = 2;
+        const rh = (ly1 - ly0) / rows;
+        m.tasks.forEach((k, i) => {
+          const end = k.t1 ?? head;
+          if (end < t0 || k.t0 > t1) return;
+          const y0 = ly0 + rh * (i % rows);
+          const x0 = x(k.t0);
+          const x1 = Math.max(x(end), x0 + 2);
+          const c = k.status === 'error' ? col.danger : k.status === 'cancelled' ? col.muted : k.status === 'done' ? col.ok : col.llm;
+          g.globalAlpha = 0.15;
+          g.fillStyle = c;
+          g.fillRect(x0, y0 + rh * 0.12, x1 - x0, rh * 0.76);
+          g.globalAlpha = 0.35;
+          for (const r of k.rounds) g.fillRect(x(r.t0), y0 + rh * 0.12, Math.max(1, x(r.t1 ?? end) - x(r.t0)), rh * 0.76);
+          g.globalAlpha = 1;
+          for (const r of k.rounds) {
+            if (r.thinkingAt !== undefined) {
+              const px = Math.round(x(r.thinkingAt)) + 0.5;
+              g.strokeStyle = col.muted;
+              g.beginPath();
+              g.moveTo(px, y0 + rh * 0.1);
+              g.lineTo(px, y0 + rh * 0.9);
+              g.stroke();
+            }
+          }
+          label(`${k.id}: ${k.result && k.status !== 'running' ? k.result : k.text}`, x0, x1, y0 + rh * 0.5, col.text);
+          const secs = ((end - k.t0) / 1000).toFixed(1);
+          const rounds = k.rounds
+            .map((r) => `#${r.n} ${(((r.t1 ?? end) - r.t0) / 1000).toFixed(1)} s${r.stopReason ? ` ${r.stopReason}` : ''}${r.tools.length ? `\n   ${r.tools.join('\n   ')}` : ''}${r.thinking ? `\n   thinking: ${r.thinking.slice(0, 300)}` : ''}`)
+            .join('\n');
+          hits.push({
+            lane: 'agent',
+            x0,
+            x1,
+            y0,
+            y1: y0 + rh,
+            text: `task ${k.id}, ${k.status}, ${secs} s: ${k.text}${k.result ? `\n→ ${k.result}` : ''}\n${rounds}`,
+            seqs: k.seqs,
+          });
+          for (const mk of k.marks) {
+            const at = (y0 - ly0 + rh / 2) / (ly1 - ly0);
+            const color = mk.kind === 'progress' ? col.warn : mk.kind === 'answer' ? col.accent : col.muted;
+            mark('agent', mk.t, color, at, mk.kind === 'steer' ? 'diamond' : 'dot', 3);
+            hits.push({ lane: 'agent', x0: x(mk.t) - 4, x1: x(mk.t) + 4, y0, y1: y0 + rh, text: `${mk.kind}: ${mk.text}`, seqs: [mk.seq] });
+          }
         });
       }
 

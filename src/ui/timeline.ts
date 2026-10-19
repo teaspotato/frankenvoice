@@ -38,6 +38,33 @@ export interface LlmSpan extends Span {
   headStartMs?: number;
   /** When the model's first reasoning arrived. */
   thinkingAt?: number;
+  /** A reply the model gave on its own, to the background agent's news (these tasks). */
+  tasks?: string[];
+  /** Task tools it called, when. */
+  tools: { t: number; name: string; text: string; seq: number }[];
+}
+
+/** One request of a background task: from sending it to its end, with the tools it used. */
+export interface AgentRound {
+  n: number;
+  t0: number;
+  t1?: number;
+  thinkingAt?: number;
+  text: string;
+  tools: string[];
+  thinking?: string;
+  stopReason?: string;
+}
+
+/** A task the LLM delegated to the background agent, from start to result. */
+export interface AgentTask extends Span {
+  id: string;
+  status: string;
+  /** The text of the result, answer or error. */
+  result?: string;
+  rounds: AgentRound[];
+  /** Progress notes, side answers and steering messages, as they happened. */
+  marks: { t: number; kind: 'progress' | 'answer' | 'steer' | 'cancel'; text: string; seq: number }[];
 }
 
 /** A reply started on the user's words before their turn was committed. */
@@ -113,6 +140,7 @@ export class TimelineModel {
   llm: LlmSpan[] = [];
   drafts: Draft[] = [];
   openers: Opener[] = [];
+  tasks: AgentTask[] = [];
   ttsRequests: { t: number; seq: number }[] = [];
   tts: (Span & { rid: string; seg: number })[] = [];
   playback: (Span & { rid: string; interrupted?: boolean; heard?: string })[] = [];
@@ -350,8 +378,64 @@ export class TimelineModel {
         break;
       }
       case 'llm.start':
-        this.llm.push({ rid: d.rid, t0: e.t, text: '', chunks: [], seqs: [e.seq], ...(typeof d.headStartMs === 'number' ? { headStartMs: d.headStartMs } : {}) });
+        this.llm.push({
+          rid: d.rid,
+          t0: e.t,
+          text: '',
+          chunks: [],
+          tools: [],
+          seqs: [e.seq],
+          ...(typeof d.headStartMs === 'number' ? { headStartMs: d.headStartMs } : {}),
+          ...(Array.isArray(d.tasks) ? { tasks: d.tasks } : {}),
+        });
         break;
+      case 'llm.tool': {
+        const l = this.llm.find((x) => x.rid === d.rid);
+        l?.tools.push({ t: e.t, name: d.name, text: `${d.name}(${JSON.stringify(d.input)})\n→ ${d.result}`, seq: e.seq });
+        l?.seqs.push(e.seq);
+        break;
+      }
+      case 'agent.started':
+        this.tasks.push({ id: d.taskId, t0: e.t, text: d.task ?? '', status: 'running', rounds: [], marks: [], seqs: [e.seq] });
+        break;
+      case 'agent.round':
+      case 'agent.thinking':
+      case 'agent.step':
+      case 'agent.progress':
+      case 'agent.answer':
+      case 'agent.steer':
+      case 'agent.done':
+      case 'agent.error':
+      case 'agent.cancelled': {
+        const k = [...this.tasks].reverse().find((x) => x.id === d.taskId);
+        if (!k) break;
+        k.seqs.push(e.seq);
+        const r = k.rounds[k.rounds.length - 1];
+        if (d.type === 'agent.round') k.rounds.push({ n: d.n, t0: e.t, text: '', tools: [] });
+        else if (d.type === 'agent.thinking' && r) r.thinkingAt ??= e.t;
+        else if (d.type === 'agent.step' && r) {
+          r.t1 = e.t;
+          r.text = d.text ?? '';
+          r.tools = (d.tools ?? []).map((x: { name: string; input: unknown }) => `${x.name} ${JSON.stringify(x.input)}`);
+          r.thinking = d.thinking;
+          r.stopReason = d.stopReason;
+        } else if (d.type === 'agent.progress') k.marks.push({ t: e.t, kind: 'progress', text: d.text ?? '', seq: e.seq });
+        else if (d.type === 'agent.answer') k.marks.push({ t: e.t, kind: 'answer', text: `${d.question}\n→ ${d.text}`, seq: e.seq });
+        else if (d.type === 'agent.steer') {
+          k.marks.push({ t: e.t, kind: 'steer', text: d.text ?? '', seq: e.seq });
+          if (!d.queued) {
+            k.status = 'running';
+            k.t1 = undefined;
+          }
+        } else {
+          k.t1 = e.t;
+          k.status = d.type === 'agent.done' ? 'done' : d.type === 'agent.error' ? 'error' : 'cancelled';
+          k.result = d.text;
+          if (r && r.t1 === undefined) r.t1 = e.t;
+          if (d.type === 'agent.cancelled') k.marks.push({ t: e.t, kind: 'cancel', text: 'cancelled', seq: e.seq });
+        }
+        break;
+      }
       case 'llm.draft':
         this.drafts.push({ rid: d.rid, t0: e.t, text: d.text ?? '', seqs: [e.seq] });
         break;

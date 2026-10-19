@@ -3,6 +3,7 @@ import type { Json, JsonObject, Msg } from '../../core/types';
 import { anthropicAdapter } from './anthropic';
 import { openaiCompatAdapter } from './openai';
 import type { ChatTurn, LlmAdapter, LlmStreamParser } from './types';
+import { DEFAULT_DELEGATE_PROMPT, TASK_TOOLS, taskCalls, taskUpdate, type TaskCall } from './delegate';
 
 const words = (s: string) => s.split(/\s+/).filter(Boolean);
 const norm = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, '');
@@ -21,6 +22,41 @@ export function heardOfReply(heard: string, reply: string): string {
     if (rest.length <= r.length && rest.every((w, j) => norm(w) === r[j])) return rest.join(' ');
   }
   return '';
+}
+
+/**
+ * Cut an assistant reply (possibly several history turns, when it called tools)
+ * down to the `heard` words of its text. Tool calls stay, so their results keep
+ * a call to answer; a turn left with nothing is dropped. Returns the history.
+ */
+export function cutToHeard(history: ChatTurn[], indexes: number[], heard: string): ChatTurn[] {
+  const said = words(heard);
+  let pos = 0;
+  const texts = indexes.map((i) => {
+    const k = Math.min(words(history[i].text).length, said.length - pos);
+    const text = said.slice(pos, pos + k).join(' ');
+    pos += k;
+    return text;
+  });
+  // Marked as cut off where the user stopped hearing it.
+  const last = texts.map((t) => !!t).lastIndexOf(true);
+  if (last >= 0) texts[last] += '—';
+  const out = new Map<number, ChatTurn | null>();
+  indexes.forEach((i, j) => {
+    const t = history[i];
+    const text = texts[j];
+    const calls = Array.isArray(t.native?.content) ? (t.native!.content as JsonObject[]).filter((b) => b?.type === 'tool_use') : [];
+    if (!text && !calls.length) out.set(i, null);
+    else
+      out.set(i, {
+        role: 'assistant',
+        text,
+        turnId: t.turnId,
+        rid: t.rid,
+        ...(calls.length ? { native: { provider: t.native!.provider, content: [...(text ? [{ type: 'text', text }] : []), ...calls] } } : {}),
+      });
+  });
+  return history.flatMap((t, i) => (out.has(i) ? (out.get(i) ? [out.get(i)!] : []) : [t]));
 }
 
 export const llmAdapters: Record<string, LlmAdapter> = {
@@ -59,8 +95,13 @@ export const llmNode: NodeDef = {
   inputs: [
     { name: 'turn', type: 'turn' },
     { name: 'control', type: 'control' },
+    { name: 'agent', type: 'agent', description: "The background agent's progress, answers and results" },
+    { name: 'vad', type: 'vad', description: 'When the user speaks, so task results wait for a pause' },
   ],
-  outputs: [{ name: 'text', type: 'text' }],
+  outputs: [
+    { name: 'text', type: 'text' },
+    { name: 'tasks', type: 'tasks', description: 'task.start / task.send / task.cancel for the background agent' },
+  ],
   params: [
     { key: 'provider', label: 'Provider', type: 'select', options: Object.keys(llmAdapters), default: 'anthropic' },
     {
@@ -93,6 +134,14 @@ export const llmNode: NodeDef = {
     { key: 'fallbacks', label: 'Server-side refusal fallback', type: 'boolean', default: true, when: anthropic },
     { key: 'extraBody', label: 'Extra request body (JSON)', type: 'text', default: '', when: openai, description: 'Merged into the request, e.g. {"temperature":0.7}' },
     { key: 'system', label: 'System prompt', type: 'text', default: DEFAULT_SYSTEM },
+    {
+      key: 'delegate',
+      label: 'Delegation',
+      type: 'text',
+      default: null,
+      description:
+        'Set by the Background agent stage: {prompt, progress, quietMs}. With it, the model gets the task tools and the agent\'s updates (Anthropic only).',
+    },
   ],
   channels: [
     { name: 'anthropic', description: 'Messages API stream (raw SDK stream events)' },
@@ -103,6 +152,24 @@ export const llmNode: NodeDef = {
     const p = ctx.params as JsonObject;
     const adapter = llmAdapters[p.provider as string];
     const reqParams: JsonObject = { ...p, model: (p.model as string) || adapter?.defaultModel || '' };
+    // Delegation: the task tools, and how the agent's updates come back.
+    const delegation = p.delegate && typeof p.delegate === 'object' && adapter?.provider === 'anthropic' ? (p.delegate as JsonObject) : null;
+    if (p.delegate && !delegation) ctx.log('warn', 'delegation needs the Anthropic provider: the task tools are off');
+    if (delegation) {
+      reqParams.tools = TASK_TOOLS;
+      reqParams.system = `${String(p.system ?? '')}\n\n${String(delegation.prompt ?? DEFAULT_DELEGATE_PROMPT)}`.trim();
+    }
+    const progressPolicy = String(delegation?.progress ?? 'context');
+    const quietMs = Number(delegation?.quietMs ?? 800);
+    const maxToolRounds = 4;
+    const tasks = new Map<string, string>();
+    let taskNo = 0;
+    /** Task updates not yet in the history; `speak`: one of them wants a reply of its own. */
+    let notes: { turns: ChatTurn[]; tasks: string[]; speak: boolean } = { turns: [], tasks: [], speak: false };
+    let floor = 'listening';
+    let userSpeaking = false;
+    let lastSpeech = -Infinity;
+    let deliverTimer: { clear(): void } | undefined;
     const history: ChatTurn[] = [];
     let n = 0;
     type Io = ReturnType<typeof ctx.io.open>;
@@ -126,6 +193,9 @@ export const llmNode: NodeDef = {
       stopReason: string | null;
       /** llm.thinking was emitted for this reply. */
       thinking?: boolean;
+      /** Text of the current request (a reply that calls tools makes several). */
+      round: string;
+      rounds: number;
     }
     let active: Reply | undefined;
     let draft: Reply | undefined;
@@ -136,13 +206,82 @@ export const llmNode: NodeDef = {
       active = undefined;
       if (a.io && !a.io.closed) a.io.close({ status });
       // Keep whatever the model produced, so the next request continues from it.
-      const native = a.parser ? a.parser.native() : null;
-      if (a.text || native)
-        history.push({ role: 'assistant', text: a.text, turnId: a.turnId, ...(native ? { native: { provider: adapter.provider, content: native } } : {}) });
+      // Tool calls that were never run (cut off, or past the round limit) are left out: they have no results.
+      let native = a.parser ? a.parser.native() : null;
+      if (Array.isArray(native)) native = (native as JsonObject[]).filter((b) => b?.type !== 'tool_use');
+      if (Array.isArray(native) && !native.length) native = null;
+      if (a.round || native)
+        history.push({ role: 'assistant', text: a.round, turnId: a.turnId, rid: a.rid, ...(native ? { native: { provider: adapter.provider, content: native } } : {}) });
       ctx.emit('text', { type: 'llm.end', rid: a.rid, status, stopReason: a.stopReason, text: a.text, ...(error ? { error } : {}) });
       ctx.setState('status', status === 'error' ? 'error' : 'idle');
       ctx.setState('turns', history.length);
       if (error) ctx.log('error', 'LLM request failed', error);
+      deliver();
+    };
+
+    /** Run a reply's task tool calls: each is answered at once, the agent does the work. */
+    const runTool = (r: Reply, c: TaskCall): JsonObject => {
+      const result = (content: string, isError = false): JsonObject => ({ type: 'tool_result', tool_use_id: c.id, content, ...(isError ? { is_error: true } : {}) });
+      const id = String(c.input.task_id ?? '');
+      let out: JsonObject;
+      if (c.name === 'task_start') {
+        const taskId = `t${++taskNo}`;
+        tasks.set(taskId, 'running');
+        ctx.emit('tasks', { type: 'task.start', taskId, task: String(c.input.task ?? ''), rid: r.rid });
+        out = result(`Started task ${taskId}. Its result will come as a task_update; keep talking with the user meanwhile.`);
+      } else if ((c.name === 'task_send' || c.name === 'task_cancel') && !tasks.has(id)) out = result(`There is no task "${id}".`, true);
+      else if (c.name === 'task_send') {
+        const mode = c.input.mode === 'ask' ? 'ask' : 'steer';
+        if (mode === 'steer') tasks.set(id, 'running');
+        ctx.emit('tasks', { type: 'task.send', taskId: id, message: String(c.input.message ?? ''), mode, rid: r.rid });
+        out = result(mode === 'ask' ? 'Asked. The answer will come as a task_update.' : tasks.get(id) === 'done' ? 'Sent: the task picks up again with it.' : 'Sent to the task.');
+      } else if (c.name === 'task_cancel') {
+        tasks.set(id, 'cancelled');
+        ctx.emit('tasks', { type: 'task.cancel', taskId: id, rid: r.rid });
+        out = result('Cancelled.');
+      } else out = result(`Unknown tool "${c.name}".`, true);
+      ctx.emit('text', { type: 'llm.tool', rid: r.rid, name: c.name, input: c.input, result: out.content as string, ...(out.is_error ? { error: true } : {}) });
+      return out;
+    };
+    /** The reply stopped to call tools: run them and continue it with their results. */
+    const toolRound = (r: Reply): boolean => {
+      const native = r.parser?.native() ?? null;
+      const calls = taskCalls(native);
+      if (!delegation || !calls.length || r.rounds >= maxToolRounds) return false;
+      r.rounds++;
+      if (r.io && !r.io.closed) r.io.close({ status: 'done' });
+      history.push({ role: 'assistant', text: r.round, turnId: r.turnId, rid: r.rid, native: { provider: adapter.provider, content: native } });
+      const results = calls.map((c) => runTool(r, c));
+      history.push({ role: 'user', text: '', native: { provider: adapter.provider, content: results } });
+      ctx.setState('turns', history.length);
+      r.round = '';
+      r.thinking = false;
+      send(r, [...history]);
+      return true;
+    };
+
+    /** Is the conversation free for the agent's news: no reply, no draft, the user quiet for a moment? */
+    const deliver = () => {
+      deliverTimer?.clear();
+      deliverTimer = undefined;
+      if (!notes.speak || active || draft || floor !== 'listening' || userSpeaking || !adapter || !reqParams.model) return;
+      const wait = lastSpeech + quietMs - ctx.now();
+      if (wait > 0) return void (deliverTimer = ctx.setTimer(wait, deliver, 'task-update'));
+      const n = notes;
+      notes = { turns: [], tasks: [], speak: false };
+      history.push(...n.turns);
+      const r = reply(n.turns[n.turns.length - 1], {});
+      ctx.emit('text', { type: 'llm.start', rid: r.rid, turnId: null, tasks: n.tasks });
+      ctx.setState('status', 'generating');
+      active = r;
+      r.live = true;
+      send(r, [...history]);
+    };
+    /** Updates the model hasn't seen go into the history ahead of the user's turn. */
+    const flushNotes = () => {
+      if (!notes.turns.length) return;
+      history.push(...notes.turns);
+      notes = { turns: [], tasks: [], speak: false };
     };
 
     const handle = (events: Events) => {
@@ -150,9 +289,11 @@ export const llmNode: NodeDef = {
         if (!active) return;
         if (ev.type === 'delta') {
           active.text += ev.text;
+          active.round += ev.text;
           ctx.emit('text', { type: 'llm.delta', rid: active.rid, text: ev.text });
         } else if (ev.type === 'end') {
           active.stopReason = ev.stopReason;
+          if (ev.stopReason === 'tool_use' && toolRound(active)) return;
           finish('done');
         } else if (ev.type === 'error') finish('error', ev.error);
         else if (ev.type === 'thinking' && !active.thinking) {
@@ -170,25 +311,31 @@ export const llmNode: NodeDef = {
 
     /** Send the request for `r`. */
     const launch = (r: Reply, turns: ChatTurn[]) => {
+      send(r, turns);
+    };
+    /** Send one request for `r` and route its stream to it. */
+    const send = (r: Reply, turns: ChatTurn[], params: JsonObject = reqParams): boolean => {
       let request: Json;
       try {
-        request = adapter.buildRequest(turns, reqParams);
+        request = adapter.buildRequest(turns, params);
       } catch (e) {
         ctx.log('error', `could not build request: ${String(e)}`);
         if (r === draft) draft = undefined;
         else if (r === active) finish('error', String(e));
-        return;
+        return false;
       }
       const parser = adapter.parser();
+      // Only the reply's current request counts: an earlier one (before its tool results) may still close.
+      r.parser = parser;
       r.io = ctx.io.open(adapter.channel, request, {
         onRecv(data) {
-          route(r, parser.recv(data));
+          if (r.parser === parser) route(r, parser.recv(data));
         },
         onClose(data) {
-          route(r, parser.close(data));
+          if (r.parser === parser) route(r, parser.close(data));
         },
       });
-      r.parser = parser;
+      return true;
     };
     const route = (r: Reply, events: Events) => {
       if (r === active) handle(events);
@@ -203,7 +350,18 @@ export const llmNode: NodeDef = {
       ctx.emit('text', { type: 'llm.draft_end', rid: d.rid, draftId: d.draftId!, status: 'dropped', why, chunks: tokens });
       ctx.log('debug', 'draft dropped', { draftId: d.draftId!, why, chunks: tokens });
     };
-    const reply = (user: ChatTurn, extra: Partial<Reply>): Reply => ({ rid: `${ctx.id}-r${n++}`, user, t0: ctx.now(), live: false, held: [], text: '', stopReason: null, ...extra });
+    const reply = (user: ChatTurn, extra: Partial<Reply>): Reply => ({
+      rid: `${ctx.id}-r${n++}`,
+      user,
+      t0: ctx.now(),
+      live: false,
+      held: [],
+      text: '',
+      round: '',
+      rounds: 0,
+      stopReason: null,
+      ...extra,
+    });
     const startDraft = (msg: Msg) => {
       dropDraft('redrafted');
       const user: ChatTurn = { role: 'user', text: msg.text as string };
@@ -218,6 +376,32 @@ export const llmNode: NodeDef = {
 
     return {
       onInput(port, msg) {
+        if (port === 'vad') {
+          if (msg.type === 'vad.speech_start') userSpeaking = true;
+          else if (msg.type === 'vad.speech_end') {
+            userSpeaking = false;
+            lastSpeech = ctx.now();
+          } else return;
+          deliver();
+          return;
+        }
+        if (port === 'agent') {
+          const kind = { 'agent.done': 'result', 'agent.answer': 'answer', 'agent.error': 'error', 'agent.progress': 'progress' }[msg.type];
+          const taskId = msg.taskId as string;
+          if (msg.type === 'agent.done' || msg.type === 'agent.error') tasks.set(taskId, 'done');
+          if (!kind || !delegation || tasks.get(taskId) === 'cancelled') return;
+          if (kind === 'progress' && progressPolicy === 'off') return;
+          notes.turns.push({ role: 'user', text: taskUpdate({ ...(msg as JsonObject), kind }) });
+          if (!notes.tasks.includes(taskId)) notes.tasks.push(taskId);
+          if (kind !== 'progress' || progressPolicy === 'speak') notes.speak = true;
+          deliver();
+          return;
+        }
+        if (msg.type === 'turn.transition') {
+          floor = String(msg.to);
+          deliver();
+          return;
+        }
         if (port === 'control') {
           if (msg.type === 'cancel') {
             dropDraft('cancelled');
@@ -235,12 +419,18 @@ export const llmNode: NodeDef = {
         }
         if (msg.type === 'turn.heard') {
           // The user cut the reply off: keep only what they heard, marked as cut off.
-          const i = history.findIndex((t) => t.role === 'assistant' && t.turnId === msg.turnId);
-          if (i < 0) return;
+          // By the reply when known (it may span tool calls, or answer no user turn), else the first answer to the turn.
+          const first = history.findIndex((t) => t.role === 'assistant' && t.turnId === msg.turnId);
+          const at = msg.rid
+            ? history.flatMap((t, i) => (t.role === 'assistant' && t.rid === msg.rid ? [i] : []))
+            : first >= 0
+              ? [first]
+              : [];
+          if (!at.length) return;
           // Anything said before the reply's own words (an opener the model never knew of) is not part of it.
-          const heard = heardOfReply(((msg.text as string) ?? '').trim(), history[i].text);
-          if (!heard) history.splice(i, 1);
-          else history[i] = { role: 'assistant', text: `${heard}—`, turnId: history[i].turnId };
+          const heard = heardOfReply(((msg.text as string) ?? '').trim(), at.map((i) => history[i].text).join(' '));
+          const cut = cutToHeard(history, at, heard);
+          history.splice(0, history.length, ...cut);
           ctx.setState('turns', history.length);
           ctx.log('info', heard ? 'reply truncated to what was heard' : 'reply dropped: nothing was heard', { turnId: msg.turnId as string, heard });
           return;
@@ -251,14 +441,17 @@ export const llmNode: NodeDef = {
           return;
         }
         finish('cancelled');
-        const kept = msg.draft && draft?.draftId === msg.draft ? draft : undefined;
-        if (!kept) dropDraft('turn committed without it');
+        // A draft went out without a task result that has come in since: the turn is sent again with it.
+        const kept = msg.draft && draft?.draftId === msg.draft && !notes.speak ? draft : undefined;
+        if (!kept) dropDraft(notes.speak && msg.draft ? 'a task result came in' : 'turn committed without it');
         if (msg.replaces) {
           // The user wasn't done: this turn replaces an earlier one and whatever followed it.
           const i = history.findIndex((t) => t.role === 'user' && t.turnId === msg.replaces);
           if (i >= 0) history.splice(i);
         }
         const turnId = msg.turnId as string;
+        // A kept draft's request went out without the agent's progress notes: those wait for the next request.
+        if (!kept) flushNotes();
         if (kept) {
           // The draft's words stand: keep its reply. The history records what the request said.
           draft = undefined;
@@ -284,6 +477,7 @@ export const llmNode: NodeDef = {
         launch(r, [...history]);
       },
       stop() {
+        deliverTimer?.clear();
         dropDraft('stopped');
         finish('cancelled');
       },
