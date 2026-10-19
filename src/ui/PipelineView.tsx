@@ -20,17 +20,18 @@ const POS: Record<StageId, [number, number]> = {
   turnmodel: [410, 88],
   asr: [410, 166],
   turn: [610, 88],
+  backchannel: [810, 206],
   llm: [810, 88],
   opener: [1010, 88],
-  workers: [810, 300],
+  workers: [1010, 330],
   tts: [1210, 88],
   speaker: [1410, 88],
 };
 const VIEW_W = 1570;
-const VIEW_H = 380;
+const VIEW_H = 410;
 const FEEDBACK_Y = 60;
 /** The echo reference runs under everything, below ASR. */
-const REFERENCE_Y = 250;
+const REFERENCE_Y = 300;
 /** Barge-in cancels run between the row and the echo reference. */
 const CONTROL_Y = 190;
 
@@ -104,14 +105,17 @@ export function PipelineView({
     // The opener watches the LLM's stream and adds its own lines to what TTS says.
     link('llm.text', right('llm'), left('opener'), 'text'),
     link('opener.text', right('opener'), left('tts'), 'text'),
+    // Backchannels hear the user (speech, words, turn model) through turn-taking's view of the floor.
+    ...(stages.some((s) => s.id === 'backchannel') ? [link('turn.turn', right('turn'), left('backchannel'), 'floor'), link('backchannel.text', right('backchannel'), left('tts'), 'lines')] : []),
     ...(out === 'speaker' ? [link('tts.audio', right('tts'), left('speaker'), 'audio')] : []),
   ];
-  // Delegation: tasks down to the workers under the LLM, their news back up.
+  // Delegation: tasks out of the LLM's right side, down the gap beside the opener to the workers, and their news back.
   {
-    const [lx, ly] = [POS.llm[0] + W / 2, POS.llm[1] + H];
-    const ay = POS.workers[1];
-    edges.push({ src: 'llm.workers', d: `M${lx - 30},${ly} L${lx - 30},${ay - 2}`, label: 'tasks', lx: lx - 50, ly: ay - 10 });
-    edges.push({ src: 'workers.updates', d: `M${lx + 30},${ay} L${lx + 30},${ly + 2}`, label: 'results', lx: lx + 55, ly: ay - 10 });
+    const [rx, ry] = [POS.llm[0] + W, POS.llm[1] + H / 2];
+    const [wx, wy] = POS.workers;
+    const gap = (POS.opener[0] - rx) / 2;
+    edges.push({ src: 'llm.workers', d: `M${rx},${ry - 8} L${rx + gap + 8},${ry - 8} L${rx + gap + 8},${wy + H * 0.35} L${wx - 2},${wy + H * 0.35}`, label: 'tasks', lx: rx + gap + 30, ly: wy - 60 });
+    edges.push({ src: 'workers.updates', d: `M${wx},${wy + H * 0.7} L${rx + gap - 8},${wy + H * 0.7} L${rx + gap - 8},${ry + 8} L${rx + 2},${ry + 8}`, label: 'results', lx: rx + gap - 44, ly: wy - 60 });
   }
   // Playback feedback: up from the output stage, back over the row, down into turn-taking.
   const [ox, oy] = [POS[out][0] + W / 2, POS[out][1]];

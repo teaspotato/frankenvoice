@@ -1,5 +1,6 @@
 import type { NodeDef } from '../../core/node';
 import type { Json, JsonObject, Msg } from '../../core/types';
+import { addTail } from './tail';
 
 interface StreamParams {
   model: string;
@@ -94,10 +95,19 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
       };
     };
 
-    /** Synthesize each line once on its own socket; the audio is kept for when the line is said. */
+    /**
+     * Synthesize each line once, ahead; the audio is kept for when the line is said. Deepgram limits
+     * flushes per connection, so a long list is split over several sockets.
+     */
     const prerender = (lines: string[]) => {
-      const todo = lines.filter((l) => !canned.has(l));
-      if (!todo.length) return;
+      const todo = [...new Set(lines)].filter((l) => !canned.has(l));
+      const per = Math.max(1, p.maxFlushesPerMin);
+      for (let i = 0; i < todo.length; i += per) renderBatch(todo.slice(i, i + per));
+    };
+
+    /** Lines already re-sent once after their socket closed early. */
+    const retried = new Set<string>();
+    const renderBatch = (todo: string[]) => {
       const queue = [...todo];
       let chunks: Float32Array[] = [];
       const decode = decoder();
@@ -111,16 +121,24 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
             const line = queue.shift();
             if (line) canned.set(line, chunks);
             chunks = [];
+            ctx.setState('canned', canned.size);
             if (!queue.length && !io.closed) {
               io.send({ type: 'Close' });
               io.close();
-              ctx.setState('canned', canned.size);
             }
+          },
+          onClose(err) {
+            // Closed before every line came back: try those once more.
+            const left = queue.filter((l) => !retried.has(l));
+            queue.length = 0;
+            if (!left.length) return;
+            ctx.log('warn', 'canned lines not rendered; retrying', { lines: left, error: (err ?? null) as Json });
+            for (const l of left) retried.add(l);
+            renderBatch(left);
           },
         },
       );
       for (const line of todo) {
-        flushes.push(ctx.now());
         io.send({ type: 'Speak', text: line });
         io.send({ type: 'Flush' });
       }
@@ -182,6 +200,25 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
       for (const a of audio) emitAudio(r, s, a);
       ctx.emit('audio', { type: 'tts.segment_end', rid: r.rid, seg: s.seg, canned: true });
       return true;
+    };
+
+    /** A backchannel: a rendered line played as a cue, outside any reply. */
+    const playCue = (id: string, text: string, tailMs: number) => {
+      const audio = canned.get(text);
+      if (!audio) return void ctx.log('warn', `backchannel "${text}" isn't rendered yet`);
+      // One chunk, so it plays as one piece.
+      let samples = new Float32Array(audio.reduce((n, a) => n + a.length, 0));
+      let o = 0;
+      for (const a of audio) {
+        samples.set(a, o);
+        o += a.length;
+      }
+      if (tailMs > 0 && samples.length) samples = addTail(samples, p.sampleRate, tailMs);
+      if (samples.length) {
+        const ref = ctx.media.append('audio', samples, p.sampleRate);
+        ctx.emit('audio', { type: 'audio', ...ref, sampleRate: p.sampleRate, samples, rid: id, cue: true });
+      }
+      ctx.emit('audio', { type: 'tts.cue_end', rid: id, text });
     };
 
     const start = (rid: string) => {
@@ -252,7 +289,12 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
             start(msg.rid as string);
             break;
           case 'opener.lines':
+          case 'bc.lines':
             prerender(msg.lines as string[]);
+            break;
+          case 'bc.say':
+            // The take, or else the line itself if that take never rendered.
+            playCue(msg.id as string, (canned.has(msg.take as string) ? msg.take : msg.line) as string, Number(msg.tailMs ?? 0));
             break;
           case 'opener.say':
           case 'llm.delta': {

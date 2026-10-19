@@ -2,6 +2,8 @@ import type { IOHandle, NodeDef } from '../core/node';
 import type { Json, Msg } from '../core/types';
 import { isAudioMsg } from '../core/types';
 import { bytesFromF32, Framer, PlayedTrack } from './audio';
+import { BcHead, type BcWeights } from './bc-head';
+import bcWeights from './bc-head.json';
 
 /** The model's block: 80 ms at 16 kHz. */
 const BLOCK = 1280;
@@ -65,6 +67,8 @@ interface TurnModelParams {
   intThreshold: number;
   refractoryMs: number;
   eotRecommitMs: number;
+  bcThreshold: number;
+  bcGapMs: number;
 }
 
 interface Frame {
@@ -72,6 +76,8 @@ interface Frame {
   eot: number[];
   int: number[];
   silent: number[];
+  /** Per speaker, the head's frame classes (sessions recorded before backchannels lack it). */
+  fine?: number[][];
 }
 
 const r4 = (v: number) => Math.round(v * 1e4) / 1e4;
@@ -119,6 +125,14 @@ export const turnModelNode: NodeDef<TurnModelParams> = {
     { key: 'intThreshold', label: 'Take-the-floor threshold', type: 'number', default: 0.18, description: 'TurnBench dev operating point.' },
     { key: 'refractoryMs', label: 'Refractory (ms)', type: 'number', default: 500, description: 'Minimum time between two events of the same kind.' },
     { key: 'eotRecommitMs', label: 'End-of-turn re-commit (ms)', type: 'number', default: 1000, description: 'Fire end of turn again once if the score stays high this long (0 = off).' },
+    {
+      key: 'bcThreshold',
+      label: 'Backchannel threshold',
+      type: 'number',
+      default: 0.4,
+      description: "Backchannel head (a small MLP on this model's outputs): fire when the agent could say mm-hmm. TurnBench dev operating point.",
+    },
+    { key: 'bcGapMs', label: 'Backchannel refractory (ms)', type: 'number', default: 1000, description: 'Minimum time between two backchannel events.' },
   ],
   channels: [{ name: 'turn-model', description: '80 ms stereo blocks (user, agent) in, per-frame scores out' }],
   create(ctx) {
@@ -138,11 +152,16 @@ export const turnModelNode: NodeDef<TurnModelParams> = {
       int: new Committer(refr),
     }));
 
+    const bcHead = new BcHead(bcWeights as BcWeights);
+    const bcCommit = new Committer(Math.max(1, Math.round(p.bcGapMs / (1000 / FPS))));
     const onFrames = (outs: Frame[]) => {
       for (const o of outs) {
         // Frame t has heard the audio up to the end of block t - 1.
         const at = base + BLOCK * o.t;
-        ctx.emit('scores', { type: 'turnmodel.frame', track, at, eot: o.eot.map(r4), int: o.int.map(r4), silent: o.silent.map(r4) });
+        const bc = o.fine ? r4(bcHead.step({ eot: o.eot, int: o.int, silent: o.silent, fine: o.fine })) : undefined;
+        ctx.emit('scores', { type: 'turnmodel.frame', track, at, eot: o.eot.map(r4), int: o.int.map(r4), silent: o.silent.map(r4), ...(bc !== undefined ? { bc } : {}) });
+        // The agent could backchannel the user here.
+        if (bc !== undefined && bcCommit.step(o.t, bc, p.bcThreshold)) ctx.emit('scores', { type: 'turnmodel.bc', who: 'agent', track, at, p: bc });
         WHO.forEach((who, c) => {
           for (const kind of ['eot', 'int'] as const) {
             const ev = commit[c][kind].step(o.t, o[kind][c], kind === 'eot' ? p.eotThreshold : p.intThreshold);
