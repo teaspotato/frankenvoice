@@ -265,9 +265,9 @@ describe('heardText', () => {
 
 describe('speech over the agent, classified by its words', () => {
   const sr = 16;
-  /** The agent is mid-reply: sentences start at 1500, 4000 and 7000 ms. */
-  function speaking() {
-    const h = harness({ overlap: 'classify' });
+  /** The agent is mid-reply: sentences start at 1500, 4000 and 7000 ms. Cut off at the first sound unless `holdAfterMs` says otherwise. */
+  function speaking(params: Record<string, unknown> = { holdAfterMs: 0 }) {
+    const h = harness({ overlap: 'classify', ...params });
     h.user(1000, 'tell me about Tokyo');
     h.send(1500, 'playback', { type: 'playback.start', rid: 'r0' });
     for (const [seg, at] of [1500, 4000, 7000].entries()) h.send(1500, 'playback', { type: 'playback.segment', rid: 'r0', seg, at });
@@ -292,6 +292,31 @@ describe('speech over the agent, classified by its words', () => {
     expect(h.states().at(-1)).toBe('speaking');
     h.advance(9000);
     expect(h.last('turn.user')?.text).toBe('tell me about Tokyo');
+  });
+
+  it('by default talks on until the user has spoken over it for a second', () => {
+    const h = speaking({});
+    over(h, 2000, 2400, 'Yeah.');
+    expect(h.decisions()).toEqual(['candidate', 'backchannel']);
+    expect(controls(h)).toEqual([]);
+    h.send(5000, 'vad', { type: 'vad.speech_start', at: 5000 * sr });
+    h.advance(5990);
+    expect(controls(h)).toEqual([]);
+    h.advance(6000);
+    expect(controls(h)).toEqual(['pause']);
+  });
+
+  it('counts the second from the start of the speech when it goes on after a short gap', () => {
+    const h = speaking({});
+    h.send(2000, 'vad', { type: 'vad.speech_start', at: 2000 * sr });
+    h.send(2300, 'vad', { type: 'vad.speech_end', at: 2300 * sr });
+    h.advance(2500);
+    expect(controls(h)).toEqual([]);
+    h.send(2600, 'vad', { type: 'vad.speech_start', at: 2600 * sr });
+    h.advance(2990);
+    expect(controls(h)).toEqual([]);
+    h.advance(3000);
+    expect(controls(h)).toEqual(['pause']);
   });
 
   it('calls speech with no words noise', () => {
@@ -404,8 +429,8 @@ describe('speech over the agent, classified by its words', () => {
   });
 
   it('ducks instead with onset: duck, and talks on with onset: none', () => {
-    const d = harness({ overlap: 'classify', onset: 'duck' });
-    const n = harness({ overlap: 'classify', onset: 'none' });
+    const d = harness({ overlap: 'classify', onset: 'duck', holdAfterMs: 0 });
+    const n = harness({ overlap: 'classify', onset: 'none', holdAfterMs: 0 });
     for (const h of [d, n]) {
       h.user(1000, 'tell me about Tokyo');
       h.send(1500, 'playback', { type: 'playback.start', rid: 'r0' });

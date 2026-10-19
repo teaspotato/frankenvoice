@@ -96,6 +96,7 @@ interface DuplexParams {
   maxSilenceMs: number;
   overlap: string;
   onset: string;
+  holdAfterMs: number;
   duckDb: number;
   floorWords: string;
   asides: boolean;
@@ -136,6 +137,8 @@ type Candidate = {
   endAt?: number;
   wait?: TimerHandle;
   check?: () => void;
+  /** Cuts the agent off (or ducks it) once the speech has gone on for `holdAfterMs`. */
+  holdTimer?: TimerHandle;
 };
 
 /** How long before the VAD's speech end a held end of turn still counts (the VAD's hangover and some). */
@@ -168,10 +171,11 @@ export const draftKey = (s: string) =>
  * Every barge-in decision is also emitted as a `turn.decision` message
  * (candidate, backchannel, noise, aside, interrupt, continue) so the timeline can show it.
  *
- * Speech over the agent, `overlap: classify` (the default): the agent is cut
- * off at once (`onset: cut`, a pause the speaker can resume from), so an
- * interruption lands, while the words come in (`duck` plays it `duckDb`
- * quieter instead; `none` lets it talk on). The reply is cancelled on a
+ * Speech over the agent, `overlap: classify` (the default): once the VAD has
+ * heard `holdAfterMs` of it the agent is cut off (`onset: cut`, a pause the
+ * speaker can resume from), so an interruption lands, while the words come in
+ * (`duck` plays it `duckDb` quieter instead; `none` lets it talk on). Shorter
+ * speech never stops it unless its words do. The reply is cancelled on a
  * floor-taking opener ("wait", "so", "actually"…), on speech longer than
  * `maxBackchannelMs`, or on the model's take-the-floor. When the speech ends,
  * its words decide: nothing (noise) or only backchannel words are dropped and
@@ -308,6 +312,15 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       when: { bargeIn: [true], overlap: ['classify'] },
     },
     {
+      key: 'holdAfterMs',
+      label: 'Cut after (ms)',
+      type: 'number',
+      default: 1000,
+      description:
+        'How long the VAD must hear the user over the agent before it is cut off (or ducked). Shorter speech, a cough or a backchannel, leaves it talking; a floor-taking opener still stops it at once. 0: at the first sound.',
+      when: { bargeIn: [true], overlap: ['classify'], onset: ['cut', 'duck'] },
+    },
+    {
       key: 'duckDb',
       label: 'Duck the agent by (dB)',
       type: 'number',
@@ -413,6 +426,22 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       else if (p.onset === 'duck' && p.duckDb > 0) ctx.emit('control', { type: 'duck', db: p.duckDb });
       else return;
       held = true;
+    };
+    /** Hold once the user's speech `c` has gone on for `holdAfterMs`. */
+    const holdWhenSustained = (c: Candidate) => {
+      c.holdTimer?.clear();
+      c.holdTimer = undefined;
+      if (held || !classifies() || c.ended !== undefined) return;
+      const left = p.holdAfterMs - (ctx.now() - c.since);
+      if (left <= 0) return hold();
+      c.holdTimer = ctx.setTimer(
+        left,
+        () => {
+          c.holdTimer = undefined;
+          if (candidate === c && c.ended === undefined && classifies()) hold();
+        },
+        'hold',
+      );
     };
     const release = () => {
       if (!held) return;
@@ -676,7 +705,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         // Still a backchannel: look again when it would be too long for one.
         if (candidate === c) c.timer = ctx.setTimer(Math.max(1, p.maxBackchannelMs - (ctx.now() - c.since)), check, 'barge-in');
       };
-      if (classifies()) hold();
+      holdWhenSustained(c);
       c.check = check;
       c.timer = ctx.setTimer(classifies() || modelDecides() ? p.maxBackchannelMs : p.minSpeechMs, check, 'barge-in');
       return c;
@@ -723,7 +752,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         if (msg.type === 'playback.start') {
           go('playback_start', 'playback started');
           // They started talking while it was thinking: don't talk over them while their words are judged.
-          if (candidate && classifies()) hold();
+          if (candidate) holdWhenSustained(candidate);
         } else if (msg.type === 'playback.segment') {
           if (msg.rid !== segRid) {
             segRid = (msg.rid as string) ?? null;
@@ -775,6 +804,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             c.ended = undefined;
             c.wait?.clear();
             c.timer?.clear();
+            holdWhenSustained(c);
             if (c.check) c.timer = ctx.setTimer(Math.max(1, p.maxBackchannelMs - (ctx.now() - c.since)), c.check, 'barge-in');
           } else if (eotWait) {
             // They went on after the model called the end of their turn: wait for the next one.
@@ -795,6 +825,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             const c = candidate;
             c.ended = ctx.now();
             c.endAt = msg.at as number;
+            c.holdTimer?.clear();
             c.wait?.clear();
             c.wait = ctx.setTimer(p.classifyWaitMs, () => classify(c, 'no ASR final in time'), 'classify');
           } else if (candidate) {
