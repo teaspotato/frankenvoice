@@ -441,3 +441,74 @@ describe('speech over the agent, classified by its words', () => {
     expect(n.decisions()).toEqual(['candidate', 'backchannel']);
   });
 });
+
+describe('backing off after repeated interruptions', () => {
+  const sr = 16;
+  /** Two replies in a row cut off by the user; the second interruption is still going on at 3900. */
+  function competing() {
+    const h = harness({ overlap: 'classify', holdAfterMs: 0 });
+    h.user(1000, 'tell me about Tokyo');
+    h.send(1500, 'playback', { type: 'playback.start', rid: 'r0' });
+    h.send(2000, 'vad', { type: 'vad.speech_start', at: 2000 * sr });
+    h.send(2300, 'transcript', { type: 'asr.partial', text: 'wait', start: 2000 * sr, end: 2300 * sr });
+    h.send(2600, 'vad', { type: 'vad.speech_end', at: 2600 * sr });
+    h.send(2700, 'transcript', { type: 'asr.final', text: 'wait what about Kyoto', start: 2000 * sr, end: 2600 * sr, speechFinal: true });
+    expect(h.last('turn.user')?.text).toBe('wait what about Kyoto');
+    h.send(3000, 'playback', { type: 'playback.start', rid: 'r1' });
+    h.send(3500, 'vad', { type: 'vad.speech_start', at: 3500 * sr });
+    h.send(3700, 'transcript', { type: 'asr.partial', text: 'no', start: 3500 * sr, end: 3700 * sr });
+    expect(h.decisions().slice(-2)).toEqual(['interrupt', 'backoff']);
+    return h;
+  }
+  const said = (h: ReturnType<typeof harness>) => h.out.filter((o) => o.port === 'text' && o.msg.type === 'bc.say').map((o) => o.msg.line);
+
+  it('renders its lines ahead', () => {
+    const h = harness();
+    expect(h.out.find((o) => o.msg.type === 'bc.lines')?.msg.lines).toContain('You go first.');
+  });
+
+  it('says "you go first" at the pause and waits out an incoherent fragment until the silence', () => {
+    const h = competing();
+    expect(said(h)).toEqual([]); // not over the user
+    h.send(3900, 'vad', { type: 'vad.speech_end', at: 3900 * sr });
+    expect(said(h)).toEqual(['You go first.']);
+    h.send(4000, 'transcript', { type: 'asr.final', text: 'no I', start: 3500 * sr, end: 3900 * sr, speechFinal: true });
+    h.advance(7850);
+    expect(h.last('turn.user')?.text).toBe('wait what about Kyoto');
+    h.advance(7900);
+    expect(h.decisions().at(-1)).toBe('recover');
+    expect(h.last('turn.user')?.text).toBe('no I');
+  });
+
+  it('takes coherent speech as the turn as soon as its words are in', () => {
+    const h = competing();
+    h.send(3900, 'vad', { type: 'vad.speech_end', at: 3900 * sr });
+    h.send(4000, 'transcript', { type: 'asr.final', text: 'no I meant the one in Osaka', start: 3500 * sr, end: 3900 * sr, speechFinal: true });
+    expect(h.decisions().at(-1)).toBe('recover');
+    expect(h.last('turn.user')?.text).toBe('no I meant the one in Osaka');
+  });
+
+  it("doesn't say the line when the words at the pause already make a turn", () => {
+    const h = competing();
+    h.send(3850, 'transcript', { type: 'asr.partial', text: 'no I meant the one in Osaka', start: 3500 * sr, end: 3850 * sr });
+    h.send(3900, 'vad', { type: 'vad.speech_end', at: 3900 * sr });
+    expect(said(h)).toEqual([]);
+  });
+
+  it('starts counting again once a reply plays to its end', () => {
+    const h = harness({ overlap: 'classify', holdAfterMs: 0 });
+    h.user(1000, 'tell me about Tokyo');
+    h.send(1500, 'playback', { type: 'playback.start', rid: 'r0' });
+    h.send(2000, 'vad', { type: 'vad.speech_start', at: 2000 * sr });
+    h.send(2300, 'transcript', { type: 'asr.partial', text: 'wait', start: 2000 * sr, end: 2300 * sr });
+    h.send(2600, 'vad', { type: 'vad.speech_end', at: 2600 * sr });
+    h.send(2700, 'transcript', { type: 'asr.final', text: 'wait what about Kyoto', start: 2000 * sr, end: 2600 * sr, speechFinal: true });
+    h.send(3000, 'playback', { type: 'playback.start', rid: 'r1' });
+    h.send(5000, 'playback', { type: 'playback.end', rid: 'r1' });
+    h.user(6000, 'and Osaka');
+    h.send(6500, 'playback', { type: 'playback.start', rid: 'r2' });
+    h.send(7000, 'vad', { type: 'vad.speech_start', at: 7000 * sr });
+    h.send(7300, 'transcript', { type: 'asr.partial', text: 'wait', start: 7000 * sr, end: 7300 * sr });
+    expect(h.decisions()).not.toContain('backoff');
+  });
+});

@@ -144,6 +144,7 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('llm', 'text', 'tts', 'text'),
     e('llm', 'text', 'opener', 'text'),
     e('opener', 'text', 'tts', 'text'),
+    ...(registry[stageType(c, 'turn')].outputs.some((p) => p.name === 'text') ? [e('turn', 'text', 'tts', 'text')] : []),
     // Delegation: the LLM hands tasks to workers and hears back; the VAD tells it when the user pauses.
     e('llm', 'workers', 'workers', 'workers'),
     e('workers', 'updates', 'llm', 'updates'),

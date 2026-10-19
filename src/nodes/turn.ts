@@ -1,5 +1,6 @@
 import type { NodeDef, TimerHandle } from '../core/node';
 import type { Json, Msg } from '../core/types';
+import { seededRandom, takes } from './backchannel';
 
 interface TurnParams {
   commitOn: string;
@@ -101,6 +102,10 @@ interface DuplexParams {
   floorWords: string;
   asides: boolean;
   classifyWaitMs: number;
+  backoffAfter: number;
+  backoffLines: string;
+  backoffWords: number;
+  backoffSilenceMs: number;
 }
 
 /** Who holds the floor, and whether the user is talking over the agent while it does. */
@@ -184,6 +189,13 @@ export const draftKey = (s: string) =>
  * sentence, stops there and gets the aside as the user's turn. `overlap: legacy` is the earlier rule set:
  * `minSpeechMs` of speech that isn't only backchannel words stops the agent.
  *
+ * Backing off: after `backoffAfter` interruptions in a row (replies cut off
+ * by the user, with none played to the end in between) the agent stops
+ * competing for the floor. It says a canned line ("You go first.") once the
+ * user pauses, and commits nothing until they say something coherent (at least
+ * `backoffWords` words that aren't only backchannel words) or `backoffSilenceMs`
+ * of silence passes; then it takes what they said as their turn and carries on.
+ *
  * Speculative replies: while the user is silent and their turn looks like it
  * is ending (the model's end-of-turn score reaches `draftAt`, or just silence
  * without the model), and ASR has caught up (a result arrived during the
@@ -208,6 +220,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
   outputs: [
     { name: 'turn', type: 'turn' },
     { name: 'control', type: 'control', description: 'cancel: stop the reply in flight (LLM, TTS, playback)' },
+    { name: 'text', type: 'text', description: 'Backing off: the "you go first" lines, rendered ahead (bc.lines) and played as a cue (bc.say) by TTS' },
   ],
   params: [
     {
@@ -353,6 +366,38 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       description: 'After speech over the agent ends, how long to wait for its ASR final before deciding on what was heard so far.',
       when: { bargeIn: [true], overlap: ['classify'] },
     },
+    {
+      key: 'backoffAfter',
+      label: 'Back off after interruptions',
+      type: 'number',
+      default: 2,
+      description: 'After this many replies in a row cut off by the user, the agent says a "you go first" line and waits for them. 0: never.',
+      when: { bargeIn: [true] },
+    },
+    {
+      key: 'backoffLines',
+      label: 'Back-off lines',
+      type: 'string',
+      default: 'You go first. | Sorry, go ahead. | Go ahead.',
+      description: 'What the agent says when it backs off, separated by |. Needs a TTS that plays canned lines (Deepgram stream).',
+      when: { bargeIn: [true] },
+    },
+    {
+      key: 'backoffWords',
+      label: 'Coherent speech (words)',
+      type: 'number',
+      default: 4,
+      description: 'While backed off, the user\'s turn is taken once it has this many words that aren\'t only backchannel words.',
+      when: { bargeIn: [true] },
+    },
+    {
+      key: 'backoffSilenceMs',
+      label: 'Back off until silence (ms)',
+      type: 'number',
+      default: 4000,
+      description: 'While backed off, this much silence ends it: whatever the user said is taken as their turn.',
+      when: { bargeIn: [true] },
+    },
   ],
   create(ctx) {
     const p = ctx.params;
@@ -377,6 +422,15 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let silence: TimerHandle | null = null;
     /** A Finalize'd final was held back because the user went on: their next silence commits it, ASR final or not. */
     let heldFinal = false;
+    /** Replies cut off by the user since one last played to its end. */
+    let interrupts = 0;
+    /** Backed off after repeated interruptions: waiting for the user to say something coherent, or for silence. */
+    let backoff: { said: boolean; timer?: TimerHandle } | null = null;
+    let backoffNo = 0;
+    const yieldLines = String(p.backoffLines)
+      .split('|')
+      .map((l) => l.trim())
+      .filter(Boolean);
     /** The user is talking (VAD). */
     let speaking = false;
     /** ASR has caught up with the silence: a result arrived during it, or the words before it were all final. */
@@ -515,6 +569,49 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       if (draft && speaking && draftKey([...parts, partial?.text ?? ''].join(' ')) !== draft.key) return dropDraft('user went on');
       maybeDraft(why);
     };
+    /** Enough words, and not only backchannel words, to take as the user's turn while backed off. */
+    const coherent = (text: string) => words(text).length >= p.backoffWords && !isBackchannel(text);
+    const pendingText = () => [...parts, partial?.text ?? ''].join(' ').trim();
+    const sayYield = () => {
+      if (!backoff || backoff.said || !yieldLines.length) return;
+      backoff.said = true;
+      const id = `${ctx.id}-yield${backoffNo}`;
+      const line = yieldLines[backoffNo % yieldLines.length];
+      const all = takes(line, 3);
+      ctx.emit('text', { type: 'bc.say', id, line, take: all[Math.floor(seededRandom(id)() * all.length)], tailMs: 150, why: 'backing off' });
+    };
+    const enterBackoff = () => {
+      backoff = { said: false };
+      interrupts = 0;
+      decide('backoff', { why: `${p.backoffAfter} interruptions in a row` });
+      ctx.setState('backoff', true);
+      if (!speaking) {
+        sayYield();
+        armBackoffSilence();
+      }
+    };
+    const recover = (why: string) => {
+      if (!backoff) return;
+      backoff.timer?.clear();
+      backoff = null;
+      backoffNo++;
+      decide('recover', { why });
+      ctx.setState('backoff', false);
+    };
+    /** While backed off, enough silence ends it: take what they said, if anything. */
+    const armBackoffSilence = () => {
+      if (!backoff) return;
+      backoff.timer?.clear();
+      backoff.timer = ctx.setTimer(
+        p.backoffSilenceMs,
+        () => {
+          recover(`${p.backoffSilenceMs} ms of silence`);
+          if (state === 'listening' && (parts.length || partial)) endOfTurn('silence after backing off');
+        },
+        'backoff',
+      );
+    };
+
     /** Commit the turn. `tail`: its last words are an ASR partial whose final may still come. */
     const commit = (why: string, tail?: Partial_, extra: Record<string, Json> = {}) => {
       heldFinal = false;
@@ -524,6 +621,10 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       silence = null;
       const text = parts.join(' ').trim();
       if (!text || state !== 'listening') return;
+      if (backoff) {
+        if (!coherent(text)) return void ctx.log('debug', 'backed off: waiting for coherent speech or silence', { text, why });
+        recover('coherent speech');
+      }
       const turnId = `${ctx.id}-u${turnNo++}`;
       let kept: string | null = null;
       if (draft && draft.key === draftKey(text)) {
@@ -583,6 +684,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       held = false;
       const wasThinking = state === 'thinking+user';
       decide(wasThinking ? 'continue' : 'interrupt', { why, ms: ctx.now() - c.since, text: c.text });
+      if (!wasThinking && p.backoffAfter > 0 && ++interrupts >= p.backoffAfter) enterBackoff();
       ctx.emit('control', { type: 'cancel' });
       if (wasThinking && last) {
         // They weren't done: resend their turn together with what they say now.
@@ -771,6 +873,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           const c = candidate;
           if (!go('playback_end', 'playback ended')) return;
           held = false;
+          interrupts = 0;
           if (c) {
             // The agent finished while the user was already talking: just listen (a bare backchannel is dropped).
             c.timer?.clear();
@@ -797,6 +900,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           eotHeld = null;
           silence?.clear();
           silence = null;
+          backoff?.timer?.clear();
           if (state === 'thinking' || state === 'speaking') overlap(msg.at as number, 'user speech (VAD)');
           else if (candidate?.ended !== undefined) {
             // They went on before the words of the last bit came in: one stretch of speech.
@@ -820,6 +924,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           armSilence();
           if (eotHeld && state === 'listening' && ctx.now() - eotHeld.at <= EOT_HOLD_MS) endOfTurn(`${eotHeld.why}, then VAD speech end`);
           eotHeld = null;
+          if (backoff) {
+            // Back off out loud at their first pause, unless what they said already makes a turn.
+            if (!coherent(pendingText())) sayYield();
+            armBackoffSilence();
+          }
           if (candidate && classifies()) {
             // Decide once its words are in.
             const c = candidate;
@@ -880,6 +989,10 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     };
 
     return {
+      start() {
+        // Render the back-off lines ahead, so one plays at once when needed.
+        if (p.bargeIn && p.backoffAfter > 0 && yieldLines.length) ctx.emit('text', { type: 'bc.lines', lines: yieldLines.flatMap((l) => takes(l, 3)) });
+      },
       onInput(port, msg) {
         handle(port, msg);
         syncPending();
