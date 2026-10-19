@@ -6,6 +6,7 @@
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
 import { Trajectory, TRAJECTORY_FORMAT, type TrajectoryMeta } from './trajectory';
 import type { TrackInfo } from './tracks';
+import { checkGraph } from './graph';
 import type { TrajEvent } from './types';
 
 interface BundleMeta extends TrajectoryMeta {
@@ -33,6 +34,7 @@ export function decodeBundle(bytes: Uint8Array): Trajectory {
   if (!files['meta.json'] || !files['events.jsonl']) throw new Error('not a frankenvoice session bundle');
   const meta = JSON.parse(strFromU8(files['meta.json'])) as BundleMeta;
   if (meta.format !== TRAJECTORY_FORMAT) throw new Error(`unexpected format ${meta.format}`);
+  checkGraph(meta.graph);
   const { tracks, eventCount: _n, ...trajMeta } = meta;
   const traj = new Trajectory(trajMeta);
   for (const [name, t] of Object.entries(tracks)) {

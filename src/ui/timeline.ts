@@ -48,14 +48,9 @@ export interface Draft extends Span {
   why?: string;
 }
 
-/**
- * A filler the opener stage said while the model was thinking (from the reply's start to when it was said),
- * or, in older sessions, a canned line the LLM picked for the user's words: picked, spoken or none.
- */
+/** A filler the opener stage said while the model was thinking: from the reply's start to when it was said. */
 export interface Opener extends Span {
   rid: string;
-  filler?: boolean;
-  status?: string;
   why?: string;
 }
 
@@ -351,21 +346,9 @@ export class TimelineModel {
       case 'llm.draft':
         this.drafts.push({ rid: d.rid, t0: e.t, text: d.text ?? '', seqs: [e.seq] });
         break;
-      case 'llm.opener':
-        // The canned line picked for the user's words (or none), and how close the nearest example was.
-        this.openers.push({
-          rid: '',
-          t0: e.t - (d.ms ?? 0),
-          t1: e.t,
-          text: d.line ?? '',
-          status: d.line ? 'picked' : 'none',
-          why: d.reason ? `${d.reason} · user: ${d.text}` : `${d.score} for "${d.example}" · user: ${d.text}`,
-          seqs: [e.seq],
-        });
-        break;
       case 'opener.say': {
         const l = this.llm.find((x) => x.rid === d.rid);
-        this.openers.push({ rid: d.rid, t0: l?.t0 ?? e.t, t1: e.t, text: d.line ?? '', status: 'spoken', filler: true, why: d.reason, seqs: [e.seq] });
+        this.openers.push({ rid: d.rid, t0: l?.t0 ?? e.t, t1: e.t, text: d.line ?? '', why: d.reason, seqs: [e.seq] });
         break;
       }
       case 'llm.thinking': {
@@ -387,15 +370,6 @@ export class TimelineModel {
         break;
       }
       case 'llm.delta': {
-        if (d.opener) {
-          const said = String(d.text ?? '').trim();
-          const o = [...this.openers].reverse().find((x) => x.text === said);
-          if (o) {
-            o.status = 'spoken';
-            o.rid = d.rid;
-            o.seqs.push(e.seq);
-          }
-        }
         const l = this.llm.find((x) => x.rid === d.rid);
         if (l) {
           l.firstToken ??= e.t;

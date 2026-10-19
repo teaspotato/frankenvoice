@@ -143,7 +143,7 @@ describe('drafting replies before the turn is committed', () => {
 });
 
 describe('the LLM on drafts', () => {
-  const params = { provider: 'openai-compatible', model: 'm', system: 'sys', opener: false };
+  const params = { provider: 'openai-compatible', model: 'm', system: 'sys' };
   const tok = (text: string) => ({ choices: [{ index: 0, delta: { content: text } }] });
   const messages = (r: Json) => (r as { body: { messages: { role: string; content: string }[] } }).body.messages.map((m) => m.content);
 
@@ -193,14 +193,6 @@ describe('the LLM on drafts', () => {
   });
 });
 
-describe('sessions recorded before drafts', () => {
-  it('replay without them', async () => {
-    const { migrateGraph } = await import('../src/nodes');
-    const g = migrateGraph({ format: 'frankenvoice-graph', formatVersion: 2, name: 'old', nodes: [{ id: 'turn', type: 'turn.duplex', params: {} }], edges: [] });
-    expect(g.nodes[0].params).toEqual({ speculate: false, modelNeedsVad: false, maxSilenceMs: 0, rules: 'format 3', draftAt: 0.3 });
-  });
-});
-
 describe('finalizing ASR on VAD speech end', () => {
   it('commits a final flushed after the VAD heard the end, without waiting for ASR endpointing', () => {
     const h = harness(duplexTurnNode);
@@ -247,12 +239,6 @@ describe('turn-taking fixes from the smoothie session', () => {
     h.send(800, 'transcript', asr(true, 800, 'I was thinking'));
     h.send(1000, 'transcript', { type: 'asr.utterance_end', at: 1000 * sr });
     expect(h.of('turn.user')).toHaveLength(0);
-    // Sessions from before graph format 4 committed on it, and replay that way.
-    const old = harness(duplexTurnNode, { useModel: false, commitOn: 'utterance_end', rules: 'format 3' });
-    old.send(0, 'vad', vad(true, 0));
-    old.send(800, 'transcript', asr(true, 800, 'I was thinking'));
-    old.send(1000, 'transcript', { type: 'asr.utterance_end', at: 1000 * sr });
-    expect(old.of('turn.user')).toMatchObject([{ text: 'I was thinking' }]);
   });
 
   it('does not repeat words when a turn committed on a partial is resent', () => {

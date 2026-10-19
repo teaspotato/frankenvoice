@@ -34,7 +34,7 @@ const LEGEND: Record<string, string> = {
   turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), grey dot = backchannel or noise, ignored.',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   opener:
-    'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it. Older sessions: the canned line the LLM picked for what the user said.',
+    'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
   speaker:
     'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries.',
@@ -710,30 +710,27 @@ export function Dashboard({
         });
       }
 
-      // Opener: the wait a filler was said in (or, in older sessions, the LLM's canned pick), a diamond when spoken
+      // Opener: the wait a filler was said after, and a diamond when it was said
       m.openers.forEach((o, i) => {
         const end = o.t1 ?? head;
         if (end < t0 || o.t0 > t1) return;
         const [ly0, ly1] = laneY.opener;
         const h = ly1 - ly0;
-        const spoken = o.status === 'spoken';
         const x0 = x(o.t0);
         const x1 = Math.max(x(end), x0 + 2);
         g.globalAlpha = 0.25;
-        g.fillStyle = spoken ? col.warn : col.muted;
+        g.fillStyle = col.warn;
         g.fillRect(x0, ly0 + h * 0.3, x1 - x0, h * 0.4);
         g.globalAlpha = 1;
-        if (spoken) mark('opener', end, col.warn, 0.5, 'diamond', 4);
+        mark('opener', end, col.warn, 0.5, 'diamond', 4);
         const next = m.openers[i + 1];
-        if (spoken) label(o.text, x1 + 6, Math.min(x1 + 200, next ? x(next.t0) - 3 : Infinity), ly0 + h * 0.5, col.warn);
+        label(o.text, x1 + 6, Math.min(x1 + 200, next ? x(next.t0) - 3 : Infinity), ly0 + h * 0.5, col.warn);
         const ms = (end - o.t0).toFixed(0);
         hits.push({
           lane: 'opener',
           x0,
           x1: x1 + 4,
-          text: o.filler
-            ? `filler "${o.text}", said ${ms} ms after the reply started${o.why ? `\n${o.why}` : ''}`
-            : `opener ${o.status ?? 'picking…'}${o.text ? `: "${o.text}"` : ''}, picked in ${ms} ms${o.why ? `\n${o.why}` : ''}`,
+          text: `filler "${o.text}", said ${ms} ms after the reply started${o.why ? `\n${o.why}` : ''}`,
           seqs: o.seqs,
         });
       });

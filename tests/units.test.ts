@@ -61,53 +61,16 @@ describe('SimScheduler', () => {
   });
 });
 
-describe('migrateGraph', () => {
-  it('upgrades format-1 per-provider node types to provider params', async () => {
-    const { migrateGraph, registry } = await import('../src/nodes');
-    const old: import('../src/core/graph').GraphSpec = {
-      format: 'frankenvoice-graph',
-      formatVersion: 1,
-      name: 'old',
-      nodes: [
-        { id: 'asr', type: 'asr.deepgram', params: { model: 'nova-2' } },
-        { id: 'llm', type: 'llm.claude', params: { effort: 'high' } },
-        { id: 'tts', type: 'tts.cartesia', params: { modelId: 'sonic-x', minSegmentChars: 5 } },
-      ],
-      edges: [],
-    };
-    const g = migrateGraph(old);
-    expect(g.nodes.map((n) => n.type)).toEqual(['asr', 'llm', 'tts']);
-    expect(g.nodes[0].params).toEqual({ provider: 'deepgram', 'deepgram.model': 'nova-2' });
-    expect(g.nodes[1].params).toEqual({ provider: 'anthropic', effort: 'high', model: 'claude-opus-5-5', opener: 'off', thinking: 'model default' });
-    expect(g.nodes[2].params).toEqual({ provider: 'cartesia', 'cartesia.model': 'sonic-x', minSegmentChars: 5 });
-    for (const n of g.nodes) expect(registry[n.type]).toBeDefined();
-  });
-
-  it('moves the format-7 thinking filler out of the LLM into the opener stage', async () => {
-    const { migrateGraph } = await import('../src/nodes');
-    const e = (a: string, b: string) => ({ from: { node: a, port: 'text' }, to: { node: b, port: 'text' } });
-    const v7 = (llm: Record<string, import('../src/core/types').Json>): import('../src/core/graph').GraphSpec => ({
-      format: 'frankenvoice-graph',
-      formatVersion: 7,
-      name: 'v7',
-      nodes: [
-        { id: 'llm', type: 'llm', params: llm },
-        { id: 'tts', type: 'tts.stream', params: {} },
-      ],
-      edges: [e('llm', 'tts')],
-    });
-    const g = migrateGraph(v7({ provider: 'anthropic', fillerAfterMs: 800 }));
-    expect(g.nodes).toEqual([
-      { id: 'llm', type: 'llm', params: { provider: 'anthropic' } },
-      { id: 'tts', type: 'tts.stream', params: {} },
-      { id: 'opener', type: 'opener.filler', params: { afterMs: 800 } },
-    ]);
-    expect(g.edges).toEqual([e('llm', 'tts'), e('llm', 'opener'), e('opener', 'tts')]);
-    expect(configFromGraph(g).opener).toEqual({ variant: 'filler', params: { filler: { afterMs: 800 } } });
-    const canned = migrateGraph(v7({ provider: 'anthropic', opener: 'canned' }));
-    expect(canned.nodes.map((n) => n.type)).toEqual(['llm', 'tts.stream']);
-    expect(canned.nodes[0].params.opener).toBe('canned');
-    expect(configFromGraph(canned).opener.variant).toBe('off');
+describe('pipeline format', () => {
+  it('refuses graphs and sessions of another format', async () => {
+    const { checkGraph } = await import('../src/core/graph');
+    const g = buildGraph(defaultConfig());
+    expect(checkGraph(g)).toBe(g);
+    expect(() => configFromGraph({ ...g, formatVersion: g.formatVersion - 1 })).toThrow(/only loads format/);
+    const { decodeBundle, encodeBundle } = await import('../src/core/bundle');
+    const traj = (graph: typeof g) => new Trajectory({ format: TRAJECTORY_FORMAT, formatVersion: 1, id: 't', createdAt: '', mode: 'live', graph, graphHash: '' });
+    expect(decodeBundle(encodeBundle(traj(g))).meta.graph).toEqual(g);
+    expect(() => decodeBundle(encodeBundle(traj({ ...g, formatVersion: 7 })))).toThrow(/recorded with pipeline format 7/);
   });
 
   it('runs the opener stage between the LLM and TTS', () => {
@@ -278,16 +241,5 @@ describe('SimScheduler seek', () => {
     wall = 20;
     await done;
     expect(fired).toEqual([10, 500, 520]);
-  });
-});
-
-describe('configFromGraph', () => {
-  it('turns the turn model off for sessions recorded without one', () => {
-    const c = defaultConfig();
-    c.turnmodel.variant = 'off';
-    const g = buildGraph(c);
-    g.nodes = g.nodes.filter((n) => n.id !== 'turnmodel');
-    expect(configFromGraph(g).turnmodel.variant).toBe('off');
-    expect(configFromGraph(buildGraph(defaultConfig())).turnmodel.variant).toBe('ssl_turn');
   });
 });

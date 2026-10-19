@@ -107,7 +107,7 @@ describe('record and replay', () => {
     const g = testGraph();
     Object.assign(g.nodes.find((n) => n.id === 'llm')!.params, { provider: 'openai-compatible', endpoint: 'openrouter', model: 'some/model' });
     const run = await recordLive(800, performance, g);
-    const opened = run.events.find((e) => e.kind === 'io.open' && e.node === 'llm' && (e.data as { channel: string }).channel !== 'embed')!;
+    const opened = run.events.find((e) => e.kind === 'io.open' && e.node === 'llm')!;
     expect((opened.data as { channel: string }).channel).toBe('openai');
     expect((opened.data as { request: { endpoint: string; body: { model: string } } }).request.body.model).toBe('some/model');
     const deltas = run.events.filter((e) => e.kind === 'msg' && (e.data as { type: string }).type === 'llm.delta');

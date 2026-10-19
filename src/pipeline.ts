@@ -3,10 +3,10 @@
 // changing the topology means editing this file.
 
 import type { EdgeSpec, GraphSpec, NodeSpec } from './core/graph';
-import { GRAPH_FORMAT, GRAPH_FORMAT_VERSION } from './core/graph';
+import { checkGraph, GRAPH_FORMAT, GRAPH_FORMAT_VERSION } from './core/graph';
 import { resolveParams } from './core/node';
 import type { Json } from './core/types';
-import { migrateGraph, registry } from './nodes';
+import { registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
 export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'llm' | 'opener' | 'tts' | 'speaker';
@@ -138,23 +138,12 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
 
 /** Recover the stage config a recorded session ran with (stages it lacks keep their defaults). */
 export function configFromGraph(graph: GraphSpec): PipelineConfig {
-  const g = migrateGraph(graph);
+  const g = checkGraph(graph);
   const c = defaultConfig();
   for (const s of STAGES) {
     const n = g.nodes.find((x) => x.id === s.id) ?? g.nodes.find((x) => Object.values(s.variants).includes(x.type));
     const variant = n && Object.entries(s.variants).find(([, t]) => t === n.type)?.[0];
     if (n && variant) c[s.id] = { variant, params: { ...c[s.id].params, [variant]: n.params } };
-  }
-  // Sessions from before the turn model ran without one.
-  if (!g.nodes.some((x) => x.type.startsWith('turnmodel.'))) c.turnmodel = { variant: 'off', params: {} };
-  // Sessions from before the opener stage had none (or had it inside the LLM).
-  if (!g.nodes.some((x) => x.type.startsWith('opener.'))) c.opener = { variant: 'off', params: {} };
-  // Sessions from before the cleanup stage set browser processing on the mic.
-  const mic = g.nodes.find((x) => x.type === 'mic');
-  if (mic && !g.nodes.some((x) => x.type.startsWith('cleanup.'))) {
-    const keys = ['echoCancellation', 'noiseSuppression', 'autoGainControl'];
-    const flags = Object.fromEntries(keys.map((k) => [k, mic.params[k] !== false]));
-    c.cleanup = Object.values(flags).some(Boolean) ? { variant: 'browser', params: { browser: flags } } : { variant: 'off', params: {} };
   }
   return c;
 }

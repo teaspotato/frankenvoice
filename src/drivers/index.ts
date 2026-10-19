@@ -12,7 +12,6 @@ import captureWorkletUrl from './capture-worklet.js?url';
 import type { DriverRegistry, LiveDriver } from '../core/world';
 import type { Json } from '../core/types';
 import { toJson } from '../core/json';
-import { loadEncoder, type Encoder } from '../embed/encoder';
 
 ort.env.wasm.wasmPaths = { wasm: ortWasmUrl, mjs: ortMjsUrl };
 ort.env.wasm.numThreads = 1;
@@ -216,20 +215,6 @@ const openai: LiveDriver = (req, sink) => {
         }
       }
     }
-    sink.close(null);
-  })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
-  return { send() {}, close: () => ac.abort() };
-};
-
-/** TypeSafe primitives (e.g. a Choice question): one JSON request, one JSON answer. */
-const typesafe: LiveDriver = (req, sink) => {
-  const r = req as { path: string; body: Json };
-  const ac = new AbortController();
-  (async () => {
-    const res = await postJson(`/api/typesafe${r.path}`, r.body, ac.signal);
-    const text = await res.text();
-    if (!res.ok) return sink.close({ error: { status: res.status, body: text } });
-    sink.recv(JSON.parse(text) as Json);
     sink.close(null);
   })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
   return { send() {}, close: () => ac.abort() };
@@ -637,43 +622,4 @@ const speaker: LiveDriver = (_req, sink, env) => {
   };
 };
 
-// Sentence encoders for the LLM's opener, loaded once per model from Hugging Face.
-const encoders = new Map<string, Promise<Encoder>>();
-function encoder(model: string): Promise<Encoder> {
-  let e = encoders.get(model);
-  if (!e) {
-    const base = `https://huggingface.co/${model}/resolve/main`;
-    e = (async () => {
-      const [onnx, vocab] = await Promise.all([
-        fetch(`${base}/onnx/model_quantized.onnx`).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`${model}: HTTP ${r.status}`)))),
-        fetch(`${base}/vocab.txt`).then((r) => (r.ok ? r.text() : Promise.reject(new Error(`${model} vocab: HTTP ${r.status}`)))),
-      ]);
-      return loadEncoder(ort as never, new Uint8Array(onnx), vocab);
-    })();
-    e.catch(() => encoders.delete(model));
-    encoders.set(model, e);
-  }
-  return e;
-}
-
-const embed: LiveDriver = (req, sink) => {
-  const r = req as { model: string; texts: string[] };
-  let closed = false;
-  encoder(r.model)
-    .then((enc) => enc.embed(r.texts))
-    .then((vecs) => {
-      if (closed) return;
-      // Rounded: plenty for cosine similarity, and a smaller recording.
-      sink.recv({ vectors: vecs.map((v) => v.map((x) => Math.round(x * 1e5) / 1e5)) });
-      sink.close(null);
-    })
-    .catch((e) => !closed && sink.close(errorJson(e)));
-  return {
-    send() {},
-    close() {
-      closed = true;
-    },
-  };
-};
-
-export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel, embed, typesafe };
+export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel };

@@ -252,13 +252,12 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
             start(msg.rid as string);
             break;
           case 'opener.lines':
-          case 'llm.opener_lines':
             prerender(msg.lines as string[]);
             break;
           case 'opener.say':
           case 'llm.delta': {
             if (!r || r.rid !== msg.rid) return;
-            const opener = msg.type === 'opener.say' || !!msg.opener;
+            const opener = msg.type === 'opener.say';
             if (opener && !r.buf && playCanned(r, (msg.text as string).trim())) return;
             r.buf += msg.text as string;
             // An opener is said as soon as it arrives, whatever its punctuation.

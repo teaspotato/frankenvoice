@@ -46,8 +46,6 @@ const SETTINGS: SettingDef[] = [
   { name: 'CARTESIA_API_KEY', group: 'Cartesia (TTS)', label: 'API key', secret: true },
   { name: 'CARTESIA_BASE_URL', group: 'Cartesia (TTS)', label: 'Base URL', default: 'https://api.cartesia.ai' },
   { name: 'CARTESIA_VERSION', group: 'Cartesia (TTS)', label: 'API version', default: '2025-04-16' },
-  { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener choice)', label: 'API key', secret: true },
-  { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener choice)', label: 'Base URL', default: 'https://api.typesafe.ai' },
   { name: 'FV_SESSIONS_DIR', group: 'Storage', label: 'Sessions folder', default: 'sessions', hint: 'Relative to where the proxy runs' },
 ];
 const SETTING_NAMES = new Set(SETTINGS.map((d) => d.name));
@@ -120,7 +118,6 @@ const upstreams: Record<string, Upstream> = {
     headers: (key) => ({ 'x-api-key': key!, 'cartesia-version': setting('CARTESIA_VERSION')! }),
   },
   deepgram: { baseVar: 'DEEPGRAM_BASE_URL', keyVar: 'DEEPGRAM_API_KEY', headers: (key) => ({ authorization: `Token ${key}` }) },
-  typesafe: { baseVar: 'TYPESAFE_BASE_URL', keyVar: 'TYPESAFE_API_KEY', headers: bearer },
   // OpenAI-compatible endpoints, addressed as /api/openai/<name>/...
   'openai/openrouter': {
     baseVar: 'OPENROUTER_BASE_URL',
@@ -255,7 +252,7 @@ const server = createServer((req, res) => {
     if (p === '/api/health') {
       return json(res, 200, Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])));
     }
-    let m = /^\/api\/(anthropic|cartesia|deepgram|typesafe|openai\/[\w-]+)(\/.*)$/.exec(p);
+    let m = /^\/api\/(anthropic|cartesia|deepgram|openai\/[\w-]+)(\/.*)$/.exec(p);
     if (m) return forward(m[1], m[2] + url.search, req, res);
     m = /^\/api\/sessions(?:\/([^/]+))?$/.exec(p);
     if (m) return sessions(req, res, m[1] && decodeURIComponent(m[1]));

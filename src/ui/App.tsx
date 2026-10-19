@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef, useState, type CSSProperties } from 'react';
-import { migrateGraph, registry } from '../nodes';
+import { registry } from '../nodes';
 import { GRAPH_FORMAT, type GraphSpec } from '../core/graph';
 import { Runtime } from '../core/runtime';
 import { LiveScheduler, type Scheduler, type SimScheduler } from '../core/scheduler';
@@ -376,7 +376,7 @@ export function App() {
       .filter(Boolean);
     const { runtime: rt, sim } = prepareReplay(source, {
       registry,
-      graph: replayOpts.useCurrentConfig ? buildGraph(config) : migrateGraph(source.meta.graph),
+      graph: replayOpts.useCurrentConfig ? buildGraph(config) : source.meta.graph,
       drivers: browserDrivers,
       liveChannels,
       monitorChannels: replayOpts.audible && replayOpts.realtime ? outputChannels : [],
@@ -498,7 +498,12 @@ export function App() {
 
   const loadServerSession = async (id: string) => {
     const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
-    const traj = decodeBundle(new Uint8Array(await res.arrayBuffer()));
+    let traj;
+    try {
+      traj = decodeBundle(new Uint8Array(await res.arrayBuffer()));
+    } catch (e) {
+      return setNotice(`${id}: ${String(e)}`);
+    }
     // The file name is the session's name; it changes when the session is renamed.
     traj.meta.id = id;
     const s = { traj, saved: id };

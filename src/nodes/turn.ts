@@ -91,7 +91,6 @@ interface DuplexParams {
   draftAt: number;
   modelNeedsVad: boolean;
   maxSilenceMs: number;
-  rules: string;
 }
 
 /** Who holds the floor, and whether the user is talking over the agent while it does. */
@@ -203,16 +202,6 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       when: { useModel: [true] },
     },
     {
-      key: 'rules',
-      label: 'Rules',
-      type: 'select',
-      options: ['current', 'format 3'],
-      default: 'current',
-      description:
-        'format 3: as sessions recorded before graph format 4 ran. The model\'s end of turn and ASR utterance end commit even while the VAD hears speech, and a turn resent after committing on a partial repeats it.',
-      when: { rules: ['format 3'] },
-    },
-    {
       key: 'asrGraceMs',
       label: 'Wait for ASR after end of turn (ms)',
       type: 'number',
@@ -277,7 +266,6 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let from = -1;
     let to = -1;
     let turnNo = 0;
-    const format3 = p.rules === 'format 3';
     /** The last committed turn, for resending it when the user wasn't done. */
     let last: { id: string; text: string; from: number; to: number; tail?: Partial_; base?: string[] } | null = null;
     let replaces: string | null = null;
@@ -397,7 +385,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         ctx.setState('draft', '');
       } else dropDraft('final words differ');
       ctx.emit('turn', { type: 'turn.user', turnId, text, from, to, ...(replaces ? { replaces } : {}), ...(kept ? { draft: kept } : {}) });
-      last = { id: turnId, text, from, to, ...(tail && !format3 ? { tail, base: parts.slice(0, -1) } : {}) };
+      last = { id: turnId, text, from, to, ...(tail ? { tail, base: parts.slice(0, -1) } : {}) };
       replaces = null;
       parts = [];
       partial = null;
@@ -451,14 +439,14 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         replaces = last.id;
         // A turn committed on a partial: its final is still to come, so the partial stays a partial.
         parts = last.tail ? [...last.base!] : [last.text];
-        if (!format3) partial = last.tail ?? null;
+        partial = last.tail ?? null;
         from = last.from;
         to = last.to;
         ctx.setState('pending', parts.join(' '));
       }
       go('take_floor', why);
       for (const f of c.finals) {
-        if (!format3 && partial && f.start <= partial.end) partial = null;
+        if (partial && f.start <= partial.end) partial = null;
         collect(f.text, f.start, f.end);
       }
       armSilence();
@@ -520,7 +508,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             if (c) yieldFloor(c, why);
           } else if (msg.type === 'turnmodel.eot' && state === 'listening') {
             // Not while the VAD still hears them; if their speech ends right after, it stands.
-            if (speaking && !format3) eotHeld = { why, at: ctx.now() };
+            if (speaking) eotHeld = { why, at: ctx.now() };
             else endOfTurn(why);
           }
           return;
@@ -600,7 +588,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             commit(msg.speechFinal ? 'speech_final' : 'finalized on VAD speech end');
           else refreshDraft('ASR final');
         } else if (msg.type === 'asr.utterance_end') {
-          if (speaking && !format3) ctx.log('debug', 'utterance end ignored: the VAD still hears speech');
+          if (speaking) ctx.log('debug', 'utterance end ignored: the VAD still hears speech');
           else commit('utterance_end');
         }
       },

@@ -1,14 +1,14 @@
-// Replays recorded sessions as the app does (graph migrated, recorded io) and reports
+// Replays recorded sessions as the app does (recorded graph and io) and reports
 // io divergences and message counts that differ from the recording.
 // Usage: pnpm replay-check path/to/*.fvs
 import { readFileSync } from 'node:fs';
 import { decodeBundle } from '../src/core/bundle';
 import { prepareReplay } from '../src/core/replay';
-import { migrateGraph, registry } from '../src/nodes';
+import { registry } from '../src/nodes';
 const key = (e: any) => (e.kind === 'msg' ? `${e.node}:${e.data?.type}` : '');
 for (const f of process.argv.slice(2)) {
   const src = decodeBundle(new Uint8Array(readFileSync(f)));
-  const r = prepareReplay(src, { registry, graph: migrateGraph(src.meta.graph) });
+  const r = prepareReplay(src, { registry });
   r.sim.runFast();
   const ev = r.runtime.trajectory.events;
   const div = ev.filter((e) => e.kind === 'io.diverge');
