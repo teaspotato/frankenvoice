@@ -38,7 +38,7 @@ export const STAGES: StageDef[] = [
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' }, managed: ['delegate'], managedNote: 'Delegation (the worker tools) is set by the Workers stage.' },
   { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', off: 'opener.off' } },
-  { id: 'workers', label: 'Workers', variants: { acp: 'workers', off: 'workers.off' } },
+  { id: 'workers', label: 'Workers', variants: { acp: 'workers', mock: 'workers.mock', off: 'workers.off' } },
   { id: 'tts', label: 'TTS', variants: { api: 'tts', 'deepgram-stream': 'tts.stream', browser: 'tts.browser', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
 ];
@@ -152,8 +152,9 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
 
 /** What the LLM needs to delegate to workers, or null when the stage is off. */
 function delegation(c: PipelineConfig): Json {
-  if (stageType(c, 'workers') !== 'workers') return null;
-  const a = resolveParams(registry.workers, stageParams(c, 'workers'));
+  const type = stageType(c, 'workers');
+  if (type === 'workers.off') return null;
+  const a = resolveParams(registry[type], stageParams(c, 'workers'));
   return { prompt: a.delegatePrompt, progress: a.progress, quietMs: a.quietMs, maxWorkers: a.maxWorkers };
 }
 

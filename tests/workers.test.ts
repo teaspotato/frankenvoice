@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { llmNode, cutToHeard } from '../src/nodes/llm';
-import { workersNode } from '../src/nodes/workers';
+import { mockWorkersNode, workersNode } from '../src/nodes/workers';
 import { FLOOR } from '../src/nodes/turn';
 import { DEFAULT_DELEGATE_PROMPT } from '../src/nodes/llm/delegate';
 import { buildGraph, defaultConfig } from '../src/pipeline';
@@ -327,12 +327,49 @@ describe('workers', () => {
   });
 });
 
+describe('mock workers', () => {
+  it('return a dummy result after a seeded random delay, the same every run', () => {
+    const run = (seed: number) => {
+      const h = harness(mockWorkersNode, { minMs: 1000, maxMs: 5000, seed });
+      h.send(0, 'workers', { type: 'worker.start', workerId: 'w1', task: 'weather' });
+      h.send(0, 'workers', { type: 'worker.start', workerId: 'w2', task: 'trains' });
+      h.send(500, 'workers', { type: 'worker.send', workerId: 'w2', message: 'tomorrow' });
+      h.advance(10_000);
+      return h;
+    };
+    const h = run(0);
+    const done = h.of('worker.done');
+    expect(done.map((d) => d.text)).toEqual(expect.arrayContaining(['Mock result for "weather".', 'Mock result for "trains". Noted: "tomorrow".']));
+    for (const d of done) expect(Number(d.ms)).toBeGreaterThanOrEqual(1000);
+    for (const d of done) expect(Number(d.ms)).toBeLessThanOrEqual(5000);
+    expect(h.of('worker.ready')).toHaveLength(2);
+    expect(h.of('worker.tool')).toHaveLength(2);
+    expect(run(0).of('worker.done').map((d) => d.ms)).toEqual(done.map((d) => d.ms));
+    expect(run(1).of('worker.done').map((d) => d.ms)).not.toEqual(done.map((d) => d.ms));
+  });
+
+  it('stop without a result, and pick up again on a follow-up', () => {
+    const h = harness(mockWorkersNode, { minMs: 100, maxMs: 200 });
+    h.send(0, 'workers', { type: 'worker.start', workerId: 'w1', task: 'a' });
+    h.send(0, 'workers', { type: 'worker.start', workerId: 'w2', task: 'b' });
+    h.send(10, 'workers', { type: 'worker.stop', workerId: 'w1' });
+    h.advance(1000);
+    expect(h.of('worker.done').map((d) => d.workerId)).toEqual(['w2']);
+    h.send(1000, 'workers', { type: 'worker.send', workerId: 'w2', message: 'more' });
+    h.advance(2000);
+    expect(h.of('worker.done').map((d) => d.workerId)).toEqual(['w2', 'w2']);
+  });
+});
+
 describe('wiring', () => {
   it('gives the LLM delegation only while the workers stage is on', () => {
     const c = defaultConfig();
     const llm = (g: ReturnType<typeof buildGraph>) => g.nodes.find((n) => n.id === 'llm')!.params.delegate;
     expect(llm(buildGraph(c))).toMatchObject({ progress: 'context', quietMs: 800, maxWorkers: 4 });
     expect(buildGraph(c).edges).toContainEqual({ from: { node: 'llm', port: 'workers' }, to: { node: 'workers', port: 'workers' } });
+    c.workers = { variant: 'mock', params: {} };
+    expect(llm(buildGraph(c))).toMatchObject({ maxWorkers: 4 });
+    expect(buildGraph(c).nodes.find((n) => n.id === 'workers')!.type).toBe('workers.mock');
     c.workers = { variant: 'off', params: {} };
     expect(llm(buildGraph(c))).toBeNull();
   });

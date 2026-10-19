@@ -344,3 +344,94 @@ export const noWorkersNode: NodeDef<Record<string, never>> = {
     return {};
   },
 };
+
+/** A number in [0, 1) from a string, the same every run, so a mock worker's timing replays. */
+function unit(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  h = Math.imul(h ^ (h >>> 15), 2246822507);
+  h = Math.imul(h ^ (h >>> 13), 3266489909);
+  return ((h ^ (h >>> 16)) >>> 0) / 2 ** 32;
+}
+
+const delegationParams = workersNode.params.filter((p) => ['maxWorkers', 'delegatePrompt', 'progress', 'quietMs'].includes(p.key));
+
+/**
+ * Mock workers: no agent, no IO. Each worker answers with a dummy result after
+ * a random delay (seeded by the worker id and `seed`, so a replay matches),
+ * going through the same events as a real one: ready, thinking, one step,
+ * done. A message for a running worker is added to its result; for a finished
+ * one it starts a follow-up with a new delay.
+ */
+export const mockWorkersNode: NodeDef = {
+  type: 'workers.mock',
+  title: 'Mock workers',
+  category: 'llm',
+  description: 'Stand-in workers that return a dummy result after a random delay, for trying delegation without an agent.',
+  inputs: workersNode.inputs,
+  outputs: workersNode.outputs,
+  params: [
+    { key: 'minMs', label: 'Shortest delay (ms)', type: 'number', default: 2000 },
+    { key: 'maxMs', label: 'Longest delay (ms)', type: 'number', default: 8000 },
+    { key: 'result', label: 'Result', type: 'text', default: 'Mock result for "{task}".', description: '{task} is replaced with the task.' },
+    { key: 'seed', label: 'Seed', type: 'number', default: 0 },
+    ...delegationParams,
+  ],
+  create(ctx) {
+    const p = ctx.params as JsonObject;
+    type Mock = { id: string; task: string; status: string; runs: number; t0: number; steers: string[]; timers: { clear(): void }[] };
+    const workers = new Map<string, Mock>();
+    const emit = (w: Mock, type: string, data: JsonObject = {}) => ctx.emit('updates', { type, workerId: w.id, ...data });
+    const count = () => ctx.setState('running', [...workers.values()].filter((w) => w.status === 'running').length);
+    const clear = (w: Mock) => w.timers.splice(0).forEach((t) => t.clear());
+
+    const run = (w: Mock) => {
+      const n = ++w.runs;
+      const min = Number(p.minMs);
+      const delay = min + unit(`${String(p.seed)}:${w.id}:${n}`) * Math.max(0, Number(p.maxMs) - min);
+      w.status = 'running';
+      w.t0 = ctx.now();
+      const at = (frac: number, fn: () => void) => w.timers.push(ctx.setTimer(delay * frac, fn, 'mock-worker'));
+      at(0.05, () => emit(w, n === 1 ? 'worker.ready' : 'worker.thinking', n === 1 ? { sessionId: `mock-${w.id}`, ms: Math.round(ctx.now() - w.t0) } : {}));
+      if (n === 1) at(0.1, () => emit(w, 'worker.thinking'));
+      at(0.3, () => emit(w, 'worker.tool', { toolCallId: `${w.id}-${n}`, title: 'Mock step', kind: 'think', status: 'pending' }));
+      at(0.7, () => emit(w, 'worker.tool_done', { toolCallId: `${w.id}-${n}`, status: 'completed' }));
+      at(1, () => {
+        w.timers = [];
+        w.status = 'done';
+        const text = String(p.result ?? '').replaceAll('{task}', w.task) + w.steers.splice(0).map((s) => ` Noted: "${s}".`).join('');
+        emit(w, 'worker.done', { text, stopReason: 'end_turn', ms: Math.round(ctx.now() - w.t0) });
+        count();
+      });
+    };
+
+    return {
+      onInput(_port, msg) {
+        const id = msg.workerId as string;
+        if (msg.type === 'worker.start') {
+          const w: Mock = { id, task: String(msg.task ?? ''), status: 'running', runs: 0, t0: ctx.now(), steers: [], timers: [] };
+          workers.set(id, w);
+          emit(w, 'worker.started', { task: w.task });
+          run(w);
+          return count();
+        }
+        const w = workers.get(id);
+        if (!w || w.status === 'stopped') return;
+        if (msg.type === 'worker.stop') {
+          clear(w);
+          w.status = 'stopped';
+          emit(w, 'worker.stopped');
+        } else if (msg.type === 'worker.send') {
+          const followUp = w.status === 'done';
+          emit(w, 'worker.steer', { text: String(msg.message ?? ''), followUp });
+          w.steers.push(String(msg.message ?? ''));
+          if (followUp) run(w);
+        }
+        count();
+      },
+      stop() {
+        for (const w of workers.values()) clear(w);
+      },
+    };
+  },
+};
