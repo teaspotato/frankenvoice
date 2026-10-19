@@ -9,7 +9,7 @@ import type { Json } from './core/types';
 import { registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'llm' | 'opener' | 'tts' | 'speaker';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'backchannel' | 'llm' | 'opener' | 'tts' | 'speaker';
 
 export interface StageDef {
   id: StageId;
@@ -31,6 +31,7 @@ export const STAGES: StageDef[] = [
   { id: 'turnmodel', label: 'Turn model', variants: { ssl_turn: 'turnmodel.ssl', off: 'turnmodel.off' } },
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
+  { id: 'backchannel', label: 'Backchannels', variants: { on: 'backchannel', off: 'backchannel.off' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
   { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', off: 'opener.off' } },
   { id: 'tts', label: 'TTS', variants: { api: 'tts', 'deepgram-stream': 'tts.stream', browser: 'tts.browser', tone: 'tts.tone' } },
@@ -84,6 +85,7 @@ const COLUMN: Record<StageId, [number, number]> = {
   turnmodel: [420, 110],
   asr: [420, 200],
   turn: [630, 110],
+  backchannel: [840, 20],
   llm: [840, 110],
   opener: [840, 200],
   tts: [1050, 110],
@@ -123,6 +125,12 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('vad', 'vad', 'asr', 'vad'),
     e('asr', 'transcript', 'turn', 'transcript'),
     e('turn', 'turn', 'llm', 'turn'),
+    // Backchannels: when, from the user's speech and the floor; their lines are rendered and played by TTS.
+    e('vad', 'vad', 'backchannel', 'vad'),
+    e('turnmodel', 'scores', 'backchannel', 'scores'),
+    e('turn', 'turn', 'backchannel', 'turn'),
+    e('asr', 'transcript', 'backchannel', 'transcript'),
+    e('backchannel', 'text', 'tts', 'text'),
     e('llm', 'text', 'tts', 'text'),
     e('llm', 'text', 'opener', 'text'),
     e('opener', 'text', 'tts', 'text'),

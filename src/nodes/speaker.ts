@@ -236,6 +236,18 @@ export const speakerNode: NodeDef<Record<string, never>> = {
           return;
         }
         if (!isAudioMsg(msg)) return;
+        if (msg.cue) {
+          // A backchannel: plays now, over whatever is playing, and starts no reply.
+          const at = ctx.now();
+          io?.send({ cmd: 'cue', at, sampleRate: msg.sampleRate }, {
+            bin: bytesFromF32(msg.samples),
+            media: { track: msg.track, start: msg.start, end: msg.end },
+            logBin: false,
+          });
+          ctx.emit('played', { type: 'audio', track: msg.track, start: msg.start, end: msg.end, sampleRate: msg.sampleRate, samples: msg.samples, at, cue: true });
+          ctx.emit('playback', { type: 'playback.cue', rid: msg.rid as Json, at, end: at + (msg.samples.length / msg.sampleRate) * 1000 });
+          return;
+        }
         const r = (msg.rid as string) ?? null;
         if (playing && r !== rid && paused !== null) {
           // A new reply while paused: the held one is dropped, and the new one starts now.

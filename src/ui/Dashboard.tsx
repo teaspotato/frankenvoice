@@ -28,7 +28,7 @@ const LEGEND: Record<string, string> = {
   cleanup: 'Audio after noise/echo cleanup: what VAD and ASR hear. Small ticks under it: AEC double talk or the RNNoise gate closing. Hover for levels.',
   vad: 'Speech probability per frame (line) against the start and stop thresholds (dashed). Shaded: detected speech.',
   turnmodel:
-    'Turn model scores per 80 ms frame, placed on the audio they had heard: end of turn (blue) and take the floor (orange). Solid: the user; faint: the agent. Dashed: the thresholds.\nDiamonds: events the model committed for the user (top: end of turn, bottom: take the floor); hollow dots: the same for the agent.',
+    'Turn model scores per 80 ms frame, placed on the audio they had heard: end of turn (blue) and take the floor (orange). Solid: the user; faint: the agent. Green: the backchannel head (the agent could say mm-hmm), green circles where it fired. Dashed: the thresholds.\nDiamonds: events the model committed for the user (top: end of turn, bottom: take the floor); hollow dots: the same for the agent.',
   asr:
     'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
   turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.',
@@ -37,7 +37,7 @@ const LEGEND: Record<string, string> = {
     'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
   speaker:
-    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged.',
+    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged. Accent boxes: backchannels said while the user talked; small grey dots near the bottom: backchannels held back (hover for why).',
 };
 
 const AXIS = 20;
@@ -524,6 +524,19 @@ export function Dashboard({
             g.stroke();
           }
         }
+        // Backchannel head: could the agent say mm-hmm now (green, only in sessions that ran it)
+        g.strokeStyle = col.ok;
+        g.globalAlpha = 0.8;
+        g.lineWidth = 1;
+        g.beginPath();
+        let bcStarted = false;
+        for (const f of m.turnScores) {
+          if (f.bc === undefined || f.t < t0 - 200 || f.t > t1 + 200) continue;
+          if (!bcStarted) g.moveTo(x(f.t), yv(f.bc));
+          else g.lineTo(x(f.t), yv(f.bc));
+          bcStarted = true;
+        }
+        g.stroke();
         g.globalAlpha = 1;
         g.lineWidth = 1;
         // While the model loads (download, then compile), say so across the lane.
@@ -550,8 +563,8 @@ export function Dashboard({
         }
         for (const ev of m.turnEvents) {
           if (ev.t < t0 || ev.t > t1) continue;
-          const c = ev.kind === 'eot' ? col.accent : col.turn;
-          const at = ev.kind === 'eot' ? 0.12 : 0.88;
+          const c = ev.kind === 'eot' ? col.accent : ev.kind === 'bc' ? col.ok : col.turn;
+          const at = ev.kind === 'eot' ? 0.12 : ev.kind === 'bc' ? 0.5 : 0.88;
           if (ev.who === 'user') mark('turnmodel', ev.t, c, at, 'diamond', 4);
           else {
             g.strokeStyle = c;
@@ -563,7 +576,7 @@ export function Dashboard({
             lane: 'turnmodel',
             x0: x(ev.t) - 4,
             x1: x(ev.t) + 4,
-            text: `${ev.who}: ${ev.kind === 'eot' ? 'end of turn' : 'takes the floor'} (p = ${ev.p}), committed ${(ev.arrived - ev.t).toFixed(0)} ms after the audio it is about`,
+            text: `${ev.who}: ${ev.kind === 'eot' ? 'end of turn' : ev.kind === 'bc' ? 'could backchannel' : 'takes the floor'} (p = ${ev.p}), committed ${(ev.arrived - ev.t).toFixed(0)} ms after the audio it is about`,
             seqs: [ev.seq],
           });
         }
@@ -1148,7 +1161,7 @@ export function Dashboard({
     const t = currentEnd() - view.span + ((hover.x - LABEL_W) / plotW()) * view.span;
     let best: (typeof modelRef.current.turnScores)[number] | undefined;
     for (const f of modelRef.current.turnScores) if (!best || Math.abs(f.t - t) < Math.abs(best.t - t)) best = f;
-    if (best && Math.abs(best.t - t) < 120) turnAt = `user: end of turn ${best.eot[0].toFixed(2)} · take floor ${best.int[0].toFixed(2)}\nagent: end of turn ${best.eot[1].toFixed(2)} · take floor ${best.int[1].toFixed(2)}`;
+    if (best && Math.abs(best.t - t) < 120) turnAt = `user: end of turn ${best.eot[0].toFixed(2)} · take floor ${best.int[0].toFixed(2)}\nagent: end of turn ${best.eot[1].toFixed(2)} · take floor ${best.int[1].toFixed(2)}${best.bc !== undefined ? `\nbackchannel ${best.bc.toFixed(2)}` : ''}`;
   }
 
   return (

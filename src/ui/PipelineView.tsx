@@ -20,16 +20,17 @@ const POS: Record<StageId, [number, number]> = {
   turnmodel: [410, 88],
   asr: [410, 166],
   turn: [610, 88],
+  backchannel: [810, 206],
   llm: [810, 88],
   opener: [1010, 88],
   tts: [1210, 88],
   speaker: [1410, 88],
 };
 const VIEW_W = 1570;
-const VIEW_H = 290;
+const VIEW_H = 340;
 const FEEDBACK_Y = 60;
 /** The echo reference runs under everything, below ASR. */
-const REFERENCE_Y = 250;
+const REFERENCE_Y = 300;
 /** Barge-in cancels run between the row and the echo reference. */
 const CONTROL_Y = 190;
 
@@ -103,6 +104,8 @@ export function PipelineView({
     // The opener watches the LLM's stream and adds its own lines to what TTS says.
     link('llm.text', right('llm'), left('opener'), 'text'),
     link('opener.text', right('opener'), left('tts'), 'text'),
+    // Backchannels hear the user (speech, words, turn model) through turn-taking's view of the floor.
+    ...(stages.some((s) => s.id === 'backchannel') ? [link('turn.turn', right('turn'), left('backchannel'), 'floor'), link('backchannel.text', right('backchannel'), left('tts'), 'lines')] : []),
     ...(out === 'speaker' ? [link('tts.audio', right('tts'), left('speaker'), 'audio')] : []),
   ];
   // Playback feedback: up from the output stage, back over the row, down into turn-taking.

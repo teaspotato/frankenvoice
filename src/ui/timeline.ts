@@ -98,9 +98,9 @@ export class TimelineModel {
   vadNegThreshold?: number;
   speech: Span[] = [];
   /** Turn model scores per frame, [user, agent], placed on the audio they have heard. */
-  turnScores: { t: number; eot: number[]; int: number[] }[] = [];
+  turnScores: { t: number; eot: number[]; int: number[]; bc?: number }[] = [];
   /** End-of-turn / take-the-floor events the turn model committed. */
-  turnEvents: (Marker & { kind: 'eot' | 'int'; who: string; p: number; arrived: number })[] = [];
+  turnEvents: (Marker & { kind: 'eot' | 'int' | 'bc'; who: string; p: number; arrived: number })[] = [];
   turnEotThreshold?: number;
   turnIntThreshold?: number;
   /** Latest ASR result per segment (keyed by its first audio sample). */
@@ -119,6 +119,9 @@ export class TimelineModel {
   playbackSegments: Marker[] = [];
   /** The agent was cut off (paused) or played quieter (ducked) while turn-taking judged the user's speech over it. */
   holds: Span[] = [];
+  /** Backchannels the agent said while the user talked, and proposals that were gated off. */
+  backchannels: (Span & { id: string; why?: string })[] = [];
+  bcSkips: (Marker & { why: string })[] = [];
   boundaries: number[] = [];
   agentAudio: AudioBlock[] = [];
   errors: (Marker & { node: string })[] = [];
@@ -253,6 +256,11 @@ export class TimelineModel {
       this.ttsRequests.push({ t: e.t, seq: e.seq });
       return;
     }
+    if (e.kind === 'io.send' && d.payload?.cmd === 'cue' && e.media) {
+      const samples = this.traj.tracks.readF32Range(e.media.track, e.media.start, e.media.end);
+      this.agentAudio.push({ t: d.payload.at, peaks: this.peaks(samples, d.payload.sampleRate) });
+      return;
+    }
     if (e.kind === 'io.send' && d.payload?.cmd === 'play' && e.media) {
       const samples = this.traj.tracks.readF32Range(e.media.track, e.media.start, e.media.end);
       this.agentAudio.push({ t: d.payload.at, peaks: this.peaks(samples, d.payload.sampleRate) });
@@ -293,11 +301,12 @@ export class TimelineModel {
         this.vad.push({ t: this.sampleToT(d.end), p: d.p });
         break;
       case 'turnmodel.frame':
-        this.turnScores.push({ t: this.sampleToT(d.at), eot: d.eot, int: d.int });
+        this.turnScores.push({ t: this.sampleToT(d.at), eot: d.eot, int: d.int, bc: d.bc });
         break;
       case 'turnmodel.eot':
       case 'turnmodel.int':
-        this.turnEvents.push({ t: this.sampleToT(d.at), arrived: e.t, kind: d.type === 'turnmodel.eot' ? 'eot' : 'int', who: d.who, p: d.p, text: '', seq: e.seq });
+      case 'turnmodel.bc':
+        this.turnEvents.push({ t: this.sampleToT(d.at), arrived: e.t, kind: d.type.slice('turnmodel.'.length), who: d.who, p: d.p, text: '', seq: e.seq });
         break;
       case 'vad.speech_start':
         this.speech.push({ t0: this.sampleToT(d.at), text: '', seqs: [e.seq] });
@@ -405,6 +414,21 @@ export class TimelineModel {
         if (s) {
           s.t1 = e.t;
           s.seqs.push(e.seq);
+        }
+        break;
+      }
+      case 'bc.say':
+        this.backchannels.push({ t0: e.t, text: d.line ?? '', id: d.id ?? '', why: d.why, seqs: [e.seq] });
+        break;
+      case 'bc.skip':
+        this.bcSkips.push({ t: e.t, text: d.reason ?? '', why: d.why ?? '', seq: e.seq });
+        break;
+      case 'playback.cue': {
+        const b = this.backchannels.find((x) => x.id === d.rid);
+        if (b) {
+          b.t0 = d.at ?? b.t0;
+          b.t1 = d.end;
+          b.seqs.push(e.seq);
         }
         break;
       }
