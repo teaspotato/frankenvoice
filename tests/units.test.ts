@@ -227,6 +227,22 @@ describe('TimelineModel.related', () => {
   });
 });
 
+describe('TimelineModel ASR placement', () => {
+  it('puts a result on its words, not on the silence its window starts with', () => {
+    const traj = new Trajectory({ format: TRAJECTORY_FORMAT, formatVersion: 1, id: 't', createdAt: '', mode: 'live', graph: { nodes: [], edges: [] } as never, graphHash: '' });
+    // mic: 1 s frames arriving on time, so sample s is at s / 16 ms
+    for (let i = 1; i <= 6; i++) traj.append({ seq: i - 1, t: i * 1000, node: 'mic', kind: 'msg', port: 'audio', data: { type: 'audio', sampleRate: 16000 }, media: { track: 'mic', start: (i - 1) * 16000, end: i * 16000 } });
+    // Deepgram-style final: window 0-5 s, words only 3.5-4.5 s
+    traj.append({ seq: 6, t: 5300, node: 'asr', kind: 'msg', port: 'transcript', data: { type: 'asr.final', text: 'hi there', start: 0, end: 80000, words: [{ word: 'hi', start: 56000, end: 64000 }, { word: 'there', start: 64000, end: 72000 }] } });
+    const m = new TimelineModel(traj);
+    m.update();
+    const r = m.asr.get(0)!;
+    expect(r.a0).toBeCloseTo(3500);
+    expect(r.a1).toBeCloseTo(4500);
+    expect(m.asrArrivals[0].a0).toBeCloseTo(3500);
+  });
+});
+
 describe('SimScheduler seek', () => {
   it('runs everything before the target at once, then keeps pacing', async () => {
     let wall = 0;
