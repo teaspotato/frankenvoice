@@ -139,6 +139,8 @@ export function configFromGraph(graph: GraphSpec): PipelineConfig {
     const variant = n && Object.entries(s.variants).find(([, t]) => t === n.type)?.[0];
     if (n && variant) c[s.id] = { variant, params: { ...c[s.id].params, [variant]: n.params } };
   }
+  // Sessions from before the turn model ran without one.
+  if (!g.nodes.some((x) => x.type.startsWith('turnmodel.'))) c.turnmodel = { variant: 'off', params: {} };
   // Sessions from before the cleanup stage set browser processing on the mic.
   const mic = g.nodes.find((x) => x.type === 'mic');
   if (mic && !g.nodes.some((x) => x.type.startsWith('cleanup.'))) {

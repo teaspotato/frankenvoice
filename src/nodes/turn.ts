@@ -220,6 +220,12 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     /** The turn model is loaded and scoring. */
     let model = false;
     const useModel = () => p.useModel && model;
+    /**
+     * The model decides barge-in only over the agent's speech: while the agent is
+     * thinking its channel is silent, so take-the-floor rarely fires and the user
+     * adding to their turn is judged by the rules.
+     */
+    const modelDecides = () => useModel() && holder(state) === 'speaking';
     const backchannel = new Set(
       String(p.backchannels)
         .split(',')
@@ -323,7 +329,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
 
     /** Rules without the model: enough speech that isn't only backchannel words. */
     const consider = (c: Candidate) => {
-      if (useModel()) return;
+      if (modelDecides()) return;
       const ms = ctx.now() - c.since;
       if (ms < p.minSpeechMs) return;
       if (c.text && isBackchannel(c.text) && ms < p.maxBackchannelMs) return;
@@ -339,7 +345,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       const check = () => {
         c.timer = undefined;
         if (candidate !== c) return;
-        if (useModel()) {
+        if (modelDecides()) {
           // The model may never call it a floor take; this much speech is one anyway.
           if (ctx.now() - c.since >= p.maxBackchannelMs) yieldFloor(c, 'sustained speech');
           else c.timer = ctx.setTimer(p.maxBackchannelMs - (ctx.now() - c.since), check, 'barge-in');
@@ -349,7 +355,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         // Still a backchannel: look again when it would be too long for one.
         if (candidate === c) c.timer = ctx.setTimer(Math.max(1, p.maxBackchannelMs - (ctx.now() - c.since)), check, 'barge-in');
       };
-      c.timer = ctx.setTimer(useModel() ? p.maxBackchannelMs : p.minSpeechMs, check, 'barge-in');
+      c.timer = ctx.setTimer(modelDecides() ? p.maxBackchannelMs : p.minSpeechMs, check, 'barge-in');
       return c;
     };
 
@@ -392,13 +398,18 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           if (msg.type === 'vad.speech_start') {
             ctx.setState('userSpeaking', true);
             if (state === 'thinking' || state === 'speaking') overlap(msg.at as number, 'user speech (VAD)');
+            else if (eotWait) {
+              // They went on after the model called the end of their turn: wait for the next one.
+              eotWait.timer.clear();
+              eotWait = null;
+            }
           } else if (msg.type === 'vad.speech_end') {
             ctx.setState('userSpeaking', false);
             if (candidate) {
               const c = candidate;
               c.timer?.clear();
               candidate = null;
-              const why = useModel() ? 'speech ended without the model calling a floor take' : 'speech ended before it counted';
+              const why = modelDecides() ? 'speech ended without the model calling a floor take' : 'speech ended before it counted';
               decide('backchannel', { ms: ctx.now() - c.since, text: c.text, why });
               go('backchannel', why);
             }

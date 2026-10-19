@@ -336,6 +336,7 @@ interface TurnModelWorker {
 }
 
 const turnModels = new Map<string, TurnModelWorker>();
+let turnModelResets = 0;
 const turnModelWatchers = new Set<() => void>();
 
 function startTurnModel(r: TurnModelRequest): TurnModelWorker {
@@ -402,6 +403,8 @@ const turnModel: LiveDriver = (req, sink) => {
   let closed = false;
   /** Frames are this session's only after the worker has been reset for it. */
   let ready = false;
+  /** The reset sent for this session; only its `ready` counts (an earlier session's may still arrive). */
+  let resetSeq: number | undefined;
   const release = () => {
     if (own.session === onMsg) own.session = undefined;
     // A second worker made for an overlapping session isn't kept.
@@ -414,6 +417,7 @@ const turnModel: LiveDriver = (req, sink) => {
       release();
       sink.close({ error: m.text ?? 'turn model failed' });
     } else if (m.type === 'ready') {
+      if (m.seq !== resetSeq) return;
       ready = true;
       sink.recv(toJson(m));
     } else if (m.type !== 'frames' || ready) sink.recv(toJson(m));
@@ -421,7 +425,8 @@ const turnModel: LiveDriver = (req, sink) => {
   own.session = onMsg;
   if (own.load.state === 'ready') {
     setTimeout(() => !closed && sink.recv({ type: 'status', text: 'preloaded' }), 0);
-    own.worker.postMessage({ type: 'reset' });
+    resetSeq = ++turnModelResets;
+    own.worker.postMessage({ type: 'reset', seq: resetSeq });
   } else if (own.load.last?.type === 'progress' || own.load.last?.type === 'status') {
     // Still loading from a preload: pick up where it is.
     const last = own.load.last;

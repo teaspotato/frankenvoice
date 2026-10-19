@@ -179,6 +179,33 @@ describe('full-duplex turn-taking with the turn model', () => {
     expect(h.last('turn.user')).toMatchObject({ text: 'hello there' });
   });
 
+  it('judges speech while the agent is still thinking by the rules: the user adding to their turn', () => {
+    const h = harness();
+    h.send(0, 'scores', ready);
+    h.user(1000, 'book a table');
+    h.send(1100, 'scores', ev('eot', 1000 * h.sr));
+    h.send(1300, 'vad', { type: 'vad.speech_start', at: 1300 * h.sr });
+    h.send(1700, 'transcript', { type: 'asr.partial', text: 'for two at seven', start: 1300 * h.sr, end: 1700 * h.sr });
+    h.advance(1800);
+    expect(h.decisions()).toEqual(['candidate', 'continue']);
+    h.user(2400, 'for two at seven');
+    h.send(2500, 'scores', ev('eot', 2450 * h.sr));
+    expect(h.last('turn.user')).toMatchObject({ text: 'book a table for two at seven', replaces: 'turn-u0' });
+  });
+
+  it('drops a pending end of turn when the user starts talking again', () => {
+    const h = harness({ asrGraceMs: 300 });
+    h.send(0, 'scores', ready);
+    h.send(1300, 'transcript', { type: 'asr.partial', text: 'so I was', start: 1000 * h.sr, end: 1300 * h.sr });
+    h.send(1400, 'scores', ev('eot', 1350 * h.sr));
+    h.send(1500, 'vad', { type: 'vad.speech_start', at: 1500 * h.sr });
+    h.advance(2000);
+    expect(h.last('turn.user')).toBeUndefined();
+    h.user(2500, 'so I was thinking about Osaka', false);
+    h.send(2600, 'scores', ev('eot', 2550 * h.sr));
+    expect(h.last('turn.user')).toMatchObject({ text: 'so I was thinking about Osaka' });
+  });
+
   it('falls back to the rules when the model fails', () => {
     const h = harness();
     h.send(0, 'scores', ready);

@@ -17,7 +17,7 @@ export type ToWorker =
   | { type: 'init'; encoderUrl: string; headUrl: string; frames: number; ep: string }
   | { type: 'block'; a: Float32Array; b: Float32Array }
   /** A new session: forget the audio so far, then say `ready` again. */
-  | { type: 'reset' };
+  | { type: 'reset'; seq: number };
 
 let ts: TurnStream | null = null;
 let queue: { a: Float32Array; b: Float32Array }[] = [];
@@ -89,13 +89,17 @@ async function init(m: Extract<ToWorker, { type: 'init' }>) {
   post(readyMsg);
 }
 
-async function reset() {
-  if (!ts) return; // still loading: `ready` follows when it is done
-  queue = [];
-  while (busy) await new Promise((r) => setTimeout(r, 5));
-  ts.reset();
-  dead = false;
-  post(readyMsg);
+/** Resets run one after another, each answered by a `ready` carrying its seq. */
+let resets: Promise<void> = Promise.resolve();
+function reset(seq: number) {
+  resets = resets.then(async () => {
+    if (!ts) return; // still loading: `ready` follows when it is done
+    queue = [];
+    while (busy) await new Promise((r) => setTimeout(r, 5));
+    ts.reset();
+    dead = false;
+    post({ ...(readyMsg as object), seq });
+  });
 }
 
 async function pump() {
@@ -119,7 +123,7 @@ async function pump() {
 onmessage = (e: MessageEvent<ToWorker>) => {
   const m = e.data;
   if (m.type === 'init') init(m).catch((err) => post({ type: 'error', text: err instanceof Error ? err.message : String(err) }));
-  else if (m.type === 'reset') void reset();
+  else if (m.type === 'reset') reset(m.seq);
   else if (m.type === 'block' && !dead) {
     queue.push({ a: m.a, b: m.b });
     if (queue.length > MAX_BACKLOG) {
