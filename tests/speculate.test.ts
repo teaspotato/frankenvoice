@@ -219,3 +219,52 @@ describe('finalizing ASR on VAD speech end', () => {
     expect(h.ios[0].sent.filter((d) => d !== null)).toEqual([{ type: 'Finalize' }]);
   });
 });
+
+describe('turn-taking fixes from the smoothie session', () => {
+  const ready = { type: 'turnmodel.status', status: 'ready' };
+  const eot = (t: number) => ({ type: 'turnmodel.eot', who: 'user', at: t * sr, p: 0.65 });
+  const int = (t: number) => ({ type: 'turnmodel.int', who: 'user', at: t * sr, p: 0.33 });
+
+  it('does not end the turn on the model while the VAD still hears speech, unless the speech ends right after', () => {
+    const h = harness(duplexTurnNode);
+    h.send(0, 'scores', ready);
+    h.send(0, 'vad', vad(true, 0));
+    h.send(500, 'transcript', asr(false, 500, 'I was thinking'));
+    h.send(900, 'scores', eot(900));
+    h.send(2000, 'vad', vad(false, 2000)); // 1.1 s later: they were not done
+    h.advance(3000);
+    expect(h.of('turn.user')).toHaveLength(0);
+    h.send(3000, 'vad', vad(true, 3000));
+    h.send(3500, 'scores', eot(3500));
+    h.send(3800, 'vad', vad(false, 3800)); // within the VAD's hangover: it stands
+    h.send(3900, 'transcript', asr(true, 3900, 'I was thinking about Osaka', true));
+    expect(h.of('turn.user')).toMatchObject([{ text: 'I was thinking about Osaka' }]);
+  });
+
+  it('ignores ASR utterance end while the VAD still hears speech', () => {
+    const h = harness(duplexTurnNode, { useModel: false, commitOn: 'utterance_end' });
+    h.send(0, 'vad', vad(true, 0));
+    h.send(800, 'transcript', asr(true, 800, 'I was thinking'));
+    h.send(1000, 'transcript', { type: 'asr.utterance_end', at: 1000 * sr });
+    expect(h.of('turn.user')).toHaveLength(0);
+  });
+
+  it('does not repeat words when a turn committed on a partial is resent', () => {
+    const h = harness(duplexTurnNode, { asrGraceMs: 600 });
+    h.send(0, 'scores', ready);
+    h.send(0, 'vad', vad(true, 0));
+    h.send(1000, 'transcript', asr(false, 1000, 'I was thinking'));
+    h.send(1100, 'vad', vad(false, 1100));
+    h.send(1200, 'scores', eot(1200));
+    h.advance(1800); // no final in time: commits on the partial
+    expect(h.of('turn.user')).toMatchObject([{ text: 'I was thinking' }]);
+    h.send(1900, 'scores', int(1900)); // they go on: the reply is dropped
+    h.send(2000, 'vad', vad(true, 2000));
+    h.send(2100, 'transcript', { ...asr(true, 1100, 'I was thinking'), fromFinalize: true });
+    h.send(2600, 'transcript', asr(false, 2600, 'about'));
+    h.send(2700, 'vad', vad(false, 2700));
+    h.send(2900, 'transcript', asr(true, 2900, 'about'));
+    h.send(3000, 'scores', eot(3000));
+    expect(h.of('turn.user').at(-1)).toMatchObject({ text: 'I was thinking about', replaces: 'turn-u0' });
+  });
+});

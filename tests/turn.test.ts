@@ -189,6 +189,7 @@ describe('full-duplex turn-taking with the turn model', () => {
     h.advance(1800);
     expect(h.decisions()).toEqual(['candidate', 'continue']);
     h.user(2400, 'for two at seven');
+    h.send(2420, 'vad', { type: 'vad.speech_end', at: 2420 * h.sr });
     h.send(2500, 'scores', ev('eot', 2450 * h.sr));
     expect(h.last('turn.user')).toMatchObject({ text: 'book a table for two at seven', replaces: 'turn-u0' });
   });
@@ -202,6 +203,7 @@ describe('full-duplex turn-taking with the turn model', () => {
     h.advance(2000);
     expect(h.last('turn.user')).toBeUndefined();
     h.user(2500, 'so I was thinking about Osaka', false);
+    h.send(2550, 'vad', { type: 'vad.speech_end', at: 2550 * h.sr });
     h.send(2600, 'scores', ev('eot', 2550 * h.sr));
     expect(h.last('turn.user')).toMatchObject({ text: 'so I was thinking about Osaka' });
   });
