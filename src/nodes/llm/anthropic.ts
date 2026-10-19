@@ -20,8 +20,9 @@ export const anthropicAdapter: LlmAdapter = {
   buildRequest(history: ChatTurn[], p: JsonObject): Json {
     const messages: { role: string; content: Json }[] = [];
     for (const t of history) {
-      const content: Json =
-        t.role === 'assistant' && t.native?.provider === 'anthropic' ? t.native.content : [{ type: 'text', text: t.text }];
+      // A copy: same-role turns are merged into it below, and the history must not change.
+      const native = t.native?.provider === 'anthropic' ? t.native.content : null;
+      const content: Json = Array.isArray(native) ? [...native] : (native ?? [{ type: 'text', text: t.text }]);
       const last = messages[messages.length - 1];
       if (last?.role === t.role && t.role === 'user') (last.content as Json[]).push(...(content as Json[]));
       else messages.push({ role: t.role, content });
@@ -31,6 +32,7 @@ export const anthropicAdapter: LlmAdapter = {
       max_tokens: p.maxTokens,
       system: p.system,
       messages: messages as Json,
+      ...(Array.isArray(p.tools) && p.tools.length ? { tools: p.tools } : {}),
       output_config: { effort: p.effort },
       ...thinkingOff(p),
       ...(p.fallbacks ? { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' } : {}),

@@ -58,6 +58,8 @@ export class Runtime {
   private running = false;
   private openConns = new Map<string, { conn: Conn; handle: IOHandle & { closed: boolean } }>();
   private stateListeners = new Set<(node: string, state: Record<string, Json>) => void>();
+  /** Live timers not yet fired or cleared, by id: a busy event loop can run them late. */
+  private liveTimers = new Map<string, { due: number; fire: () => void }>();
 
   constructor(private opts: RuntimeOptions) {
     const g = opts.graph;
@@ -147,14 +149,18 @@ export class Runtime {
       // Stamp it with its own arrival time, so live and replay order it identically.
       const t = this.opts.scheduler.now();
       this.pendingTurns.push(() => {
+        this.fireOverdue(t);
         this.t = Math.max(this.t, t);
+        this.cause = undefined;
         fn();
       });
       return;
     }
     this.inTurn = true;
     try {
-      this.t = Math.max(this.t, this.opts.scheduler.now());
+      const now = this.opts.scheduler.now();
+      this.fireOverdue(now);
+      this.t = Math.max(this.t, now);
       this.cause = undefined;
       fn();
       this.drain();
@@ -166,6 +172,26 @@ export class Runtime {
     } finally {
       this.inTurn = false;
       this.cause = undefined;
+    }
+  }
+
+  /**
+   * Live only: run the timers that were due before `now` but haven't fired,
+   * each at the time it was due, before whatever arrived at `now`. A replay
+   * fires a timer at its time; without this, a live timer running late behind
+   * a busy event loop could be cleared by an event that came after its time,
+   * and the replay, firing it first, would not match.
+   */
+  private fireOverdue(now: number): void {
+    for (;;) {
+      let next: { id: string; due: number; fire: () => void } | undefined;
+      for (const [id, x] of this.liveTimers) if (x.due <= now && (!next || x.due < next.due)) next = { id, ...x };
+      if (!next) return;
+      this.liveTimers.delete(next.id);
+      this.t = Math.max(this.t, next.due);
+      this.cause = undefined;
+      next.fire();
+      this.drain();
     }
   }
 
@@ -236,19 +262,20 @@ export class Runtime {
         const setSeq = rt.log(id, 'timer.set', { data: { id: timerId, delay: delayMs, ...(label ? { label } : {}) } });
         let done = false;
         const fireAt = rt.opts.world.timerFireAt(timerId, rt.t, delayMs);
-        const cancel = rt.opts.scheduler.at(fireAt.t, () =>
-          rt.turn(() => {
-            if (done || !rt.running) return;
-            done = true;
-            rt.cause = rt.log(id, 'timer.fire', { data: { id: timerId }, cause: [setSeq] });
-            rt.guard(slot, fn);
-          }),
-          fireAt.order,
-        );
+        const fire = () => {
+          rt.liveTimers.delete(timerId);
+          if (done || !rt.running) return;
+          done = true;
+          rt.cause = rt.log(id, 'timer.fire', { data: { id: timerId }, cause: [setSeq] });
+          rt.guard(slot, fn);
+        };
+        const cancel = rt.opts.scheduler.at(fireAt.t, () => rt.turn(fire), fireAt.order);
+        if (rt.opts.mode === 'live') rt.liveTimers.set(timerId, { due: fireAt.t, fire });
         return {
           clear() {
             if (done) return;
             done = true;
+            rt.liveTimers.delete(timerId);
             cancel();
             rt.log(id, 'timer.clear', { data: { id: timerId } });
           },

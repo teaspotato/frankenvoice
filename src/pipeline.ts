@@ -9,7 +9,7 @@ import type { Json } from './core/types';
 import { registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'backchannel' | 'llm' | 'opener' | 'tts' | 'speaker';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'backchannel' | 'llm' | 'opener' | 'workers' | 'tts' | 'speaker';
 
 export interface StageDef {
   id: StageId;
@@ -18,10 +18,15 @@ export interface StageDef {
   variants: Record<string, string>;
   /** Params set by another stage, hidden from this stage's panel. */
   managed?: string[];
+  /** Says which stage sets the managed params. */
+  managedNote?: string;
 }
 
 export const STAGES: StageDef[] = [
-  { id: 'mic', label: 'Microphone', variants: { mic: 'mic' }, managed: ['echoCancellation', 'noiseSuppression', 'autoGainControl'] },
+  { id: 'mic', label: 'Microphone', variants: { mic: 'mic' },
+    managed: ['echoCancellation', 'noiseSuppression', 'autoGainControl'],
+    managedNote: 'Browser echo cancellation, noise suppression and gain are set by the Noise / echo stage.',
+  },
   {
     id: 'cleanup',
     label: 'Noise / echo',
@@ -32,8 +37,9 @@ export const STAGES: StageDef[] = [
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
   { id: 'backchannel', label: 'Backchannels', variants: { on: 'backchannel', off: 'backchannel.off' } },
-  { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
+  { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' }, managed: ['delegate'], managedNote: 'Delegation (the worker tools) is set by the Workers stage.' },
   { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', off: 'opener.off' } },
+  { id: 'workers', label: 'Workers', variants: { acp: 'workers', mock: 'workers.mock', off: 'workers.off' } },
   { id: 'tts', label: 'TTS', variants: { api: 'tts', 'deepgram-stream': 'tts.stream', browser: 'tts.browser', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
 ];
@@ -88,6 +94,7 @@ const COLUMN: Record<StageId, [number, number]> = {
   backchannel: [840, 20],
   llm: [840, 110],
   opener: [840, 200],
+  workers: [840, 290],
   tts: [1050, 110],
   speaker: [1260, 110],
 };
@@ -96,7 +103,7 @@ const e = (from: string, fp: string, to: string, tp: string): EdgeSpec => ({ fro
 
 /**
  * The fixed topology: mic → noise/echo cleanup → VAD + turn model + ASR → turn-taking → LLM → TTS → speaker,
- * the opener watching the LLM and speaking through TTS too, with playback fed back to turn-taking and what was played to the turn model (the agent's channel).
+ * the opener watching the LLM and speaking through TTS too, workers taking the LLM's delegated tasks, with playback fed back to turn-taking and what was played to the turn model (the agent's channel).
  */
 export function buildGraph(c: PipelineConfig): GraphSpec {
   const stages = activeStages(c);
@@ -108,7 +115,10 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
       s.id === 'mic'
         ? // The cleanup stage decides what the browser does at capture.
           { ...stageParams(c, 'mic'), ...micProcessing(cleanupType, resolveParams(registry[cleanupType], stageParams(c, 'cleanup'))) }
-        : stageParams(c, s.id),
+        : s.id === 'llm'
+          ? // The workers stage decides whether the LLM can delegate, and how it hears back.
+            { ...stageParams(c, 'llm'), delegate: delegation(c) }
+          : stageParams(c, s.id),
     ui: { x: COLUMN[s.id][0], y: COLUMN[s.id][1] },
   }));
   const hasSpeaker = stages.some((s) => s.id === 'speaker');
@@ -134,6 +144,10 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('llm', 'text', 'tts', 'text'),
     e('llm', 'text', 'opener', 'text'),
     e('opener', 'text', 'tts', 'text'),
+    // Delegation: the LLM hands tasks to workers and hears back; the VAD tells it when the user pauses.
+    e('llm', 'workers', 'workers', 'workers'),
+    e('workers', 'updates', 'llm', 'updates'),
+    e('vad', 'vad', 'llm', 'vad'),
     ...(hasSpeaker ? [e('tts', 'audio', 'speaker', 'audio'), e('speaker', 'playback', 'turn', 'playback')] : [e('tts', 'playback', 'turn', 'playback')]),
     ...(hasSpeaker && wantsReference ? [e('speaker', 'played', 'cleanup', 'ref')] : []),
     // Barge-in: turn-taking can stop the reply in flight.
@@ -142,6 +156,14 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
       : []),
   ];
   return { format: GRAPH_FORMAT, formatVersion: GRAPH_FORMAT_VERSION, name: 'Cascade', nodes, edges };
+}
+
+/** What the LLM needs to delegate to workers, or null when the stage is off. */
+function delegation(c: PipelineConfig): Json {
+  const type = stageType(c, 'workers');
+  if (type === 'workers.off') return null;
+  const a = resolveParams(registry[type], stageParams(c, 'workers'));
+  return { prompt: a.delegatePrompt, progress: a.progress, quietMs: a.quietMs, maxWorkers: a.maxWorkers };
 }
 
 /** Recover the stage config a recorded session ran with (stages it lacks keep their defaults). */

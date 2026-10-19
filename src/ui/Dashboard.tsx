@@ -18,6 +18,7 @@ export const LANES: Lane[] = [
   { id: 'turn', label: 'Turn', height: 52 },
   { id: 'llm', label: 'LLM', height: 60 },
   { id: 'opener', label: 'Opener', height: 28 },
+  { id: 'workers', label: 'Workers', height: 52 },
   { id: 'tts', label: 'TTS', height: 36 },
   { id: 'speaker', label: 'Playback', height: 48 },
 ];
@@ -35,6 +36,8 @@ const LEGEND: Record<string, string> = {
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   opener:
     'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
+  workers:
+    'Workers the LLM started, each an agent session; workers that overlap get their own row. Bar: the worker from start to its result (green), error (red) or stop (grey); a dark tick where its session was ready, grey ticks where it started reasoning; darker blocks are its tool calls (red: failed). Dots: plan updates (amber), its in-between text (blue), refused permissions (red); diamonds: messages from the LLM. On the LLM lane, a purple diamond is a worker tool call (red: refused), and a reply labelled "worker news" is one the LLM gave on its own to a result.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
   speaker:
     'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged. Accent boxes: backchannels said while the user talked; small grey dots near the bottom: backchannels held back (hover for why).',
@@ -766,7 +769,12 @@ export function Dashboard({
         span('llm', ft, end, col.llm, 0.35, stats, 0.06, 0.4);
         hits.pop();
         if (l.thinkingAt !== undefined) vline('llm', l.thinkingAt, col.muted, 0.04, 0.42);
-        hits.push({ lane: 'llm', x0: x(l.t0), x1: x(end), text: `${stats}\n${l.text}`, seqs: l.seqs });
+        if (l.workers) label('worker news', x(l.t0) + 1, x(ft), ly0 + h * 0.23, col.muted);
+        hits.push({ lane: 'llm', x0: x(l.t0), x1: x(end), text: `${l.workers ? `on its own, for worker ${l.workers.join(', ')} · ` : ''}${stats}\n${l.text}`, seqs: l.seqs });
+        for (const tl of l.tools) {
+          mark('llm', tl.t, tl.error ? col.danger : col.llm, 0.23, 'diamond', 4);
+          hits.push({ lane: 'llm', x0: x(tl.t) - 5, x1: x(tl.t) + 5, y0: ly0, y1: ly0 + h * 0.44, text: tl.text, seqs: [tl.seq] });
+        }
         let so = '';
         l.chunks.forEach((c, i) => {
           so += c.text;
@@ -793,6 +801,63 @@ export function Dashboard({
             seqs: [c.seq],
           });
         });
+      }
+
+      // Workers: one bar per worker, packed into rows; its tool calls inside, notes as marks
+      {
+        const [ly0, ly1] = laneY.workers;
+        const rows = Math.max(2, ...m.workers.filter((w) => (w.t1 ?? head) >= t0 && w.t0 <= t1).map((w) => w.row + 1));
+        const rh = (ly1 - ly0) / rows;
+        for (const w of m.workers) {
+          const end = w.t1 ?? head;
+          if (end < t0 || w.t0 > t1) continue;
+          const y0 = ly0 + rh * w.row;
+          const x0 = x(w.t0);
+          const x1 = Math.max(x(end), x0 + 2);
+          const c = w.status === 'error' ? col.danger : w.status === 'stopped' ? col.muted : w.status === 'done' ? col.ok : col.llm;
+          g.globalAlpha = 0.15;
+          g.fillStyle = c;
+          g.fillRect(x0, y0 + rh * 0.12, x1 - x0, rh * 0.76);
+          // Tool calls: darker blocks, red when they failed.
+          g.globalAlpha = 0.35;
+          for (const st of w.steps) {
+            g.fillStyle = st.status === 'failed' ? col.danger : c;
+            g.fillRect(x(st.t0), y0 + rh * 0.12, Math.max(1, x(st.t1 ?? end) - x(st.t0)), rh * 0.76);
+          }
+          g.globalAlpha = 1;
+          for (const tt of [w.readyAt, ...w.thinking]) {
+            if (tt === undefined) continue;
+            const px = Math.round(x(tt)) + 0.5;
+            g.strokeStyle = tt === w.readyAt ? col.text : col.muted;
+            g.beginPath();
+            g.moveTo(px, y0 + rh * 0.1);
+            g.lineTo(px, y0 + rh * 0.9);
+            g.stroke();
+          }
+          label(`${w.id}: ${w.result && w.status !== 'running' ? w.result : w.text}`, x0, x1, y0 + rh * 0.5, col.text);
+          const secs = ((end - w.t0) / 1000).toFixed(1);
+          const ready = w.readyAt !== undefined ? ` · session ready at +${((w.readyAt - w.t0) / 1000).toFixed(1)} s` : '';
+          const steps = w.steps.map((st) => `${(((st.t1 ?? end) - st.t0) / 1000).toFixed(1)} s ${st.kind}: ${st.title}${st.status === 'failed' ? ' (failed)' : ''}`).join('\n   ');
+          hits.push({
+            lane: 'workers',
+            x0,
+            x1,
+            y0,
+            y1: y0 + rh,
+            text: `worker ${w.id}, ${w.status}, ${secs} s${ready}: ${w.text}${w.result && w.status !== 'running' ? `\n→ ${w.result}` : ''}${steps ? `\n   ${steps}` : ''}`,
+            seqs: w.seqs,
+          });
+          for (const st of w.steps) {
+            if (x(st.t1 ?? end) - x(st.t0) < 3) continue;
+            hits.push({ lane: 'workers', x0: x(st.t0), x1: x(st.t1 ?? end), y0, y1: y0 + rh, text: `${w.id} ${st.kind}: ${st.title}\n${(((st.t1 ?? end) - st.t0) / 1000).toFixed(1)} s, ${st.status}`, seqs: w.seqs });
+          }
+          for (const mk of w.marks) {
+            const at = (y0 - ly0 + rh / 2) / (ly1 - ly0);
+            const color = mk.kind === 'progress' ? col.warn : mk.kind === 'denied' ? col.danger : mk.kind === 'text' ? col.accent : col.muted;
+            mark('workers', mk.t, color, at, mk.kind === 'steer' ? 'diamond' : 'dot', 3);
+            hits.push({ lane: 'workers', x0: x(mk.t) - 4, x1: x(mk.t) + 4, y0, y1: y0 + rh, text: `${mk.kind}: ${mk.text}`, seqs: [mk.seq] });
+          }
+        }
       }
 
       // TTS: request sent, then audio streaming per sentence
