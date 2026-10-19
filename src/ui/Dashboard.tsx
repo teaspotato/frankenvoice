@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import type { Trajectory } from '../core/trajectory';
 import { TimelineModel, type Related } from './timeline';
 
@@ -116,6 +116,8 @@ export function Dashboard({
   onSeek,
   playhead,
   transport,
+  muted,
+  onMute,
 }: {
   trajectory?: Trajectory;
   running: boolean;
@@ -128,10 +130,13 @@ export function Dashboard({
   onFocusEvents(seqs: number[]): void;
   /** Empty timeline space or the time axis was clicked: seek there. */
   onSeek(t: number): void;
-  /** Where ▶ will start, shown while nothing runs. */
-  playhead: number | null;
+  /** Where ▶ will start while nothing runs; while a recorded session plays back, the current playback time. */
+  playhead: number | (() => number) | null;
   /** Play/pause/stop for the shown session. */
   transport: ReactNode;
+  /** Mute switches on the Mic lane (recorded mic, heard in replays) and the Playback lane (the agent). */
+  muted: { mic: boolean; agent: boolean };
+  onMute(which: 'mic' | 'agent'): void;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -153,8 +158,19 @@ export function Dashboard({
   if (trajectory && modelRef.current?.traj !== trajectory) modelRef.current = new TimelineModel(trajectory);
   if (!trajectory) modelRef.current = null;
 
-  // A new session starts following again.
-  useEffect(() => setView((v) => ({ ...v, end: null })), [trajectory]);
+  // A new session starts following again, except a replay of the one on screen: the view stays put.
+  const prevTraj = useRef(trajectory);
+  useEffect(() => {
+    const prev = prevTraj.current;
+    prevTraj.current = trajectory;
+    if (trajectory?.meta.mode === 'replay' && trajectory.meta.replayOf === prev?.meta.id) return;
+    setView((v) => ({ ...v, end: null }));
+  }, [trajectory]);
+
+  // Playing back a recorded session shows all of it; following turns pages only when the playhead leaves the view.
+  const playing = typeof playhead === 'function';
+  const page = useRef<number | null>(null);
+  if (!playing) page.current = null;
 
   useEffect(() => {
     const el = wrapRef.current;
@@ -177,7 +193,14 @@ export function Dashboard({
   }, [running]);
 
   const window_ = (m: TimelineModel | null): [number, number] => {
-    const head = Math.max(m?.duration ?? 0, running && now ? now() : 0);
+    if (playing && view.end === null) {
+      const t = (playhead as () => number)();
+      let end = page.current ?? Math.max(m?.duration ?? 0, view.span);
+      if (t > end - view.span * 0.02 || t < end - view.span) end = t - view.span * 0.05 + view.span;
+      page.current = end;
+      return [Math.max(end, view.span) - view.span, Math.max(end, view.span)];
+    }
+    const head = Math.max(m?.duration ?? 0, running && !playing && now ? now() : 0);
     // Never show time before the session started.
     const end = Math.max(view.end ?? head, view.span);
     return [end - view.span, end];
@@ -756,9 +779,10 @@ export function Dashboard({
       setRelInfo(info);
     }
 
-    // where ▶ starts
-    if (playhead !== null && playhead > 0 && playhead >= t0 && playhead <= t1) {
-      const px = Math.round(x(playhead)) + 0.5;
+    // where ▶ starts, or where playback is
+    const cursor = typeof playhead === 'function' ? playhead() : playhead;
+    if (cursor !== null && (playing || cursor > 0) && cursor >= t0 && cursor <= t1) {
+      const px = Math.round(x(cursor)) + 0.5;
       g.strokeStyle = col.accent;
       g.fillStyle = col.accent;
       g.beginPath();
@@ -863,7 +887,7 @@ export function Dashboard({
   };
   const fit = () => {
     const d = modelRef.current?.duration ?? 0;
-    setView({ span: Math.max(MIN_SPAN, d * 1.02), end: running ? null : d * 1.01 });
+    setView({ span: Math.max(MIN_SPAN, d * 1.02), end: running && !playing ? null : d * 1.01 });
   };
 
   let tip: Hit | undefined;
@@ -918,7 +942,7 @@ export function Dashboard({
       <div className="dashboard-bar">
         {transport}
         <span className="muted">
-          {trajectory ? (trajectory.meta.mode === 'replay' ? `replay of ${trajectory.meta.replayOf}` : running ? 'live' : trajectory.meta.id) : 'no session yet: press Run live'}
+          {trajectory ? (trajectory.meta.mode === 'replay' ? `replay of ${trajectory.meta.replayOf}` : playing ? `playing ${trajectory.meta.id}` : running ? 'live' : trajectory.meta.id) : 'no session yet: press Run live'}
         </span>
         <span className="spacer" />
         <small className="muted">click to seek · scroll to zoom · drag to pan · click a lane's name to select its stage</small>
@@ -930,6 +954,22 @@ export function Dashboard({
         </button>
       </div>
       <div className="dashboard-body" ref={wrapRef}>
+        {LANES.map((l, i) => {
+          const which = l.id === 'mic' ? 'mic' : l.id === 'speaker' ? 'agent' : null;
+          if (!which) return null;
+          const top = AXIS + LANES.slice(0, i).reduce((a, x) => a + x.height, 0) + l.height / 2 + 7;
+          return (
+            <button
+              key={l.id}
+              className={`lane-mute${muted[which] ? ' on' : ''}`}
+              style={{ top }}
+              onClick={() => onMute(which)}
+              title={muted[which] ? `Unmute ${which === 'mic' ? 'the recorded mic' : 'the agent'}` : `Mute ${which === 'mic' ? 'the recorded mic (heard in replays)' : 'the agent'}`}
+            >
+              {muted[which] ? '🔇' : '🔊'}
+            </button>
+          );
+        })}
         <canvas
           ref={canvasRef}
           onMouseDown={onMouseDown}
@@ -942,12 +982,12 @@ export function Dashboard({
           onDoubleClick={fit}
         />
         {hover && legend && (
-          <div className="dashboard-tip legend" style={{ left: LABEL_W + 4, top: hover.y + 14 }}>
+          <Tip className="dashboard-tip legend" x={LABEL_W - 8} y={hover.y} canvas={canvasRef} frame={wrapRef}>
             {legend}
-          </div>
+          </Tip>
         )}
         {hover && !legend && (tip || vadAt || cleanAt || turnAt) && (
-          <div className="dashboard-tip" style={{ left: Math.min(hover.x + 12, size.w - 320), top: hover.y + 14 }}>
+          <Tip className="dashboard-tip" x={hover.x} y={hover.y} canvas={canvasRef} frame={wrapRef}>
             {vadAt && <div>{vadAt}</div>}
             {turnAt && <div>{turnAt}</div>}
             {cleanAt && <div>{cleanAt}</div>}
@@ -969,9 +1009,43 @@ export function Dashboard({
                 {relInfo.down.length > 8 && <div className="muted">… {relInfo.down.length - 8} more</div>}
               </div>
             )}
-          </div>
+          </Tip>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * A hover tooltip kept inside the dashboard's visible area: below-right of the pointer by default,
+ * flipped left or above when it would cross the edge. Positioned against the viewport so the
+ * scrolling dashboard can't clip it; if it is taller than the dashboard it may extend past it, never past the window.
+ */
+function Tip(props: { x: number; y: number; canvas: RefObject<HTMLCanvasElement | null>; frame: RefObject<HTMLDivElement | null>; className: string; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    const c = props.canvas.current?.getBoundingClientRect();
+    const f = props.frame.current?.getBoundingClientRect();
+    if (!el || !c || !f) return;
+    const pad = 4;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const px = c.left + props.x;
+    const py = c.top + props.y;
+    let left = px + 12;
+    if (left + w > f.right - pad) left = px - 12 - w;
+    left = Math.max(Math.max(f.left, 0) + pad, Math.min(left, window.innerWidth - w - pad));
+    let top = py + 14;
+    if (top + h > f.bottom - pad) top = py - 10 - h;
+    if (top < f.top + pad) top = Math.max(pad, Math.min(f.top + pad, window.innerHeight - h - pad));
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+    el.style.visibility = 'visible';
+  });
+  return (
+    <div ref={ref} className={props.className} style={{ position: 'fixed', left: 0, top: 0, visibility: 'hidden' }}>
+      {props.children}
     </div>
   );
 }

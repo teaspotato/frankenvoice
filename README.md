@@ -113,7 +113,7 @@ How the runtime ensures that:
 
 Replay options:
 
-- **real time / audible** paces the virtual clock against the wall clock and plays the agent audio again (output channels such as `speaker` and `speech-synthesis` run live as monitors).
+- **real time / audible** paces the virtual clock against the wall clock and plays both sides again: the recorded mic, and the agent audio (output channels such as `speaker` and `speech-synthesis` run live as monitors). The 🔊 buttons on the Mic and Playback lanes mute either side.
 - **replay with current config** runs the current stage config against the recorded world. Upstream nodes reproduce exactly; any exchange whose request differs from the recording is flagged as an `io.diverge` event.
 - **live channels** (for example `anthropic`) serves those channels live during replay, so the same recorded user audio can be run against a new LLM or TTS.
 

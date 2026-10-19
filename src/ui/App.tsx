@@ -9,7 +9,7 @@ import { decodeBundle, encodeBundle } from '../core/bundle';
 import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
 import type { Json } from '../core/types';
-import { browserDrivers, setOutputPaused, setOutputSuppressed } from '../drivers';
+import { browserDrivers, micMonitor, sessionTitle, setOutputMuted, setOutputPaused, setOutputSuppressed } from '../drivers';
 import {
   CONFIG_FORMAT,
   activeStages,
@@ -32,6 +32,31 @@ import { ActivityTracker, NO_ACTIVITY, type Activity } from './activity';
 
 const CONFIG_KEY = 'frankenvoice.pipeline';
 const AUTOSAVE_KEY = 'frankenvoice.autosave';
+const MUTE_KEY = 'frankenvoice.mute';
+const TITLE_KEY = 'frankenvoice.autoTitle';
+
+/** What was said in a session, for naming it: user turns and the agent's replies, in order. */
+function transcriptOf(traj: Trajectory): string {
+  const lines: string[] = [];
+  for (const e of traj.events) {
+    if (e.kind !== 'msg') continue;
+    const d = e.data as { type?: string; text?: string };
+    if (d.type === 'turn.user' && d.text) lines.push(`User: ${d.text}`);
+    else if (d.type === 'llm.end' && d.text) lines.push(`Agent: ${d.text}`);
+  }
+  return lines.join('\n').slice(0, 6000);
+}
+
+/** A title made safe as a session (file) name. */
+function titleToName(title: string): string {
+  return title
+    .replace(/[\/\\:*?"<>|\x00-\x1f]/g, ' ')
+    .replace(/^[\s.]+/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60)
+    .trim();
+}
 
 function loadConfig(): PipelineConfig {
   try {
@@ -75,10 +100,31 @@ export function App() {
   const [config, setConfig] = useState<PipelineConfig>(loadConfig);
   const [selected, setSelected] = useState<StageId | null>(null);
   const [running, setRunning] = useState<'live' | 'replay' | null>(null);
+  /** Mute switches on the Mic and Playback lanes: the recorded mic (heard during replay) and the agent's voice. */
+  const [muted, setMuted] = useState<{ mic: boolean; agent: boolean }>(() => {
+    try {
+      return { mic: false, agent: false, ...(JSON.parse(localStorage.getItem(MUTE_KEY) ?? '{}') as object) };
+    } catch {
+      return { mic: false, agent: false };
+    }
+  });
+  useEffect(() => {
+    setOutputMuted('mic', muted.mic);
+    setOutputMuted('agent', muted.agent);
+    try {
+      localStorage.setItem(MUTE_KEY, JSON.stringify(muted));
+    } catch {
+      /* storage unavailable: muting still works for this tab */
+    }
+  }, [muted]);
+  /** The running replay plays a session back as recorded: the dashboard keeps showing that session. */
+  const [playingBack, setPlayingBack] = useState(false);
   const [nodeStates, setNodeStates] = useState<Record<string, Record<string, Json>>>({});
   /** Node type behind each entry of nodeStates (the run they came from may predate a config change). */
   const [stateTypes, setStateTypes] = useState<Record<string, string>>({});
   const [sessions, setSessions] = useState<Session[]>([]);
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
   const [current, setCurrent] = useState<Session | null>(null);
   const [health, setHealth] = useState<Record<string, boolean> | null>(null);
   const [replayOpts, setReplayOpts] = useState({ audible: true, realtime: true, useCurrentConfig: false, liveChannels: '' });
@@ -87,6 +133,31 @@ export function App() {
   const [renaming, setRenaming] = useState<Session | string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [serverSessions, setServerSessions] = useState<string[]>([]);
+  /** Name each finished live session from its content, with this model ('' = off). */
+  const [autoTitle, setAutoTitle] = useState(() => {
+    try {
+      return localStorage.getItem(TITLE_KEY) ?? 'claude-haiku-5-5';
+    } catch {
+      return 'claude-haiku-5-5';
+    }
+  });
+  const [titleOn, setTitleOn] = useState(() => {
+    try {
+      return localStorage.getItem(TITLE_KEY + '.on') !== 'off';
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(TITLE_KEY, autoTitle);
+      localStorage.setItem(TITLE_KEY + '.on', titleOn ? 'on' : 'off');
+    } catch {
+      /* storage unavailable */
+    }
+  }, [autoTitle, titleOn]);
+  const titleRef = useRef({ on: titleOn, model: autoTitle });
+  titleRef.current = { on: titleOn, model: autoTitle };
   const [autosave, setAutosave] = useState(() => {
     try {
       return localStorage.getItem(AUTOSAVE_KEY) !== 'off';
@@ -165,15 +236,53 @@ export function App() {
     });
   };
 
-  const finishSession = async (rt: Runtime, source?: Trajectory, stoppedAt?: number) => {
+  /**
+   * A live run or a replay with a changed config becomes a new session in the list. Playing a session
+   * back as recorded doesn't: the view returns to that session, with a notice only if the replay diverged.
+   */
+  const finishSession = async (rt: Runtime, origin?: Session, keep = true, stoppedAt?: number) => {
     const s: Session = { traj: rt.trajectory, stoppedAt };
-    if (source) s.comparison = compareTrajectories(source, rt.trajectory);
-    setSessions((ss) => [s, ...ss]);
-    setCurrent(s);
+    if (origin) s.comparison = compareTrajectories(origin.traj, rt.trajectory);
+    if (keep) {
+      setSessions((ss) => [s, ...ss]);
+      setCurrent(s);
+    } else {
+      setCurrent(origin!);
+      const verdict = describeComparison(s);
+      if (!verdict.includes('✓')) setNotice(`Playback of ${origin!.traj.meta.id} ${verdict}: the code changed since it was recorded.`);
+    }
     setRunning(null);
     stopActivity.current();
     setPaused(false);
     if (rt.trajectory.meta.mode === 'live' && autosaveRef.current) await saveSession(s);
+    if (rt.trajectory.meta.mode === 'live' && titleRef.current.on && titleRef.current.model) void nameSession(s, titleRef.current.model);
+  };
+
+  /** Rename a finished session after what it was about; on any failure it keeps its generated id. */
+  const nameSession = async (s: Session, model: string) => {
+    const transcript = transcriptOf(s.traj);
+    if (!transcript) return;
+    let name: string;
+    try {
+      name = titleToName(await sessionTitle(model, transcript));
+    } catch (e) {
+      return setNotice(`Could not title the session with ${model}: ${String(e).slice(0, 200)}`);
+    }
+    if (!name) return;
+    const from = s.traj.meta.id;
+    for (let n = 1; n <= 9; n++) {
+      const to = n === 1 ? name : `${name} ${n}`;
+      if (s.saved) {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(from)}`, { method: 'PATCH', body: JSON.stringify({ id: to }) }).catch(() => null);
+        if (res?.status === 409) continue;
+        if (!res?.ok) return;
+        s.saved = ((await res.json()) as { path: string }).path;
+        setServerSessions((l) => l.map((x) => (x === from ? to : x)));
+      } else if (sessionsRef.current.some((x) => x !== s && x.traj.meta.id === to)) continue;
+      s.traj.meta.id = to;
+      setSessions((ss) => [...ss]);
+      return;
+    }
   };
 
   const saveSession = async (s: Session) => {
@@ -236,7 +345,10 @@ export function App() {
     }
   };
 
-  const replay = async (source: Trajectory, from = 0) => {
+  const replay = async (origin: Session, from = 0) => {
+    const source = origin.traj;
+    const keep = replayOpts.useCurrentConfig;
+    setNotice('');
     const outputChannels = Object.values(registry).flatMap((d) => (d.channels ?? []).filter((c) => c.output).map((c) => c.name));
     const liveChannels = replayOpts.liveChannels
       .split(',')
@@ -251,13 +363,26 @@ export function App() {
     });
     simRef.current = sim;
     attach(rt, sim);
-    setCurrent({ traj: rt.trajectory });
+    if (keep) setCurrent({ traj: rt.trajectory });
+    setPlayingBack(!keep);
     setRunning('replay');
     setPlayFrom(0);
     if (replayOpts.realtime) {
+      // Hear the user's side too: the mic frames as the replay reaches them.
+      const mic = replayOpts.audible ? micMonitor() : null;
+      const unsub = mic
+        ? rt.trajectory.subscribe((e) => {
+            if (e.kind === 'msg' && e.node === 'mic' && e.media) {
+              const d = e.data as { sampleRate?: number };
+              mic.play(new Float32Array(rt.trajectory.tracks.readF32Range(e.media.track, e.media.start, e.media.end)), d.sampleRate ?? 16000);
+            }
+          })
+        : () => {};
       const done = sim.runRealtime(1);
       if (from > 0) skipTo(sim, from);
       await done;
+      unsub();
+      mic?.close();
     } else sim.runFast();
     const stoppedAt = rt.isRunning ? sim.now() : undefined;
     if (rt.isRunning) rt.stop();
@@ -266,9 +391,9 @@ export function App() {
       // Seeking backwards: start over and skip to the new time; this partial run isn't kept.
       restartAt.current = null;
       stopActivity.current();
-      return replay(source, again);
+      return replay(origin, again);
     }
-    await finishSession(rt, source, stoppedAt);
+    await finishSession(rt, origin, keep, stoppedAt);
   };
 
   /** Seek: a replay jumps there (restarting if it's earlier); otherwise ▶ will start there. */
@@ -302,7 +427,7 @@ export function App() {
         </button>
       ) : (
         <button
-          onClick={() => current && replay(current.traj, playFrom)}
+          onClick={() => current && replay(current, playFrom)}
           disabled={!!running || !current}
           title={running === 'live' ? "A live session can't be paused" : 'Replay this session (space)'}
         >
@@ -317,7 +442,7 @@ export function App() {
 
   // Space plays, pauses or resumes, unless typing somewhere.
   const spaceRef = useRef(() => {});
-  spaceRef.current = () => (running === 'replay' ? togglePause() : !running && current && replay(current.traj, playFrom));
+  spaceRef.current = () => (running === 'replay' ? togglePause() : !running && current && replay(current, playFrom));
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.code !== 'Space' || (e.target as HTMLElement).closest('input, textarea, select, button, [contenteditable]')) return;
@@ -501,7 +626,9 @@ export function App() {
           onSelect={(lane, item) => selectStage(stageOf(lane), !item)}
           transport={transport}
           onSeek={seek}
-          playhead={running ? null : playFrom}
+          muted={muted}
+          onMute={(which) => setMuted((m) => ({ ...m, [which]: !m[which] }))}
+          playhead={running === 'replay' && playingBack ? () => simRef.current?.now() ?? 0 : running ? null : playFrom}
           onFocusEvents={(seqs) => setFocus((f) => ({ seqs, n: (f?.n ?? 0) + 1 }))}
         />
       </section>
@@ -518,6 +645,10 @@ export function App() {
         <label className="autosave" title="Save each live session to the proxy's sessions folder when it stops">
           <input type="checkbox" checked={autosave} onChange={(e) => setAutosave(e.target.checked)} /> autosave live sessions
         </label>
+        <label className="autosave" title="When a live session stops, ask this model for a short title and rename the session to it (uses the Anthropic key)">
+          <input type="checkbox" checked={titleOn} onChange={(e) => setTitleOn(e.target.checked)} /> name sessions with{' '}
+          <input className="title-model" value={autoTitle} disabled={!titleOn} onChange={(e) => setAutoTitle(e.target.value)} />
+        </label>
         <div className="replay-opts">
           <label>
             <input type="checkbox" checked={replayOpts.realtime} onChange={(e) => setReplayOpts({ ...replayOpts, realtime: e.target.checked })} /> real time
@@ -525,7 +656,7 @@ export function App() {
           <label>
             <input type="checkbox" checked={replayOpts.audible} onChange={(e) => setReplayOpts({ ...replayOpts, audible: e.target.checked })} /> audible
           </label>
-          <label>
+          <label title="Run the recording through the current stage config instead of the one it was recorded with. The result is kept as a new entry in the list, compared with the original.">
             <input
               type="checkbox"
               checked={replayOpts.useCurrentConfig}
@@ -561,7 +692,7 @@ export function App() {
                 {s.saved && ' · saved'}
               </small>
               <span>
-                <button disabled={!!running} onClick={() => replay(s.traj)}>
+                <button disabled={!!running} onClick={() => replay(s)}>
                   Replay
                 </button>
                 {!s.saved && s.traj.meta.mode === 'live' && (

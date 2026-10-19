@@ -6,6 +6,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { dirname, join, resolve } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 
@@ -183,7 +184,12 @@ async function forward(name: string, rest: string, req: IncomingMessage, res: Se
   });
   res.writeHead(upstream.status, outHeaders);
   if (!upstream.body) return res.end();
-  Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream).pipe(res);
+  // Errors mid-stream (the browser aborting a reply it no longer wants, the upstream resetting) end
+  // this response only. With a bare .pipe() they were unhandled and took the whole proxy down.
+  await pipeline(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream), res).catch((e: unknown) => {
+    if (!ac.signal.aborted) console.warn(`[${name}] response stream failed: ${String(e)}`);
+    res.destroy();
+  });
 }
 
 /** Close codes 1005/1006/1015 are reserved and may not be sent in a close frame. */
@@ -280,11 +286,15 @@ server.on('upgrade', (req, socket, head) => {
     remote.on('unexpected-response', (_r, res) => {
       client.close(1011, `deepgram HTTP ${res.statusCode}`.slice(0, 120));
     });
-    remote.on('close', (code, reason) => client.readyState === WebSocket.OPEN && client.close(sendableCode(code), reason));
+    // A close reason over 123 bytes throws; keep it short.
+    remote.on('close', (code, reason) => client.readyState === WebSocket.OPEN && client.close(sendableCode(code), reason.subarray(0, 120)));
     remote.on('error', (e) => client.readyState === WebSocket.OPEN && client.close(1011, String(e).slice(0, 120)));
     client.on('close', () => remote.readyState <= WebSocket.OPEN && remote.close());
   });
 });
+
+// Last resort: one bad request must not stop the proxy, which would drop every connection of a live session.
+process.on('uncaughtException', (e) => console.error('[proxy] uncaught error, still running:', e));
 
 server.listen(PORT, '127.0.0.1', () => {
   const keys = Object.entries(upstreams)

@@ -103,7 +103,7 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 .dashboard-bar button.on { border-color: var(--accent); color: var(--accent); }
 .dashboard-body { position: relative; flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
 .dashboard-body canvas { display: block; cursor: crosshair; }
-.dashboard-tip { position: absolute; max-width: 320px; pointer-events: none; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; font: 11px/1.35 var(--mono); white-space: pre-wrap; box-shadow: 0 2px 8px rgb(0 0 0 / 0.15); z-index: 5; }
+.dashboard-tip { position: fixed; max-width: 320px; pointer-events: none; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; font: 11px/1.35 var(--mono); white-space: pre-wrap; box-shadow: 0 2px 8px rgb(0 0 0 / 0.15); z-index: 50; }
 .dashboard-tip.legend { max-width: 380px; font-family: system-ui, sans-serif; }
 .dashboard-tip .rel { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
 .dashboard-tip .rel.up b { color: var(--warn); }
@@ -166,3 +166,7 @@ pre.state { font: 11px/1.35 var(--mono); background: var(--bg); padding: 6px; bo
 @media (max-width: 560px) { .setting { grid-template-columns: 1fr auto auto; } .setting > span:first-child { grid-column: 1 / -1; } .setting input { grid-column: 1; } }
 button.link.warn { color: var(--warn); }
 button.danger-link { color: var(--danger); margin-left: auto; }
+.lane-mute { position: absolute; left: 6px; z-index: 2; padding: 0 3px; height: 16px; line-height: 14px; font-size: 11px; border: 1px solid var(--border); border-radius: 3px; background: var(--panel); cursor: pointer; opacity: 0.75; }
+.lane-mute:hover { opacity: 1; }
+.lane-mute.on { opacity: 1; border-color: var(--danger, #c33); }
+.title-model { width: 9.5em; font: 11px var(--mono); margin-left: 2px; }
