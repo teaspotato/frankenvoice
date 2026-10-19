@@ -31,7 +31,7 @@ const LEGEND: Record<string, string> = {
   asr:
     'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
   turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), grey dot = backchannel or noise, ignored.',
-  llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped). Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
+  llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a thin bar under a reply is its opener (orange when spoken). Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
   speaker:
     'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries.',
@@ -706,6 +706,32 @@ export function Dashboard({
           seqs: d.seqs,
         });
       }
+
+      // Openers: the fast model's few words, a thin bar under the reply (solid when spoken)
+      m.openers.forEach((o, i) => {
+        const end = o.t1 ?? head;
+        if (end < t0 || o.t0 > t1) return;
+        const [ly0, ly1] = laneY.llm;
+        const h = ly1 - ly0;
+        const spoken = o.status === 'spoken';
+        const x0 = x(o.t0);
+        const x1 = Math.max(x(end), x0 + 2);
+        g.globalAlpha = spoken ? 0.8 : 0.3;
+        g.fillStyle = spoken ? col.warn : col.muted;
+        g.fillRect(x0, ly0 + h * 0.42, x1 - x0, h * 0.06);
+        g.globalAlpha = 1;
+        const next = m.openers[i + 1];
+        if (spoken) label(`opener: ${o.text}`, x1 + 3, Math.min(x1 + 160, next ? x(next.t0) - 3 : Infinity), ly0 + h * 0.45, col.warn);
+        hits.push({
+          lane: 'llm',
+          x0,
+          x1,
+          y0: ly0 + h * 0.4,
+          y1: ly0 + h * 0.5,
+          text: `opener ${o.status ?? 'running…'}${o.why ? ` (${o.why})` : ''} after ${(end - o.t0).toFixed(0)} ms${o.text ? `: ${o.text}` : ''}`,
+          seqs: o.seqs,
+        });
+      });
 
       // LLM: waiting for the first token, then generating; below, each chunk at its arrival
       for (const l of m.llm) {

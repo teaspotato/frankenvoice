@@ -194,7 +194,8 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
           case 'llm.delta':
             if (!r || r.rid !== msg.rid) return;
             r.buf += msg.text as string;
-            send(r, false);
+            // An opener is said as soon as it arrives, whatever its punctuation.
+            send(r, !!msg.opener);
             break;
           case 'llm.end':
             if (!r || r.rid !== msg.rid) return;

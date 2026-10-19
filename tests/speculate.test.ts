@@ -143,7 +143,7 @@ describe('drafting replies before the turn is committed', () => {
 });
 
 describe('the LLM on drafts', () => {
-  const params = { provider: 'openai-compatible', model: 'm', system: 'sys' };
+  const params = { provider: 'openai-compatible', model: 'm', system: 'sys', opener: false };
   const tok = (text: string) => ({ choices: [{ index: 0, delta: { content: text } }] });
   const messages = (r: Json) => (r as { body: { messages: { role: string; content: string }[] } }).body.messages.map((m) => m.content);
 

@@ -27,7 +27,8 @@ export const registry: NodeRegistry = Object.fromEntries(
  */
 export function migrateGraph(g: GraphSpec): GraphSpec {
   if (g.formatVersion >= GRAPH_FORMAT_VERSION) return g;
-  if (g.formatVersion >= 2) return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: g.nodes.map(noDrafts) };
+  const older = (n: NodeSpec) => (g.formatVersion < 3 ? noDrafts(noOpener(n)) : noOpener(n));
+  if (g.formatVersion >= 2) return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: g.nodes.map(older) };
   const prefix = (provider: string, params: Record<string, Json>, rename: Record<string, string> = {}) => ({
     provider,
     ...Object.fromEntries(Object.entries(params).map(([k, v]) => [`${provider}.${rename[k] ?? k}`, v])),
@@ -50,7 +51,16 @@ export function migrateGraph(g: GraphSpec): GraphSpec {
         return n;
     }
   });
-  return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: nodes.map(noDrafts) };
+  return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: nodes.map(older) };
 }
 
+/** Before format 4 the LLM had no opener, sent no thinking setting and defaulted to Opus. */
+const noOpener = (n: NodeSpec): NodeSpec => {
+  if (n.type !== 'llm') return n;
+  const p = { ...n.params };
+  p.opener ??= false;
+  p.thinking ??= 'model default';
+  if ((p.provider ?? 'anthropic') === 'anthropic' && !p.model) p.model = 'claude-opus-5-5';
+  return { ...n, params: p };
+};
 const noDrafts = (n: NodeSpec): NodeSpec => (n.type === 'turn.duplex' && n.params.speculate === undefined ? { ...n, params: { ...n.params, speculate: false } } : n);

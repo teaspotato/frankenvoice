@@ -46,6 +46,13 @@ export interface Draft extends Span {
   why?: string;
 }
 
+/** The fast model's few words of acknowledgement for a reply: spoken first, skipped or cancelled. */
+export interface Opener extends Span {
+  rid: string;
+  status?: string;
+  why?: string;
+}
+
 export interface AudioBlock {
   t: number;
   peaks: Float32Array;
@@ -104,6 +111,7 @@ export class TimelineModel {
   bargeIns: { t0: number; t1?: number; decision?: string; why?: string; text: string; seqs: number[] }[] = [];
   llm: LlmSpan[] = [];
   drafts: Draft[] = [];
+  openers: Opener[] = [];
   ttsRequests: { t: number; seq: number }[] = [];
   tts: (Span & { rid: string; seg: number })[] = [];
   playback: (Span & { rid: string; interrupted?: boolean; heard?: string })[] = [];
@@ -337,6 +345,20 @@ export class TimelineModel {
       case 'llm.draft':
         this.drafts.push({ rid: d.rid, t0: e.t, text: d.text ?? '', seqs: [e.seq] });
         break;
+      case 'llm.opener':
+        this.openers.push({ rid: d.rid, t0: e.t, text: '', seqs: [e.seq] });
+        break;
+      case 'llm.opener_end': {
+        const o = this.openers.find((x) => x.rid === d.rid && x.t1 === undefined);
+        if (o) {
+          o.t1 = e.t;
+          o.status = d.status;
+          o.why = d.why;
+          o.text = d.text ?? '';
+          o.seqs.push(e.seq);
+        }
+        break;
+      }
       case 'llm.draft_end': {
         const r = this.drafts.find((x) => x.rid === d.rid);
         if (r) {

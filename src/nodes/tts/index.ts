@@ -148,6 +148,11 @@ export const ttsNode: NodeDef = {
           case 'llm.delta':
             if (msg.rid !== rid) return;
             for (const seg of splitter.push(msg.text as string)) speak(seg);
+            if (msg.opener) {
+              // An opener is said as soon as it arrives, whatever its punctuation.
+              const rest = splitter.flush();
+              if (rest) speak(rest);
+            }
             break;
           case 'llm.end': {
             if (msg.rid !== rid) return;

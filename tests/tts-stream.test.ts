@@ -69,6 +69,16 @@ describe('streaming TTS (Deepgram WebSocket)', () => {
     expect(h.ios[0].closed).toBe(true);
   });
 
+  it('speaks an opener at once, and the reply goes on the same socket after it', () => {
+    const h = harness();
+    h.llm(0, 'start');
+    h.send(100, 'text', { type: 'llm.delta', rid: 'r0', text: 'Hmm, let me see ', opener: true });
+    expect(h.ios[0].sent).toEqual([{ type: 'Speak', text: 'Hmm, let me see' }, { type: 'Flush' }]);
+    h.llm(900, 'delta', 'It is 391. ');
+    expect(h.ios).toHaveLength(1);
+    expect(h.ios[0].sent.slice(2)).toEqual([{ type: 'Speak', text: 'It is 391.' }, { type: 'Flush' }]);
+  });
+
   it('stops on cancel and drops audio still in flight', () => {
     const h = harness();
     h.llm(0, 'start');
