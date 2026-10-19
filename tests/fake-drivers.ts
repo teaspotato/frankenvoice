@@ -7,6 +7,28 @@ import type { Json } from '../src/core/types';
 const jitter = (base: number, spread: number) => base + Math.random() * spread;
 const later = (ms: number, fn: () => void) => setTimeout(fn, ms);
 
+/**
+ * Delivers messages one at a time, in order, each a gap after the last, like a
+ * stream. (Separate timers can fire out of order when their times are close.)
+ */
+function sequence(deliver: (m: Json) => void, isClosed: () => boolean) {
+  const queue: { m: Json | (() => void); gap: number }[] = [];
+  let pumping = false;
+  const pump = () => {
+    const next = queue.shift();
+    if (!next) return void (pumping = false);
+    pumping = true;
+    later(next.gap, () => {
+      if (!isClosed()) typeof next.m === 'function' ? next.m() : deliver(next.m);
+      pump();
+    });
+  };
+  return (m: Json | (() => void), gap = jitter(0.5, 2)) => {
+    queue.push({ m, gap });
+    if (!pumping) pump();
+  };
+}
+
 /** 16 kHz mic: silence, then a loud noise burst ("speech"), then silence; repeated. */
 const mic: LiveDriver = (req, sink) => {
   const { frameSamples } = req as { frameSamples: number };
@@ -90,12 +112,8 @@ const anthropic: LiveDriver = (req, sink) => {
   const reply = delegate ? 'Let me look that up.' : `Reply number ${r.messages.length}. This is a second sentence! And a third?`;
   const tokens = reply.match(/\S+\s*/g)!;
   let closed = false;
-  let t = jitter(2, 3);
-  const ev = (e: Json) => {
-    t += jitter(0.5, 2);
-    later(t, () => !closed && sink.recv(e));
-  };
-  ev({ type: 'message_start', message: { id: 'msg_fake', role: 'assistant', content: [] } });
+  const ev = sequence((e) => sink.recv(e), () => closed);
+  ev({ type: 'message_start', message: { id: 'msg_fake', role: 'assistant', content: [] } }, jitter(2.5, 4));
   let i = 0;
   ev({ type: 'content_block_start', index: i, content_block: { type: 'text', text: '' } });
   for (const tok of tokens) ev({ type: 'content_block_delta', index: i, delta: { type: 'text_delta', text: tok } });
@@ -107,18 +125,14 @@ const anthropic: LiveDriver = (req, sink) => {
   }
   ev({ type: 'message_delta', delta: { stop_reason: delegate ? 'tool_use' : 'end_turn' } });
   ev({ type: 'message_stop' });
-  later(t + 1, () => !closed && sink.close());
+  ev(() => sink.close(), 1);
   return { send() {}, close: () => void (closed = true) };
 };
 
 /** An ACP agent: sets up a session, then answers each prompt after thinking and one web fetch (asking permission first). */
 const acp: LiveDriver = (_req, sink) => {
   let closed = false;
-  let t = 0;
-  const out = (m: Json, gap = jitter(0.5, 2)) => {
-    t = Math.max(t, performance.now()) + gap;
-    later(t - performance.now(), () => !closed && sink.recv(m));
-  };
+  const out = sequence((m) => sink.recv(m), () => closed);
   const update = (sessionId: string, u: Json) => out({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update: u } });
   out({ $open: { cwd: '/tmp/fake-workers', command: 'fake-acp', pid: 1 } }, 1);
   let calls = 0;
