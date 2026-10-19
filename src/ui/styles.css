@@ -170,3 +170,10 @@ button.danger-link { color: var(--danger); margin-left: auto; }
 .lane-mute:hover { opacity: 1; }
 .lane-mute.on { opacity: 1; border-color: var(--danger, #c33); }
 .title-model { width: 9.5em; font: 11px var(--mono); margin-left: 2px; }
+.span-details { border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 8px; }
+.span-details h3 { display: flex; gap: 6px; align-items: baseline; }
+.span-details h3 .link { margin-left: auto; font-size: 16px; }
+.span-details pre { max-height: 360px; overflow: auto; font: 11px/1.4 var(--mono); white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 6px; margin: 4px 0; }
+.span-details summary { cursor: pointer; font-size: 12px; margin-top: 4px; }
+.exchange { margin: 6px 0; }
+.exchange-head { font-size: 12px; }
