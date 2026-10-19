@@ -90,14 +90,32 @@ them the same way.
 
 - **A new engine costs about 18 points** where a new voice of a known engine costs
   almost nothing. Each extra engine in the training mix buys back about half of that.
-  Fish should help the same way. A separate thread is generating Fish clips into
-  `data/fish_*.npz`.
 - **On Bugs 2 the mixed model is the best so far.** At +0.4 s:
   - all 3 backchannels resumed correctly;
   - 2 of the 3 "So" attempts stopped correctly (one was heard as "wait", which is
     still a floor opener);
   - the one wrong action is resuming on the quietest "So (gave up)", which it heard as
     noise.
+
+### Unseen engine and speakers: Fish Audio
+
+The Fish clips come from `fish_synth.py`: 711 training clips in 107 voices and 237 test
+clips in 27 other voices. The split is in `fish_split.json`.
+
+| Trained on | Unseen Fish test voices (27) | Bugs 2 at +0.4 s | Bugs 2 at +0.5 s |
+|---|---|---|---|
+| Kokoro only | 78% | 4/10; decided 4 times, wrong 2 | |
+| Kokoro + Aura (Fish never heard) | 86% | 6/10; decided 6 times, wrong 1 | 6 decided, 1 wrong |
+| Kokoro + Aura + 107 Fish voices | **92%** | 6/10; decided 7 times, wrong 2 | 6 decided, 1 wrong |
+
+- **Generalization to new engines rises with the number of engines:** 77–78% from
+  one engine, 86% from two, and 92% on new voices of a third engine it has seen.
+- **Bugs 2 doesn't move,** because the remaining errors aren't about the voice:
+  - the quietest "So (gave up)" is still heard as noise;
+  - with Fish added, "Okay. So so…" has p(more) = 0.48 at +0.4 s. That's just under the
+    0.5 threshold, so the model resumes on it at +0.4 s and gets it right from +0.5 s.
+
+This is consistent with the channel being the remaining gap (below).
 
 ## Why the channel matters (measured)
 
@@ -140,7 +158,7 @@ All in `research/bc-spotter/` on branch `claude/project-thread-5jvmuc`:
 - `vocab.py`: classes and spellings.
 - `cut_real.py`: word-onset windows from `.fvs` sessions.
 - `eval_set.py`: the 10 labeled overlaps.
-- `synth.py`: Kokoro generator; `synth_deepgram.py`: the same prompts in Deepgram Aura-2 voices.
+- `synth.py`: Kokoro generator; `synth_deepgram.py` and `fish_synth.py`: the same prompts in Deepgram Aura-2 and Fish voices.
 - `split_takes.py` and `takes.txt`: your own recordings.
 - `train.py`: training, evaluation and ONNX export.
 
@@ -158,5 +176,6 @@ Session directories are unzipped `.fvs` files.
 The project folder `frankenvoice/research/bc-spotter/` has a copy, plus:
 
 - `data/`: the three `.npz` sets above;
+- `ckpt-all/`: the Kokoro + Aura + Fish model (3,000 steps, `PRE = 0.5`).
 - `ckpt-800/`: the 800-step model. It was trained with `PRE = 0.3`, so set that in
   `train.py` before loading it with `--load`.
