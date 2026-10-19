@@ -599,6 +599,8 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
   // Ducking, ahead of the mute switch; kept across a context change.
   let level = 1;
   let duck: GainNode | null = null;
+  /** Fades the reply out at a cut; back to 1 once the cut sources have stopped. */
+  let fade: GainNode | null = null;
   /** Timed chunks that arrived while a replay was skipping ahead (needs `clock`). */
   let held: { samples: Float32Array<ArrayBuffer>; sampleRate: number; at: number }[] = [];
   const release = () => {
@@ -611,8 +613,17 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
       play(c.samples.subarray(cut), c.sampleRate, Math.max(c.at, now), now);
     }
   };
-  const stop = () => {
-    for (const src of playing) src.stop();
+  /** Stop everything: now, or at session time `at` (ms, with the session clock `now`) after fading out over `releaseMs`. */
+  const stop = (at?: number, now?: number, releaseMs = 0) => {
+    if (o && fade && at !== undefined && now !== undefined) {
+      const t = o.ctx.currentTime + Math.max(0, (at - now) / 1000);
+      const r = Math.max(0.001, releaseMs / 1000);
+      fade.gain.cancelScheduledValues(o.ctx.currentTime);
+      fade.gain.setValueAtTime(1, t);
+      fade.gain.linearRampToValueAtTime(0, t + r);
+      fade.gain.setValueAtTime(1, t + r + 0.002);
+      for (const src of playing) src.stop(t + r);
+    } else for (const src of playing) src.stop();
     playing.clear();
     nextAt = NaN;
     held = [];
@@ -633,9 +644,11 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
       duck = o.ctx.createGain();
       duck.gain.value = level;
       duck.connect(o.out);
+      fade = o.ctx.createGain();
+      fade.connect(duck);
     }
     const { ctx } = o;
-    const out = duck!;
+    const out = fade!;
     const buf = ctx.createBuffer(1, samples.length, sampleRate);
     buf.copyToChannel(samples, 0);
     const src = ctx.createBufferSource();
@@ -669,6 +682,7 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
       o?.close();
       o = null;
       duck = null;
+      fade = null;
     },
   };
 }
@@ -695,9 +709,9 @@ const speaker: LiveDriver = (_req, sink, env) => {
   setTimeout(() => sink.recv({ type: 'ready' }), 0);
   return {
     send(data, bin) {
-      const d = data as { cmd: string; at?: number; sampleRate?: number; gain?: number };
+      const d = data as { cmd: string; at?: number; sampleRate?: number; gain?: number; releaseMs?: number };
       if (d.cmd === 'cue' && bin) return cues.play(new Float32Array(bin.slice().buffer), d.sampleRate!, d.at!, env.now());
-      if (d.cmd === 'flush') return out.stop();
+      if (d.cmd === 'flush') return d.at === undefined ? out.stop() : out.stop(d.at, env.now(), d.releaseMs);
       if (d.cmd === 'gain') return out.setGain(d.gain ?? 1);
       if (d.cmd !== 'play' || !bin) return;
       out.play(new Float32Array(bin.slice().buffer), d.sampleRate!, d.at!, env.now());
