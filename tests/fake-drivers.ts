@@ -85,29 +85,23 @@ const anthropic: LiveDriver = (req, sink) => {
   const r = req as { messages: { role: string; content: { type: string }[] }[]; tools?: { name: string }[] };
   const tools = new Set((r.tools ?? []).map((x) => x.name));
   const last = r.messages[r.messages.length - 1];
-  // The conversation delegates on the first user turn; the background agent thinks, then answers.
-  const delegate = tools.has('task_start') && r.messages.length === 1 && last.content[0]?.type === 'text';
-  const agent = tools.has('report_progress');
-  const reply = agent ? 'The answer is 42.' : delegate ? 'Let me look that up.' : `Reply number ${r.messages.length}. This is a second sentence! And a third?`;
+  // The conversation starts a worker on the first user turn.
+  const delegate = tools.has('spawn_worker') && r.messages.length === 1 && last.content[0]?.type === 'text';
+  const reply = delegate ? 'Let me look that up.' : `Reply number ${r.messages.length}. This is a second sentence! And a third?`;
   const tokens = reply.match(/\S+\s*/g)!;
   let closed = false;
-  let t = jitter(2, 3) + (agent ? 150 : 0);
+  let t = jitter(2, 3);
   const ev = (e: Json) => {
     t += jitter(0.5, 2);
     later(t, () => !closed && sink.recv(e));
   };
   ev({ type: 'message_start', message: { id: 'msg_fake', role: 'assistant', content: [] } });
   let i = 0;
-  if (agent) {
-    ev({ type: 'content_block_start', index: i, content_block: { type: 'thinking', thinking: '' } });
-    ev({ type: 'content_block_delta', index: i, delta: { type: 'thinking_delta', thinking: 'Deep thought.' } });
-    ev({ type: 'content_block_stop', index: i++ });
-  }
   ev({ type: 'content_block_start', index: i, content_block: { type: 'text', text: '' } });
   for (const tok of tokens) ev({ type: 'content_block_delta', index: i, delta: { type: 'text_delta', text: tok } });
   ev({ type: 'content_block_stop', index: i++ });
   if (delegate) {
-    ev({ type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: 'toolu_fake', name: 'task_start', input: {} } });
+    ev({ type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: 'toolu_fake', name: 'spawn_worker', input: {} } });
     ev({ type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: '{"task":"the question"}' } });
     ev({ type: 'content_block_stop', index: i++ });
   }
@@ -115,6 +109,45 @@ const anthropic: LiveDriver = (req, sink) => {
   ev({ type: 'message_stop' });
   later(t + 1, () => !closed && sink.close());
   return { send() {}, close: () => void (closed = true) };
+};
+
+/** An ACP agent: sets up a session, then answers each prompt after thinking and one web fetch (asking permission first). */
+const acp: LiveDriver = (_req, sink) => {
+  let closed = false;
+  let t = 0;
+  const out = (m: Json, gap = jitter(0.5, 2)) => {
+    t = Math.max(t, performance.now()) + gap;
+    later(t - performance.now(), () => !closed && sink.recv(m));
+  };
+  const update = (sessionId: string, u: Json) => out({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update: u } });
+  out({ $open: { cwd: '/tmp/fake-workers', command: 'fake-acp', pid: 1 } }, 1);
+  let calls = 0;
+  /** The rest of a prompt's turn, once its permission request is answered. */
+  let pendingPrompt: (() => void) | undefined;
+  return {
+    send(data) {
+      const m = data as { id?: number; method?: string; params?: { sessionId?: string }; result?: unknown };
+      const ok = (result: Json) => out({ jsonrpc: '2.0', id: m.id!, result });
+      if (m.method === 'initialize') ok({ protocolVersion: 1, agentCapabilities: {} });
+      else if (m.method === 'session/new') ok({ sessionId: 'sess-fake', configOptions: ['model', 'effort'].map((id) => ({ id, name: id, type: 'select', currentValue: 'default', options: [] })) });
+      else if (m.method === 'session/set_config_option') ok({ configOptions: [] });
+      else if (m.method === 'session/prompt') {
+        const sid = m.params!.sessionId!;
+        const n = ++calls;
+        update(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Deep thought.' } });
+        update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Let me check.' } });
+        update(sid, { sessionUpdate: 'tool_call', toolCallId: `tc${n}`, title: 'Fetch https://example.com', kind: 'fetch', status: 'pending' });
+        out({ jsonrpc: '2.0', id: 1000 + n, method: 'session/request_permission', params: { sessionId: sid, toolCall: { toolCallId: `tc${n}`, title: 'Fetch https://example.com', kind: 'fetch' }, options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'reject', name: 'Reject', kind: 'reject_once' }] } });
+        const id = m.id!;
+        pendingPrompt = () => {
+          update(sid, { sessionUpdate: 'tool_call_update', toolCallId: `tc${n}`, status: 'completed' });
+          for (const tok of ['The answer ', 'is 42.']) update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: tok } });
+          out({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } }, 100);
+        };
+      } else if (m.id !== undefined && m.method === undefined && m.result) pendingPrompt?.();
+    },
+    close: () => void (closed = true),
+  };
 };
 
 const openai: LiveDriver = (req, sink) => {
@@ -242,4 +275,4 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel };
+export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp };

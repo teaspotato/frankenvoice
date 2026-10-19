@@ -38,33 +38,37 @@ export interface LlmSpan extends Span {
   headStartMs?: number;
   /** When the model's first reasoning arrived. */
   thinkingAt?: number;
-  /** A reply the model gave on its own, to the background agent's news (these tasks). */
-  tasks?: string[];
-  /** Task tools it called, when. */
+  /** A reply the model gave on its own, to the workers' news (these workers). */
+  workers?: string[];
+  /** Worker tools it called, when. */
   tools: { t: number; name: string; text: string; seq: number }[];
 }
 
-/** One request of a background task: from sending it to its end, with the tools it used. */
-export interface AgentRound {
-  n: number;
+/** One tool call a worker made, from start to finish. */
+export interface WorkerStep {
+  id: string;
   t0: number;
   t1?: number;
-  thinkingAt?: number;
-  text: string;
-  tools: string[];
-  thinking?: string;
-  stopReason?: string;
+  title: string;
+  kind: string;
+  status: string;
 }
 
-/** A task the LLM delegated to the background agent, from start to result. */
-export interface AgentTask extends Span {
+/** A worker the LLM started: one agent session, from start to result (and any follow-ups). */
+export interface WorkerSpan extends Span {
   id: string;
   status: string;
-  /** The text of the result, answer or error. */
+  /** Lane row, so workers that overlap in time don't cover each other. */
+  row: number;
+  /** When its session was ready. */
+  readyAt?: number;
+  /** The text of the result or error. */
   result?: string;
-  rounds: AgentRound[];
-  /** Progress notes, side answers and steering messages, as they happened. */
-  marks: { t: number; kind: 'progress' | 'answer' | 'steer' | 'cancel'; text: string; seq: number }[];
+  steps: WorkerStep[];
+  /** When a stretch of reasoning began. */
+  thinking: number[];
+  /** Plan updates, messages from the LLM, the agent's in-between text, refused permissions, as they happened. */
+  marks: { t: number; kind: 'progress' | 'steer' | 'text' | 'denied' | 'stop'; text: string; seq: number }[];
 }
 
 /** A reply started on the user's words before their turn was committed. */
@@ -140,7 +144,7 @@ export class TimelineModel {
   llm: LlmSpan[] = [];
   drafts: Draft[] = [];
   openers: Opener[] = [];
-  tasks: AgentTask[] = [];
+  workers: WorkerSpan[] = [];
   ttsRequests: { t: number; seq: number }[] = [];
   tts: (Span & { rid: string; seg: number })[] = [];
   playback: (Span & { rid: string; interrupted?: boolean; heard?: string })[] = [];
@@ -386,7 +390,7 @@ export class TimelineModel {
           tools: [],
           seqs: [e.seq],
           ...(typeof d.headStartMs === 'number' ? { headStartMs: d.headStartMs } : {}),
-          ...(Array.isArray(d.tasks) ? { tasks: d.tasks } : {}),
+          ...(Array.isArray(d.workers) ? { workers: d.workers } : {}),
         });
         break;
       case 'llm.tool': {
@@ -395,44 +399,55 @@ export class TimelineModel {
         l?.seqs.push(e.seq);
         break;
       }
-      case 'agent.started':
-        this.tasks.push({ id: d.taskId, t0: e.t, text: d.task ?? '', status: 'running', rounds: [], marks: [], seqs: [e.seq] });
+      case 'worker.started': {
+        // The first row free at this moment.
+        const busy = new Set(this.workers.filter((w) => w.t1 === undefined || w.t1 > e.t).map((w) => w.row));
+        let row = 0;
+        while (busy.has(row)) row++;
+        this.workers.push({ id: d.workerId, t0: e.t, text: d.task ?? '', status: 'starting', row, steps: [], thinking: [], marks: [], seqs: [e.seq] });
         break;
-      case 'agent.round':
-      case 'agent.thinking':
-      case 'agent.step':
-      case 'agent.progress':
-      case 'agent.answer':
-      case 'agent.steer':
-      case 'agent.done':
-      case 'agent.error':
-      case 'agent.cancelled': {
-        const k = [...this.tasks].reverse().find((x) => x.id === d.taskId);
-        if (!k) break;
-        k.seqs.push(e.seq);
-        const r = k.rounds[k.rounds.length - 1];
-        if (d.type === 'agent.round') k.rounds.push({ n: d.n, t0: e.t, text: '', tools: [] });
-        else if (d.type === 'agent.thinking' && r) r.thinkingAt ??= e.t;
-        else if (d.type === 'agent.step' && r) {
-          r.t1 = e.t;
-          r.text = d.text ?? '';
-          r.tools = (d.tools ?? []).map((x: { name: string; input: unknown }) => `${x.name} ${JSON.stringify(x.input)}`);
-          r.thinking = d.thinking;
-          r.stopReason = d.stopReason;
-        } else if (d.type === 'agent.progress') k.marks.push({ t: e.t, kind: 'progress', text: d.text ?? '', seq: e.seq });
-        else if (d.type === 'agent.answer') k.marks.push({ t: e.t, kind: 'answer', text: `${d.question}\n→ ${d.text}`, seq: e.seq });
-        else if (d.type === 'agent.steer') {
-          k.marks.push({ t: e.t, kind: 'steer', text: d.text ?? '', seq: e.seq });
-          if (!d.queued) {
-            k.status = 'running';
-            k.t1 = undefined;
+      }
+      case 'worker.ready':
+      case 'worker.thinking':
+      case 'worker.text':
+      case 'worker.tool':
+      case 'worker.tool_done':
+      case 'worker.permission':
+      case 'worker.progress':
+      case 'worker.steer':
+      case 'worker.done':
+      case 'worker.error':
+      case 'worker.stopped': {
+        const w = [...this.workers].reverse().find((x) => x.id === d.workerId);
+        if (!w) break;
+        w.seqs.push(e.seq);
+        if (d.type === 'worker.ready') {
+          w.readyAt = e.t;
+          w.status = 'running';
+        } else if (d.type === 'worker.thinking') w.thinking.push(e.t);
+        else if (d.type === 'worker.text') w.marks.push({ t: e.t, kind: 'text', text: d.text ?? '', seq: e.seq });
+        else if (d.type === 'worker.tool') w.steps.push({ id: d.toolCallId, t0: e.t, title: d.title ?? '', kind: d.kind ?? 'other', status: d.status ?? 'pending' });
+        else if (d.type === 'worker.tool_done') {
+          const s = [...w.steps].reverse().find((x) => x.id === d.toolCallId);
+          if (s) {
+            s.t1 = e.t;
+            s.status = d.status;
+          }
+        } else if (d.type === 'worker.permission') {
+          if (!d.allowed) w.marks.push({ t: e.t, kind: 'denied', text: `refused: ${d.title} (${d.kind})`, seq: e.seq });
+        } else if (d.type === 'worker.progress') w.marks.push({ t: e.t, kind: 'progress', text: d.text ?? '', seq: e.seq });
+        else if (d.type === 'worker.steer') {
+          w.marks.push({ t: e.t, kind: 'steer', text: d.text ?? '', seq: e.seq });
+          if (d.followUp) {
+            w.status = 'running';
+            w.t1 = undefined;
           }
         } else {
-          k.t1 = e.t;
-          k.status = d.type === 'agent.done' ? 'done' : d.type === 'agent.error' ? 'error' : 'cancelled';
-          k.result = d.text;
-          if (r && r.t1 === undefined) r.t1 = e.t;
-          if (d.type === 'agent.cancelled') k.marks.push({ t: e.t, kind: 'cancel', text: 'cancelled', seq: e.seq });
+          w.t1 = e.t;
+          w.status = d.type === 'worker.done' ? 'done' : d.type === 'worker.error' ? 'error' : 'stopped';
+          w.result = d.text;
+          for (const s of w.steps) s.t1 ??= e.t;
+          if (d.type === 'worker.stopped') w.marks.push({ t: e.t, kind: 'stop', text: 'stopped', seq: e.seq });
         }
         break;
       }

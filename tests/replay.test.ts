@@ -51,10 +51,11 @@ describe('record and replay', () => {
     expect(count(live, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
   }, 10_000);
 
-  it('delegates a task to the background agent and gets its result', () => {
+  it('starts a worker over ACP and gets its result', () => {
     const msgs = (type: string) => live.events.filter((e) => e.kind === 'msg' && (e.data as { type: string }).type === type).map((e) => e.data as Record<string, unknown>);
-    expect(msgs('task.start')).toMatchObject([{ taskId: 't1', task: 'the question' }]);
-    expect(msgs('agent.done')).toMatchObject([{ taskId: 't1', text: 'The answer is 42.' }]);
+    expect(msgs('worker.start')).toMatchObject([{ workerId: 'w1', task: 'the question' }]);
+    expect(msgs('worker.permission')).toMatchObject([{ workerId: 'w1', kind: 'fetch', allowed: true }]);
+    expect(msgs('worker.done')).toMatchObject([{ workerId: 'w1', text: 'The answer is 42.' }]);
   });
 
   it('replays bit-for-bit, including timing, after a bundle round trip', () => {

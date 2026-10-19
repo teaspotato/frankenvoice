@@ -3,7 +3,7 @@ import type { Json, JsonObject, Msg } from '../../core/types';
 import { anthropicAdapter } from './anthropic';
 import { openaiCompatAdapter } from './openai';
 import type { ChatTurn, LlmAdapter, LlmStreamParser } from './types';
-import { DEFAULT_DELEGATE_PROMPT, TASK_TOOLS, taskCalls, taskUpdate, type TaskCall } from './delegate';
+import { DEFAULT_DELEGATE_PROMPT, WORKER_TOOLS, toolCalls, workerStatus, workerUpdate, type ToolCall, type WorkerInfo } from './delegate';
 
 const words = (s: string) => s.split(/\s+/).filter(Boolean);
 const norm = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, '');
@@ -95,12 +95,12 @@ export const llmNode: NodeDef = {
   inputs: [
     { name: 'turn', type: 'turn' },
     { name: 'control', type: 'control' },
-    { name: 'agent', type: 'agent', description: "The background agent's progress, answers and results" },
-    { name: 'vad', type: 'vad', description: 'When the user speaks, so task results wait for a pause' },
+    { name: 'updates', type: 'workers', description: "The workers' progress, answers and results" },
+    { name: 'vad', type: 'vad', description: 'When the user speaks, so worker results wait for a pause' },
   ],
   outputs: [
     { name: 'text', type: 'text' },
-    { name: 'tasks', type: 'tasks', description: 'task.start / task.send / task.cancel for the background agent' },
+    { name: 'workers', type: 'workers', description: 'worker.start / worker.send / worker.stop for the workers' },
   ],
   params: [
     { key: 'provider', label: 'Provider', type: 'select', options: Object.keys(llmAdapters), default: 'anthropic' },
@@ -140,7 +140,7 @@ export const llmNode: NodeDef = {
       type: 'text',
       default: null,
       description:
-        'Set by the Background agent stage: {prompt, progress, quietMs}. With it, the model gets the task tools and the agent\'s updates (Anthropic only).',
+        'Set by the Workers stage: {prompt, progress, quietMs, maxWorkers}. With it, the model gets the worker tools and the workers\' updates (Anthropic only).',
     },
   ],
   channels: [
@@ -152,20 +152,22 @@ export const llmNode: NodeDef = {
     const p = ctx.params as JsonObject;
     const adapter = llmAdapters[p.provider as string];
     const reqParams: JsonObject = { ...p, model: (p.model as string) || adapter?.defaultModel || '' };
-    // Delegation: the task tools, and how the agent's updates come back.
+    // Delegation: the worker tools, and how the workers' updates come back.
     const delegation = p.delegate && typeof p.delegate === 'object' && adapter?.provider === 'anthropic' ? (p.delegate as JsonObject) : null;
-    if (p.delegate && !delegation) ctx.log('warn', 'delegation needs the Anthropic provider: the task tools are off');
+    if (p.delegate && !delegation) ctx.log('warn', 'delegation needs the Anthropic provider: the worker tools are off');
     if (delegation) {
-      reqParams.tools = TASK_TOOLS;
+      reqParams.tools = WORKER_TOOLS;
       reqParams.system = `${String(p.system ?? '')}\n\n${String(delegation.prompt ?? DEFAULT_DELEGATE_PROMPT)}`.trim();
     }
     const progressPolicy = String(delegation?.progress ?? 'context');
     const quietMs = Number(delegation?.quietMs ?? 800);
+    const maxWorkers = Number(delegation?.maxWorkers ?? 4);
     const maxToolRounds = 4;
-    const tasks = new Map<string, string>();
-    let taskNo = 0;
-    /** Task updates not yet in the history; `speak`: one of them wants a reply of its own. */
-    let notes: { turns: ChatTurn[]; tasks: string[]; speak: boolean } = { turns: [], tasks: [], speak: false };
+    /** What each worker is doing, from its updates (for check_worker). */
+    const workers = new Map<string, WorkerInfo>();
+    let workerNo = 0;
+    /** Worker updates not yet in the history; `speak`: one of them wants a reply of its own. */
+    let notes: { turns: ChatTurn[]; workers: string[]; speak: boolean } = { turns: [], workers: [], speak: false };
     let floor = 'listening';
     let userSpeaking = false;
     let lastSpeech = -Infinity;
@@ -219,26 +221,33 @@ export const llmNode: NodeDef = {
       deliver();
     };
 
-    /** Run a reply's task tool calls: each is answered at once, the agent does the work. */
-    const runTool = (r: Reply, c: TaskCall): JsonObject => {
+    /** Run a reply's worker tool calls: each is answered at once, the workers do the work. */
+    const runTool = (r: Reply, c: ToolCall): JsonObject => {
       const result = (content: string, isError = false): JsonObject => ({ type: 'tool_result', tool_use_id: c.id, content, ...(isError ? { is_error: true } : {}) });
-      const id = String(c.input.task_id ?? '');
+      const id = String(c.input.worker_id ?? '');
+      const w = workers.get(id);
+      const running = [...workers.values()].filter((x) => x.status === 'running').length;
       let out: JsonObject;
-      if (c.name === 'task_start') {
-        const taskId = `t${++taskNo}`;
-        tasks.set(taskId, 'running');
-        ctx.emit('tasks', { type: 'task.start', taskId, task: String(c.input.task ?? ''), rid: r.rid });
-        out = result(`Started task ${taskId}. Its result will come as a task_update; keep talking with the user meanwhile.`);
-      } else if ((c.name === 'task_send' || c.name === 'task_cancel') && !tasks.has(id)) out = result(`There is no task "${id}".`, true);
-      else if (c.name === 'task_send') {
-        const mode = c.input.mode === 'ask' ? 'ask' : 'steer';
-        if (mode === 'steer') tasks.set(id, 'running');
-        ctx.emit('tasks', { type: 'task.send', taskId: id, message: String(c.input.message ?? ''), mode, rid: r.rid });
-        out = result(mode === 'ask' ? 'Asked. The answer will come as a task_update.' : tasks.get(id) === 'done' ? 'Sent: the task picks up again with it.' : 'Sent to the task.');
-      } else if (c.name === 'task_cancel') {
-        tasks.set(id, 'cancelled');
-        ctx.emit('tasks', { type: 'task.cancel', taskId: id, rid: r.rid });
-        out = result('Cancelled.');
+      if (c.name === 'spawn_worker') {
+        if (running >= maxWorkers) out = result(`${running} workers are already running, the most at once. Wait for one to finish, or stop one.`, true);
+        else {
+          const workerId = `w${++workerNo}`;
+          workers.set(workerId, { status: 'running', task: String(c.input.task ?? ''), t0: ctx.now(), steps: [], plan: '' });
+          ctx.emit('workers', { type: 'worker.start', workerId, task: String(c.input.task ?? ''), rid: r.rid });
+          out = result(`Started worker ${workerId}. Its result will come as a worker_update; keep talking with the user meanwhile.`);
+        }
+      } else if (['message_worker', 'check_worker', 'stop_worker'].includes(c.name) && !w) out = result(`There is no worker "${id}".`, true);
+      else if (w && c.name === 'check_worker') out = result(workerStatus(id, w, ctx.now()));
+      else if (w && c.name === 'message_worker') {
+        const was = w.status;
+        w.status = 'running';
+        if (was !== 'running') w.t0 = ctx.now();
+        ctx.emit('workers', { type: 'worker.send', workerId: id, message: String(c.input.message ?? ''), rid: r.rid });
+        out = result(was === 'running' ? 'Sent to the worker.' : 'Sent: the worker picks up again with it.');
+      } else if (w && c.name === 'stop_worker') {
+        w.status = 'stopped';
+        ctx.emit('workers', { type: 'worker.stop', workerId: id, rid: r.rid });
+        out = result('Stopped.');
       } else out = result(`Unknown tool "${c.name}".`, true);
       ctx.emit('text', { type: 'llm.tool', rid: r.rid, name: c.name, input: c.input, result: out.content as string, ...(out.is_error ? { error: true } : {}) });
       return out;
@@ -246,7 +255,7 @@ export const llmNode: NodeDef = {
     /** The reply stopped to call tools: run them and continue it with their results. */
     const toolRound = (r: Reply): boolean => {
       const native = r.parser?.native() ?? null;
-      const calls = taskCalls(native);
+      const calls = toolCalls(native);
       if (!delegation || !calls.length || r.rounds >= maxToolRounds) return false;
       r.rounds++;
       if (r.io && !r.io.closed) r.io.close({ status: 'done' });
@@ -260,18 +269,18 @@ export const llmNode: NodeDef = {
       return true;
     };
 
-    /** Is the conversation free for the agent's news: no reply, no draft, the user quiet for a moment? */
+    /** Is the conversation free for the workers' news: no reply, no draft, the user quiet for a moment? */
     const deliver = () => {
       deliverTimer?.clear();
       deliverTimer = undefined;
       if (!notes.speak || active || draft || floor !== 'listening' || userSpeaking || !adapter || !reqParams.model) return;
       const wait = lastSpeech + quietMs - ctx.now();
-      if (wait > 0) return void (deliverTimer = ctx.setTimer(wait, deliver, 'task-update'));
+      if (wait > 0) return void (deliverTimer = ctx.setTimer(wait, deliver, 'worker-update'));
       const n = notes;
-      notes = { turns: [], tasks: [], speak: false };
+      notes = { turns: [], workers: [], speak: false };
       history.push(...n.turns);
       const r = reply(n.turns[n.turns.length - 1], {});
-      ctx.emit('text', { type: 'llm.start', rid: r.rid, turnId: null, tasks: n.tasks });
+      ctx.emit('text', { type: 'llm.start', rid: r.rid, turnId: null, workers: n.workers });
       ctx.setState('status', 'generating');
       active = r;
       r.live = true;
@@ -281,7 +290,7 @@ export const llmNode: NodeDef = {
     const flushNotes = () => {
       if (!notes.turns.length) return;
       history.push(...notes.turns);
-      notes = { turns: [], tasks: [], speak: false };
+      notes = { turns: [], workers: [], speak: false };
     };
 
     const handle = (events: Events) => {
@@ -385,14 +394,18 @@ export const llmNode: NodeDef = {
           deliver();
           return;
         }
-        if (port === 'agent') {
-          const kind = { 'agent.done': 'result', 'agent.answer': 'answer', 'agent.error': 'error', 'agent.progress': 'progress' }[msg.type];
-          const taskId = msg.taskId as string;
-          if (msg.type === 'agent.done' || msg.type === 'agent.error') tasks.set(taskId, 'done');
-          if (!kind || !delegation || tasks.get(taskId) === 'cancelled') return;
+        if (port === 'updates') {
+          const kind = { 'worker.done': 'result', 'worker.error': 'error', 'worker.progress': 'progress' }[msg.type];
+          const workerId = msg.workerId as string;
+          const w = workers.get(workerId);
+          if (!w || !delegation || w.status === 'stopped') return;
+          if (msg.type === 'worker.tool' && msg.title) w.steps = [...w.steps, String(msg.title)].slice(-5);
+          if (msg.type === 'worker.progress') w.plan = String(msg.text ?? '');
+          if (msg.type === 'worker.done' || msg.type === 'worker.error') w.status = msg.type === 'worker.done' ? 'done' : 'error';
+          if (!kind) return;
           if (kind === 'progress' && progressPolicy === 'off') return;
-          notes.turns.push({ role: 'user', text: taskUpdate({ ...(msg as JsonObject), kind }) });
-          if (!notes.tasks.includes(taskId)) notes.tasks.push(taskId);
+          notes.turns.push({ role: 'user', text: workerUpdate({ ...(msg as JsonObject), kind }) });
+          if (!notes.workers.includes(workerId)) notes.workers.push(workerId);
           if (kind !== 'progress' || progressPolicy === 'speak') notes.speak = true;
           deliver();
           return;
@@ -441,16 +454,16 @@ export const llmNode: NodeDef = {
           return;
         }
         finish('cancelled');
-        // A draft went out without a task result that has come in since: the turn is sent again with it.
+        // A draft went out without a worker result that has come in since: the turn is sent again with it.
         const kept = msg.draft && draft?.draftId === msg.draft && !notes.speak ? draft : undefined;
-        if (!kept) dropDraft(notes.speak && msg.draft ? 'a task result came in' : 'turn committed without it');
+        if (!kept) dropDraft(notes.speak && msg.draft ? 'a worker result came in' : 'turn committed without it');
         if (msg.replaces) {
           // The user wasn't done: this turn replaces an earlier one and whatever followed it.
           const i = history.findIndex((t) => t.role === 'user' && t.turnId === msg.replaces);
           if (i >= 0) history.splice(i);
         }
         const turnId = msg.turnId as string;
-        // A kept draft's request went out without the agent's progress notes: those wait for the next request.
+        // A kept draft's request went out without the workers' progress notes: those wait for the next request.
         if (!kept) flushNotes();
         if (kept) {
           // The draft's words stand: keep its reply. The history records what the request said.

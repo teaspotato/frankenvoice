@@ -22,7 +22,7 @@ const POS: Record<StageId, [number, number]> = {
   turn: [610, 88],
   llm: [810, 88],
   opener: [1010, 88],
-  agent: [810, 300],
+  workers: [810, 300],
   tts: [1210, 88],
   speaker: [1410, 88],
 };
@@ -106,12 +106,12 @@ export function PipelineView({
     link('opener.text', right('opener'), left('tts'), 'text'),
     ...(out === 'speaker' ? [link('tts.audio', right('tts'), left('speaker'), 'audio')] : []),
   ];
-  // Delegation: tasks down to the background agent under the LLM, its news back up.
+  // Delegation: tasks down to the workers under the LLM, their news back up.
   {
     const [lx, ly] = [POS.llm[0] + W / 2, POS.llm[1] + H];
-    const ay = POS.agent[1];
-    edges.push({ src: 'llm.tasks', d: `M${lx - 30},${ly} L${lx - 30},${ay - 2}`, label: 'tasks', lx: lx - 50, ly: ay - 10 });
-    edges.push({ src: 'agent.agent', d: `M${lx + 30},${ay} L${lx + 30},${ly + 2}`, label: 'results', lx: lx + 55, ly: ay - 10 });
+    const ay = POS.workers[1];
+    edges.push({ src: 'llm.workers', d: `M${lx - 30},${ly} L${lx - 30},${ay - 2}`, label: 'tasks', lx: lx - 50, ly: ay - 10 });
+    edges.push({ src: 'workers.updates', d: `M${lx + 30},${ay} L${lx + 30},${ly + 2}`, label: 'results', lx: lx + 55, ly: ay - 10 });
   }
   // Playback feedback: up from the output stage, back over the row, down into turn-taking.
   const [ox, oy] = [POS[out][0] + W / 2, POS[out][1]];
