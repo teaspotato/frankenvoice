@@ -11,7 +11,7 @@ function harness(params: Record<string, unknown> = {}) {
   const out: { port: string; msg: Msg }[] = [];
   const ctx: NodeContext = {
     id: 'turn',
-    params: resolveParams(duplexTurnNode, params as never),
+    params: resolveParams(duplexTurnNode, { overlap: 'legacy', ...params } as never),
     now: () => now,
     cause: undefined,
     emit: (port, msg) => (out.push({ port, msg }), out.length),
@@ -231,5 +231,159 @@ describe('heardText', () => {
   });
   it('is empty before any audio played', () => {
     expect(heardText(segs, 0)).toBe('');
+  });
+});
+
+describe('speech over the agent, classified by its words', () => {
+  const sr = 16;
+  /** The agent is mid-reply: sentences start at 1500, 4000 and 7000 ms. */
+  function speaking() {
+    const h = harness({ overlap: 'classify' });
+    h.user(1000, 'tell me about Tokyo');
+    h.send(1500, 'playback', { type: 'playback.start', rid: 'r0' });
+    for (const [seg, at] of [1500, 4000, 7000].entries()) h.send(1500, 'playback', { type: 'playback.segment', rid: 'r0', seg, at });
+    return h;
+  }
+  const controls = (h: ReturnType<typeof harness>) => h.out.filter((o) => o.port === 'control').map((o) => o.msg.type);
+  const over = (h: ReturnType<typeof harness>, t0: number, t1: number, text: string) => {
+    h.send(t0, 'vad', { type: 'vad.speech_start', at: t0 * sr });
+    h.send(t1, 'vad', { type: 'vad.speech_end', at: t1 * sr });
+    h.send(t1 + 150, 'transcript', { type: 'asr.final', text, start: t0 * sr, end: t1 * sr, speechFinal: true, fromFinalize: true });
+  };
+
+  it('cuts the agent off at once, then drops a backchannel and lets it go on', () => {
+    const h = speaking();
+    h.send(2000, 'vad', { type: 'vad.speech_start', at: 2000 * sr });
+    expect(controls(h)).toEqual(['pause']);
+    h.send(2400, 'vad', { type: 'vad.speech_end', at: 2400 * sr });
+    expect(h.decisions()).toEqual(['candidate']); // waiting for the words
+    h.send(2550, 'transcript', { type: 'asr.final', text: 'Yeah.', start: 2000 * sr, end: 2400 * sr, speechFinal: true });
+    expect(h.decisions()).toEqual(['candidate', 'backchannel']);
+    expect(controls(h)).toEqual(['pause', 'resume']);
+    expect(h.states().at(-1)).toBe('speaking');
+    h.advance(9000);
+    expect(h.last('turn.user')?.text).toBe('tell me about Tokyo');
+  });
+
+  it('calls speech with no words noise', () => {
+    const h = speaking();
+    over(h, 2000, 2300, '');
+    expect(h.decisions()).toEqual(['candidate', 'noise']);
+    expect(controls(h)).toEqual(['pause', 'resume']);
+  });
+
+  it('stops at once on a short floor-taking opener like "So"', () => {
+    const h = speaking();
+    over(h, 2000, 2380, 'So');
+    expect(h.decisions()).toEqual(['candidate', 'interrupt']);
+    expect(h.last('turn.decision')?.why).toBe('floor-taking opener');
+    expect(controls(h)).toEqual(['pause', 'cancel']);
+  });
+
+  it('stops while the user is still talking when the words open with one', () => {
+    const h = speaking();
+    h.send(2000, 'vad', { type: 'vad.speech_start', at: 2000 * sr });
+    h.send(2300, 'transcript', { type: 'asr.partial', text: 'wait', start: 2000 * sr, end: 2300 * sr });
+    expect(h.decisions()).toEqual(['candidate', 'interrupt']);
+  });
+
+  it('holds an aside until the sentence ends, then stops there and answers it', () => {
+    const h = speaking();
+    over(h, 2000, 2700, 'The blue one.');
+    expect(h.decisions()).toEqual(['candidate', 'aside']);
+    expect(controls(h)).toEqual(['pause', 'resume']);
+    h.advance(3990);
+    expect(controls(h)).toEqual(['pause', 'resume']); // still mid-sentence
+    h.advance(4000);
+    expect(controls(h)).toEqual(['pause', 'resume', 'cancel']);
+    h.send(4010, 'playback', { type: 'playback.interrupted', heard: 'Tokyo is big.' });
+    expect(h.out.filter((o) => o.msg.type === 'turn.heard').at(-1)?.msg).toEqual({ type: 'turn.heard', turnId: 'turn-u0', text: 'Tokyo is big.' });
+    expect(h.last('turn.user')).toMatchObject({ text: 'The blue one.', aside: true });
+    expect(h.states().slice(-3)).toEqual(['speaking', 'listening', 'thinking']);
+  });
+
+  it('answers an aside when the reply ends before the next sentence', () => {
+    const h = speaking();
+    over(h, 7500, 8000, 'And Kyoto too.');
+    expect(h.decisions()).toEqual(['candidate', 'aside']);
+    h.send(9000, 'playback', { type: 'playback.end', rid: 'r0' });
+    expect(controls(h)).toEqual(['pause', 'resume']);
+    expect(h.last('turn.user')).toMatchObject({ text: 'And Kyoto too.', aside: true });
+  });
+
+  it('takes the floor when the speech goes on, whatever the words', () => {
+    const h = speaking();
+    h.send(2000, 'vad', { type: 'vad.speech_start', at: 2000 * sr });
+    h.send(2500, 'transcript', { type: 'asr.partial', text: 'yeah that is', start: 2000 * sr, end: 2500 * sr });
+    h.advance(3150);
+    expect(h.decisions()).toEqual(['candidate']);
+    h.advance(3200);
+    expect(h.decisions()).toEqual(['candidate', 'interrupt']);
+    expect(h.last('turn.decision')?.why).toBe('sustained speech');
+  });
+
+  it('decides on the words heard so far when the ASR final is late', () => {
+    const h = speaking();
+    h.send(2000, 'vad', { type: 'vad.speech_start', at: 2000 * sr });
+    h.send(2300, 'transcript', { type: 'asr.partial', text: 'mhm', start: 2000 * sr, end: 2300 * sr });
+    h.send(2400, 'vad', { type: 'vad.speech_end', at: 2400 * sr });
+    h.advance(3800);
+    expect(h.decisions()).toEqual(['candidate']);
+    h.advance(3900);
+    expect(h.decisions()).toEqual(['candidate', 'backchannel']);
+  });
+
+  it('treats a short pause before the words came in as one stretch of speech', () => {
+    const h = speaking();
+    h.send(2000, 'vad', { type: 'vad.speech_start', at: 2000 * sr });
+    h.send(2300, 'vad', { type: 'vad.speech_end', at: 2300 * sr });
+    h.send(2500, 'vad', { type: 'vad.speech_start', at: 2500 * sr });
+    expect(h.decisions()).toEqual(['candidate']);
+    h.advance(3200);
+    expect(h.decisions()).toEqual(['candidate', 'interrupt']);
+  });
+
+  it('includes a held aside when the user then takes the floor', () => {
+    const h = speaking();
+    over(h, 2000, 2600, 'The blue one.');
+    over(h, 3000, 3300, 'Actually wait');
+    expect(h.decisions()).toEqual(['candidate', 'aside', 'candidate', 'interrupt']);
+    h.user(4500, 'make it red', true);
+    expect(h.last('turn.user')?.text).toBe('The blue one. Actually wait make it red');
+  });
+
+  it('keeps the old rules for speech over the agent while it is still thinking', () => {
+    const h = harness({ overlap: 'classify' });
+    h.user(1000, 'how about');
+    h.send(1200, 'vad', { type: 'vad.speech_start', at: 1200 * sr });
+    h.send(1500, 'transcript', { type: 'asr.partial', text: 'about New York', start: 1200 * sr, end: 1500 * sr });
+    h.advance(1700);
+    expect(h.decisions()).toEqual(['candidate', 'continue']);
+    expect(controls(h)).toEqual(['cancel']);
+  });
+
+  it('holds the aside for the sentence after a pause, announced with its new time', () => {
+    const h = speaking();
+    over(h, 2000, 2700, 'The blue one.');
+    // The speaker paused at 2000 and resumed at 2850: the sentence at 4000 now starts at 4850.
+    h.send(2850, 'playback', { type: 'playback.paused', rid: 'r0', at: 2000 });
+    h.send(2850, 'playback', { type: 'playback.segment', rid: 'r0', seg: 1, at: 4850 });
+    h.advance(4500);
+    expect(controls(h)).toEqual(['pause', 'resume']);
+    h.advance(4850);
+    expect(controls(h)).toEqual(['pause', 'resume', 'cancel']);
+  });
+
+  it('ducks instead with onset: duck, and talks on with onset: none', () => {
+    const d = harness({ overlap: 'classify', onset: 'duck' });
+    const n = harness({ overlap: 'classify', onset: 'none' });
+    for (const h of [d, n]) {
+      h.user(1000, 'tell me about Tokyo');
+      h.send(1500, 'playback', { type: 'playback.start', rid: 'r0' });
+      over(h, 2000, 2400, 'Yeah.');
+    }
+    expect(controls(d)).toEqual(['duck', 'unduck']);
+    expect(controls(n)).toEqual([]);
+    expect(n.decisions()).toEqual(['candidate', 'backchannel']);
   });
 });

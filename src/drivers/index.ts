@@ -549,6 +549,9 @@ function pcmOutput(which: 'agent' | 'mic') {
   let next = 0; // audio-clock end of the last chunk
   let nextAt = NaN; // and its session time, when chunks carry one
   const playing = new Set<AudioBufferSourceNode>();
+  // Ducking, ahead of the mute switch; kept across a context change.
+  let level = 1;
+  let duck: GainNode | null = null;
   const stop = () => {
     for (const src of playing) src.stop();
     playing.clear();
@@ -562,8 +565,12 @@ function pcmOutput(which: 'agent' | 'mic') {
         stop();
         o?.close();
         o = outputContext(which, sampleRate);
+        duck = o.ctx.createGain();
+        duck.gain.value = level;
+        duck.connect(o.out);
       }
-      const { ctx, out } = o;
+      const { ctx } = o;
+      const out = duck!;
       const buf = ctx.createBuffer(1, samples.length, sampleRate);
       buf.copyToChannel(samples, 0);
       const src = ctx.createBufferSource();
@@ -585,10 +592,16 @@ function pcmOutput(which: 'agent' | 'mic') {
       nextAt = at === undefined ? NaN : at + buf.duration * 1000;
     },
     stop,
+    /** Fade to `g` (linear) over a few tens of ms, so the step doesn't click. */
+    setGain(g: number) {
+      level = g;
+      if (o && duck) duck.gain.setTargetAtTime(g, o.ctx.currentTime, 0.015);
+    },
     close() {
       stop();
       o?.close();
       o = null;
+      duck = null;
     },
   };
 }
@@ -613,8 +626,9 @@ const speaker: LiveDriver = (_req, sink, env) => {
   setTimeout(() => sink.recv({ type: 'ready' }), 0);
   return {
     send(data, bin) {
-      const d = data as { cmd: string; at?: number; sampleRate?: number };
+      const d = data as { cmd: string; at?: number; sampleRate?: number; gain?: number };
       if (d.cmd === 'flush') return out.stop();
+      if (d.cmd === 'gain') return out.setGain(d.gain ?? 1);
       if (d.cmd !== 'play' || !bin) return;
       out.play(new Float32Array(bin.slice().buffer), d.sampleRate!, d.at!, env.now());
     },

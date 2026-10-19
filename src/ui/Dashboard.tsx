@@ -31,13 +31,13 @@ const LEGEND: Record<string, string> = {
     'Turn model scores per 80 ms frame, placed on the audio they had heard: end of turn (blue) and take the floor (orange). Solid: the user; faint: the agent. Dashed: the thresholds.\nDiamonds: events the model committed for the user (top: end of turn, bottom: take the floor); hollow dots: the same for the agent.',
   asr:
     'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
-  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), grey dot = backchannel or noise, ignored.',
+  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   opener:
     'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
   speaker:
-    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries.',
+    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged.',
 };
 
 const AXIS = 20;
@@ -657,7 +657,9 @@ export function Dashboard({
       const verdict: Record<string, [string, string]> = {
         interrupt: [col.danger, 'interrupted the agent'],
         continue: [col.warn, 'user kept talking: reply dropped, turn resent'],
-        backchannel: [col.muted, 'backchannel or noise: agent kept going'],
+        backchannel: [col.muted, 'backchannel: dropped, agent kept going'],
+        noise: [col.muted, 'no words: dropped, agent kept going'],
+        aside: [col.accent, 'aside: agent finishes its sentence, then answers it'],
       };
       m.bargeIns.forEach((b, i) => {
         const end = b.t1 ?? head;
@@ -671,7 +673,7 @@ export function Dashboard({
         g.fillStyle = c;
         g.fillRect(x0, ly0 + h * 0.66, x1 - x0, h * 0.26);
         g.globalAlpha = 1;
-        if (b.decision) mark('turn', end, c, 0.79, b.decision === 'backchannel' ? 'dot' : 'diamond', 4);
+        if (b.decision) mark('turn', end, c, 0.79, b.decision === 'backchannel' || b.decision === 'noise' ? 'dot' : 'diamond', 4);
         const next = m.bargeIns[i + 1];
         label(b.decision ?? '', x1 + 4, Math.min(x1 + 120, next ? x(next.t0) : Infinity), ly0 + h * 0.79, c);
         hits.push({
@@ -829,6 +831,13 @@ export function Dashboard({
             g.fillRect(px, mid - h, Math.max(1, x(b.t + (i + 1) * dt) - px), h * 2);
           }
         }
+      }
+      for (const d of m.holds) {
+        const end = d.t1 ?? head;
+        if (end < t0 || d.t0 > t1) continue;
+        span('speaker', d.t0, end, col.warn, 0.22, '', 0.05, 0.25);
+        hits[hits.length - 1].text = d.text;
+        tag(d.seqs);
       }
       for (const s of m.playbackSegments) {
         if (s.t < t0 || s.t > t1) continue;

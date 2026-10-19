@@ -117,6 +117,8 @@ export class TimelineModel {
   tts: (Span & { rid: string; seg: number })[] = [];
   playback: (Span & { rid: string; interrupted?: boolean; heard?: string })[] = [];
   playbackSegments: Marker[] = [];
+  /** The agent was cut off (paused) or played quieter (ducked) while turn-taking judged the user's speech over it. */
+  holds: Span[] = [];
   boundaries: number[] = [];
   agentAudio: AudioBlock[] = [];
   errors: (Marker & { node: string })[] = [];
@@ -162,6 +164,13 @@ export class TimelineModel {
   /** Session time of mic peak `i` (peaks are equally spaced in audio time). */
   peakToT(i: number): number {
     return this.sampleToT((i + 0.5) * this.micRate * (PEAK_MS / 1000));
+  }
+
+  private closeHold(at: number, seq: number) {
+    const open = this.holds.at(-1);
+    if (!open || open.t1 !== undefined) return;
+    open.t1 = Math.max(open.t0, at);
+    open.seqs.push(seq);
   }
 
   private clipAgentAudio(at: number) {
@@ -405,6 +414,20 @@ export class TimelineModel {
       case 'playback.segment':
         this.playbackSegments.push({ t: d.at ?? e.t, text: d.text ?? '', seq: e.seq });
         break;
+      case 'playback.gain':
+        this.closeHold(d.at ?? e.t, e.seq);
+        if (typeof d.gain === 'number' && d.gain < 1)
+          this.holds.push({ t0: d.at ?? e.t, text: `ducked ${(20 * Math.log10(d.gain)).toFixed(0)} dB while the user spoke`, seqs: [e.seq] });
+        break;
+      case 'playback.paused':
+        this.closeHold(d.at ?? e.t, e.seq);
+        this.holds.push({ t0: d.at ?? e.t, text: 'cut off while the user spoke', seqs: [e.seq] });
+        // Held audio is sent again, at its new times, on resume.
+        this.clipAgentAudio(d.at ?? e.t);
+        break;
+      case 'playback.resumed':
+        this.closeHold(d.at ?? e.t, e.seq);
+        break;
       case 'playback.boundary':
         this.boundaries.push(d.at ?? e.t);
         break;
@@ -416,6 +439,7 @@ export class TimelineModel {
           p.t1 = d.at ?? e.t;
           p.interrupted = d.type === 'playback.interrupted';
           p.seqs.push(e.seq);
+          this.closeHold(p.t1!, e.seq);
           // Audio already scheduled past the cut never played: don't draw it.
           if (p.interrupted) this.clipAgentAudio(p.t1!);
         }
