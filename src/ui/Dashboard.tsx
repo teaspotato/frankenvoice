@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import type { Trajectory } from '../core/trajectory';
 import { TimelineModel, type Related } from './timeline';
 
@@ -873,12 +873,12 @@ export function Dashboard({
           onDoubleClick={fit}
         />
         {hover && legend && (
-          <div className="dashboard-tip legend" style={{ left: LABEL_W + 4, top: hover.y + 14 }}>
+          <Tip className="dashboard-tip legend" x={LABEL_W - 8} y={hover.y} canvas={canvasRef} frame={wrapRef}>
             {legend}
-          </div>
+          </Tip>
         )}
         {hover && !legend && (tip || vadAt || cleanAt) && (
-          <div className="dashboard-tip" style={{ left: Math.min(hover.x + 12, size.w - 320), top: hover.y + 14 }}>
+          <Tip className="dashboard-tip" x={hover.x} y={hover.y} canvas={canvasRef} frame={wrapRef}>
             {vadAt && <div>{vadAt}</div>}
             {cleanAt && <div>{cleanAt}</div>}
             {tip && <div>{tip.text}</div>}
@@ -899,9 +899,43 @@ export function Dashboard({
                 {relInfo.down.length > 8 && <div className="muted">… {relInfo.down.length - 8} more</div>}
               </div>
             )}
-          </div>
+          </Tip>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * A hover tooltip kept inside the dashboard's visible area: below-right of the pointer by default,
+ * flipped left or above when it would cross the edge. Positioned against the viewport so the
+ * scrolling dashboard can't clip it; if it is taller than the dashboard it may extend past it, never past the window.
+ */
+function Tip(props: { x: number; y: number; canvas: RefObject<HTMLCanvasElement | null>; frame: RefObject<HTMLDivElement | null>; className: string; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    const c = props.canvas.current?.getBoundingClientRect();
+    const f = props.frame.current?.getBoundingClientRect();
+    if (!el || !c || !f) return;
+    const pad = 4;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const px = c.left + props.x;
+    const py = c.top + props.y;
+    let left = px + 12;
+    if (left + w > f.right - pad) left = px - 12 - w;
+    left = Math.max(Math.max(f.left, 0) + pad, Math.min(left, window.innerWidth - w - pad));
+    let top = py + 14;
+    if (top + h > f.bottom - pad) top = py - 10 - h;
+    if (top < f.top + pad) top = Math.max(pad, Math.min(f.top + pad, window.innerHeight - h - pad));
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+    el.style.visibility = 'visible';
+  });
+  return (
+    <div ref={ref} className={props.className} style={{ position: 'fixed', left: 0, top: 0, visibility: 'hidden' }}>
+      {props.children}
     </div>
   );
 }
