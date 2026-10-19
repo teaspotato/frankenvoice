@@ -42,6 +42,12 @@ describe('record and replay', () => {
     expect(types('text')).toContain('llm.delta');
     expect(types('audio')).toContain('audio');
     expect(types('playback')).toContain('playback.start');
+    expect(types('scores')).toContain('turnmodel.frame');
+    expect(types('scores')).toContain('turnmodel.eot');
+    // The turn model, not ASR endpointing, ended the user's turns.
+    const commits = live.events.filter((e) => e.kind === 'msg' && (e.data as { type: string; on?: string }).on === 'commit');
+    expect(commits.length).toBeGreaterThan(0);
+    expect(commits.some((e) => String((e.data as { why: string }).why).startsWith('model: end of turn'))).toBe(true);
     expect(count(live, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
   }, 10_000);
 

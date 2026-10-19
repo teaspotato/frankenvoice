@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { buildGraph, configFromGraph, defaultConfig } from '../src/pipeline';
 import { SentenceSplitter } from '../src/nodes/segment';
 import { Framer } from '../src/nodes/audio';
 import { SimScheduler } from '../src/core/scheduler';
@@ -242,5 +243,16 @@ describe('SimScheduler seek', () => {
     wall = 20;
     await done;
     expect(fired).toEqual([10, 500, 520]);
+  });
+});
+
+describe('configFromGraph', () => {
+  it('turns the turn model off for sessions recorded without one', () => {
+    const c = defaultConfig();
+    c.turnmodel.variant = 'off';
+    const g = buildGraph(c);
+    g.nodes = g.nodes.filter((n) => n.id !== 'turnmodel');
+    expect(configFromGraph(g).turnmodel.variant).toBe('off');
+    expect(configFromGraph(buildGraph(defaultConfig())).turnmodel.variant).toBe('ssl_turn');
   });
 });

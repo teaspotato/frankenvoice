@@ -1,7 +1,7 @@
 import type { IOHandle, NodeDef } from '../core/node';
 import type { AudioMsg, Json, Msg } from '../core/types';
 import { isAudioMsg } from '../core/types';
-import { bytesFromF32, f32FromBytes } from './audio';
+import { bytesFromF32, f32FromBytes, PlayedTrack } from './audio';
 
 // Noise / echo cancellation sits between the mic and everything that listens
 // to it. Every variant emits the audio VAD and ASR should hear on 'audio', and
@@ -76,9 +76,8 @@ export interface EchoCancellerParams {
 export class EchoCanceller {
   readonly taps: number;
   private w: Float64Array;
-  /** Reference ring buffer, indexed by absolute sample number on the session clock. */
-  private ref: Float32Array;
-  private refHi = 0;
+  /** What the speaker played, on the session clock. */
+  private ref: PlayedTrack;
   private dtHold = 0;
   private offset: number | null = null;
 
@@ -89,44 +88,21 @@ export class EchoCanceller {
   ) {
     this.taps = Math.max(16, Math.round((p.filterMs * rate) / 1000));
     this.w = new Float64Array(this.taps);
-    this.ref = new Float32Array(Math.max(this.taps * 4, Math.round(seconds * rate)));
+    this.ref = new PlayedTrack(rate, seconds, this.taps * 4);
   }
 
   private at(k: number): number {
-    if (k < 0 || k >= this.refHi || k < this.refHi - this.ref.length) return 0;
-    return this.ref[k % this.ref.length];
-  }
-
-  /** Ensure ring positions up to `k` exist (zeroed). */
-  private extend(k: number) {
-    const n = this.ref.length;
-    if (k - this.refHi >= n) {
-      this.ref.fill(0);
-      this.refHi = k - n;
-    }
-    for (; this.refHi < k; this.refHi++) this.ref[this.refHi % n] = 0;
+    return this.ref.get(k);
   }
 
   /** Add played audio starting at session time `atMs` (resampled to the mic rate). */
   addReference(atMs: number, samples: Float32Array, sampleRate: number) {
-    const k0 = Math.round((atMs * this.rate) / 1000);
-    const n = Math.floor((samples.length * this.rate) / sampleRate);
-    this.extend(k0 + n);
-    const step = sampleRate / this.rate;
-    for (let i = 0; i < n; i++) {
-      const pos = i * step;
-      const j = Math.floor(pos);
-      const f = pos - j;
-      const v = samples[j] * (1 - f) + (j + 1 < samples.length ? samples[j + 1] : samples[j]) * f;
-      const k = k0 + i;
-      if (k >= this.refHi - this.ref.length) this.ref[k % this.ref.length] += v;
-    }
+    this.ref.add(atMs, samples, sampleRate);
   }
 
   /** Playback was cut at `atMs`: nothing after that will be heard. */
   truncateReference(atMs: number) {
-    const k0 = Math.round((atMs * this.rate) / 1000);
-    for (let k = Math.max(k0, this.refHi - this.ref.length); k < this.refHi; k++) this.ref[k % this.ref.length] = 0;
+    this.ref.truncate(atMs);
   }
 
   /**
