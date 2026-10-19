@@ -75,10 +75,29 @@ voices reading English):
   echo. That's close to the 88–93% on 3 held-out voices from the same accent groups.
 - **Bugs 2:** still 6/10 at +0.4 s, deciding 6 times and wrongly 2 times.
 
-So the model generalizes across speakers and accents. What it doesn't cross is the
-step from TTS to your browser-processed mic. Fish voices would be a stronger
-unseen-speaker test, since they're a different TTS family; this session couldn't reach
-the Fish API.
+So the model generalizes across speakers and accents of the same engine.
+
+### Unseen engine: Deepgram Aura-2
+
+I synthesized 952 clips in all 41 English Aura-2 voices (`synth_deepgram.py`) and mixed
+them the same way.
+
+| Trained on | Unseen test voices | First word right | Bugs 2 at +0.4 s |
+|---|---|---|---|
+| Kokoro only, 3,000 steps | all 41 Aura voices | **77%** | 4/10; decided 4 times, wrong 2 |
+| Kokoro (3 voices held out) | 3 Kokoro voices | 95% | (same model) |
+| Kokoro plus 20 Aura voices, 3,000 steps | the other 21 Aura voices | **85%** | 6/10; decided 6 times, wrong 1 |
+
+- **A new engine costs about 18 points** where a new voice of a known engine costs
+  almost nothing. Each extra engine in the training mix buys back about half of that.
+  Fish should help the same way. A separate thread is generating Fish clips into
+  `data/fish_*.npz`.
+- **On Bugs 2 the mixed model is the best so far.** At +0.4 s:
+  - all 3 backchannels resumed correctly;
+  - 2 of the 3 "So" attempts stopped correctly (one was heard as "wait", which is
+    still a floor opener);
+  - the one wrong action is resuming on the quietest "So (gave up)", which it heard as
+    noise.
 
 ## Why the channel matters (measured)
 
@@ -121,7 +140,7 @@ All in `research/bc-spotter/` on branch `claude/project-thread-5jvmuc`:
 - `vocab.py`: classes and spellings.
 - `cut_real.py`: word-onset windows from `.fvs` sessions.
 - `eval_set.py`: the 10 labeled overlaps.
-- `synth.py`: Kokoro generator.
+- `synth.py`: Kokoro generator; `synth_deepgram.py`: the same prompts in Deepgram Aura-2 voices.
 - `split_takes.py` and `takes.txt`: your own recordings.
 - `train.py`: training, evaluation and ONNX export.
 

@@ -189,6 +189,8 @@ def main():
     ap.add_argument('--holdout', help='comma-separated voices (or a prefix ending in *) kept out of training and scored')
     ap.add_argument('--out', default='ckpt'); ap.add_argument('--export')
     ap.add_argument('--load', help='skip training, load this state dict')
+    ap.add_argument('--test-synth', nargs='+', help='synthetic sets scored in full (every voice unseen), e.g. another TTS engine')
+    ap.add_argument('--test-voices', help='with --test-synth: only these voices (comma list or prefix*)')
     a = ap.parse_args()
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     torch.manual_seed(0); random.seed(0)
@@ -227,6 +229,13 @@ def main():
                 log.append(dict(step=step, val_synth=vs, eval=summ))
         torch.save(model.state_dict(), f'{a.out}/spotter.pt')
         json.dump(log, open(f'{a.out}/log.json', 'w'))
+    if a.test_synth:
+        for f in a.test_synth:
+            allv = sorted({str(v) for v in np.load(f)['voice']})
+            pick = allv if not a.test_voices else [v for v in allv if any(
+                v == h or (h.endswith('*') and v.startswith(h[:-1])) for h in a.test_voices.split(','))]
+            print(f'{f}: first-word acc {val_synth(model, Data([f], a.real, holdout=True, holdout_voices=pick), dev, n=30):.3f} '
+                  f'on {len(pick)} voices', flush=True)
     ev = evaluate(model, a.eval, dev)
     json.dump(ev, open(f'{a.out}/eval.json', 'w'), indent=1)
     for W, r in ev.items():
