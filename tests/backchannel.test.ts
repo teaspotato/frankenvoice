@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { backchannelNode, parseBackchannelLines, takes } from '../src/nodes/backchannel';
+import { backchannelNode, bcState, parseBackchannelLines, takes } from '../src/nodes/backchannel';
 import { speakerNode } from '../src/nodes/speaker';
 import { resolveParams, type IOHandlers, type NodeContext, type NodeDef } from '../src/core/node';
 import type { Json, Msg } from '../src/core/types';
@@ -223,7 +223,7 @@ describe('backchannels decided by TypeSafe', () => {
     harness(backchannelNode as NodeDef<never>, { decide: 'typesafe', source: 'pause', options: 'Mm-hmm. | Yeah. = continuer\nOh no. = bad news\n- = nothing', ...params });
 
   it('asks with the turn\'s ASR words at a pause and says the picked line, taking the lines of an option in turn', () => {
-    const h = ts({ minGapMs: 0 });
+    const h = ts({ gapMs: 0 });
     expect(h.of('bc.lines')[0].lines).toContain('Oh no.');
     h.send(0, 'vad', { type: 'vad.speech_start' });
     h.send(500, 'transcript', { type: 'asr.final', text: 'So I went to the shop' });
@@ -233,7 +233,7 @@ describe('backchannels decided by TypeSafe', () => {
     expect(h.ios).toHaveLength(1);
     const req = h.ios[0].request as { path: string; body: { state: string; questions: { pick: { criteria: Record<string, string> } } } };
     expect(req.path).toBe('/v1/systemone');
-    expect(req.body.state).toBe('So I went to the shop and it was closed.');
+    expect(req.body.state).toBe("[Agent hasn't backchannelled yet this turn]\nSo I went to the shop and it was closed.");
     expect(Object.keys(req.body.questions.pick.criteria)).toEqual(['Mm-hmm.', 'Oh no.', '-']);
     h.advance(1000);
     h.ios[0].h.onRecv?.(answer('Mm-hmm.', 0.8), undefined);
@@ -241,13 +241,15 @@ describe('backchannels decided by TypeSafe', () => {
     h.send(1100, 'vad', { type: 'vad.speech_start' });
     h.send(1500, 'vad', { type: 'vad.speech_end' });
     h.advance(1500);
+    // The next question says what was said last, and how long ago.
+    expect((h.ios[1].request as { body: { state: string } }).body.state).toBe('[Agent\'s last backchannel: "Mm-hmm.", 1 s ago]\nSo I went to the shop and it was closed.');
     h.ios[1].h.onRecv?.(answer('Mm-hmm.', 0.9), undefined);
     expect(h.of('bc.say').map((m) => m.line)).toEqual(['Mm-hmm.', 'Yeah.']);
     expect(h.of('bc.say')[0]).toMatchObject({ choice: 'Mm-hmm.', confidence: 0.8 });
   });
 
   it('says nothing on "-", below the min confidence, on a failed request, or once the turn is over', () => {
-    const h = ts({ minGapMs: 0, minConfidence: 0.5 });
+    const h = ts({ gapMs: 0, minConfidence: 0.5 });
     h.send(0, 'vad', { type: 'vad.speech_start' });
     h.send(500, 'transcript', { type: 'asr.final', text: 'What do you think?' });
     for (const [i, t] of [600, 1200, 1800, 2400].entries()) {
@@ -266,7 +268,7 @@ describe('backchannels decided by TypeSafe', () => {
   });
 
   it('keeps the gap between backchannels it said', () => {
-    const h = ts({ minGapMs: 4000 });
+    const h = ts({ gapMs: 4000 });
     h.send(0, 'vad', { type: 'vad.speech_start' });
     h.send(500, 'transcript', { type: 'asr.final', text: 'my flight got cancelled' });
     h.send(600, 'vad', { type: 'vad.speech_end' });
@@ -277,5 +279,12 @@ describe('backchannels decided by TypeSafe', () => {
     h.advance(1600);
     expect(h.ios).toHaveLength(1);
     expect(h.of('bc.skip')[0].reason).toMatch(/^last backchannel/);
+  });
+});
+
+describe('TypeSafe backchannel state', () => {
+  it('leaves out the last backchannel when context is off', () => {
+    expect(bcState('hi there', { line: 'Yeah.', agoMs: 3400 }, false)).toBe('hi there');
+    expect(bcState('hi there', { line: 'Yeah.', agoMs: 3400 }, true)).toBe('[Agent\'s last backchannel: "Yeah.", 3 s ago]\nhi there');
   });
 });
