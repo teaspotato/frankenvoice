@@ -53,12 +53,12 @@ def rms(x):
 
 
 class Data:
-    def __init__(self, synth, real, seed=0, holdout=False):
+    def __init__(self, synth, real, seed=0, holdout=False, holdout_voices=HOLDOUT):
         self.rng = np.random.default_rng(seed)
         self.s = {k: [] for k in ('audio', 'len', 'y', 'first_end', 'more')}
         for f in synth:  # synth.py output and split_takes.py output share one format
             s = np.load(f)
-            keep = np.isin(s['voice'], HOLDOUT) == holdout
+            keep = np.isin(s['voice'], holdout_voices) == holdout
             for k in self.s:
                 v = s[k][keep]
                 self.s[k] += list(v) if k == 'audio' else [v]
@@ -186,6 +186,7 @@ def main():
     ap.add_argument('--steps', type=int, default=3000); ap.add_argument('--batch', type=int, default=48)
     ap.add_argument('--lr', type=float, default=5e-5); ap.add_argument('--freeze-encoder', action='store_true')
     ap.add_argument('--p-real', type=float, default=0.25)
+    ap.add_argument('--holdout', help='comma-separated voices (or a prefix ending in *) kept out of training and scored')
     ap.add_argument('--out', default='ckpt'); ap.add_argument('--export')
     ap.add_argument('--load', help='skip training, load this state dict')
     a = ap.parse_args()
@@ -196,8 +197,13 @@ def main():
     if a.load:
         model.load_state_dict(torch.load(a.load, map_location=dev))
     else:
-        data = Data(a.synth, a.real)
-        val = Data(a.synth, a.real, holdout=True)
+        hv = HOLDOUT
+        if a.holdout:
+            allv = sorted({str(v) for f in a.synth for v in np.load(f)['voice']})
+            hv = [v for v in allv if any(v == h or (h.endswith('*') and v.startswith(h[:-1])) for h in a.holdout.split(','))]
+            print('held-out voices:', hv)
+        data = Data(a.synth, a.real, holdout_voices=hv)
+        val = Data(a.synth, a.real, holdout=True, holdout_voices=hv)
         enc_p = list(model.enc.parameters()); head_p = [p for n, p in model.named_parameters() if not n.startswith('enc.')]
         if a.freeze_encoder:
             for p in enc_p: p.requires_grad = False

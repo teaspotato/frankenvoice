@@ -65,6 +65,21 @@ resumed on a floor-take or stopped on a backchannel.
   (0.88 to 0.93). That is the signature of a domain gap. Ten clips is also too few to
   rank models: one clip is 10 points.
 
+### Unseen speakers
+
+I trained on the 27 US and UK Kokoro voices only, for 1,500 steps, and held out all
+17 accented voices (Japanese, Chinese, Spanish, French, Hindi, Italian and Portuguese
+voices reading English):
+
+- **Held-out voices:** 89–90% first-word accuracy, mixed under your mic noise and agent
+  echo. That's close to the 88–93% on 3 held-out voices from the same accent groups.
+- **Bugs 2:** still 6/10 at +0.4 s, deciding 6 times and wrongly 2 times.
+
+So the model generalizes across speakers and accents. What it doesn't cross is the
+step from TTS to your browser-processed mic. Fish voices would be a stronger
+unseen-speaker test, since they're a different TTS family; this session couldn't reach
+the Fish API.
+
 ## Why the channel matters (measured)
 
 Per 100 ms frame, your mic during the overlaps:
