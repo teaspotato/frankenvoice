@@ -19,7 +19,7 @@ export interface Span {
 export interface AsrResult {
   /** When the result arrived. */
   t: number;
-  /** Audio it covers, in session time. */
+  /** Its words, in session time: first word start to last word end (the window when there are no words). */
   a0: number;
   a1: number;
   text: string;
@@ -313,11 +313,15 @@ export class TimelineModel {
       case 'asr.partial':
       case 'asr.final': {
         const final = d.type === 'asr.final';
-        const covers = typeof d.start === 'number' && typeof d.end === 'number' ? { a0: this.sampleToT(d.start), a1: this.sampleToT(d.end) } : {};
+        // The provider's window (start/end) begins where its previous final ended, so it takes in the
+        // silence before the words; the words' own times say where the speech is.
+        const words: { start: number; end: number }[] = Array.isArray(d.words) ? d.words : [];
+        const span = words.length ? { start: words[0].start, end: words[words.length - 1].end } : { start: d.start, end: d.end };
+        const covers = typeof span.start === 'number' && typeof span.end === 'number' ? { a0: this.sampleToT(span.start), a1: this.sampleToT(span.end) } : {};
         this.asrArrivals.push({ t: e.t, final, text: d.text ?? '', seq: e.seq, ...covers });
         if (typeof d.start === 'number' && typeof d.end === 'number') {
           const seqs = [...(this.asr.get(d.start)?.seqs ?? []), e.seq];
-          this.asr.set(d.start, { t: e.t, a0: this.sampleToT(d.start), a1: this.sampleToT(d.end), text: d.text ?? '', final, seqs });
+          this.asr.set(d.start, { t: e.t, a0: covers.a0!, a1: covers.a1!, text: d.text ?? '', final, seqs });
         }
         break;
       }

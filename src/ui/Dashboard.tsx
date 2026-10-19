@@ -30,7 +30,7 @@ const LEGEND: Record<string, string> = {
   turnmodel:
     'Turn model scores per 80 ms frame, placed on the audio they had heard: end of turn (blue) and take the floor (orange). Solid: the user; faint: the agent. Dashed: the thresholds.\nDiamonds: events the model committed for the user (top: end of turn, bottom: take the floor); hollow dots: the same for the agent.',
   asr:
-    'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
+    'Bar: a final transcript, from its first word to its last. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the last word to when its result arrived: the ASR latency.',
   turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   opener:
@@ -598,7 +598,7 @@ export function Dashboard({
             audio: [r.a0, r.a1],
           });
         }
-        // latency: end of the audio to arrival of this result
+        // latency: end of the last word to arrival of this result
         g.strokeStyle = col.asr;
         g.globalAlpha = 0.5;
         g.beginPath();
@@ -612,7 +612,7 @@ export function Dashboard({
           x1: x(r.t),
           y0: ly0 + (ly1 - ly0) * 0.64,
           y1: ly1,
-          text: `ASR latency: the ${r.final ? 'final' : 'latest partial'} result arrived ${(r.t - r.a1).toFixed(0)} ms after the end of the audio it covers`,
+          text: `ASR latency: the ${r.final ? 'final' : 'latest partial'} result arrived ${(r.t - r.a1).toFixed(0)} ms after its last word ended`,
           seqs: r.seqs,
         });
       }
@@ -626,7 +626,7 @@ export function Dashboard({
           x1: x(a.t) + 3,
           y0: ly0 + (ly1 - ly0) * 0.64,
           y1: ly1,
-          text: `${a.final ? 'final' : 'partial'} result arrived${a.a1 !== undefined ? ` ${(a.t - a.a1).toFixed(0)} ms after its audio ended` : ''}: ${a.text || '(empty)'}`,
+          text: `${a.final ? 'final' : 'partial'} result arrived${a.a1 !== undefined ? ` ${(a.t - a.a1).toFixed(0)} ms after its last word ended` : ''}: ${a.text || '(empty)'}`,
           seqs: [a.seq],
           audio: a.a0 === undefined ? undefined : [a.a0, a.a1!],
         });
