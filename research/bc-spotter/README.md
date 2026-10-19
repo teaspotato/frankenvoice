@@ -117,6 +117,38 @@ clips in 27 other voices. The split is in `fish_split.json`.
 
 This is consistent with the channel being the remaining gap (below).
 
+### Browser-mic simulation (`mic_sim.py`)
+
+Each synthetic clip, with probability 0.8, goes through a simulated browser mic chain:
+
+1. A room impulse response: synthetic, or with `--banks`, one of 325 real ones.
+2. A cheap-mic response: high-pass, low-pass and a resonance.
+3. Agent echo through its own room path, distorted, then mostly cancelled.
+4. Room noise: pink noise, or one of 586 real environmental noises at 0–30 dB SNR.
+5. Double-talk suppression: −0 to −30 dB while the agent is loud.
+6. Noise suppression: spectral subtraction plus a frame gate down to about −88 dB.
+7. A slow AGC that starts low at the onset.
+
+The real rooms and noises come from OpenSLR 28 (RIRS_NOISES, Apache-2.0) via
+`prep_banks.py`.
+
+**Calibration:** per 10 ms frame in the window around onset, the simulated clips are
+36% near-silent (below −75 dB), with a median of −51 dB and a 90th percentile of
+−23 dB. Your real overlaps are 28% near-silent, with a median of −46 dB and a 90th
+percentile of −20 dB.
+
+| Kokoro + Aura + Fish, 3,000 steps | Unseen Fish voices | Bugs 2 first word at +0.4 s | Decided / wrong at +0.4 s | Decided / wrong at +0.5 s |
+|---|---|---|---|---|
+| no simulation | 92% | 6/10 | 7 / 2 | 6 / 1 |
+| mic simulation | 92% | **7/10** | 6 / 2 | 6 / 2 |
+| mic simulation + real rooms and noises | 92% | **7/10** | 7 / 2 | 6 / 1 |
+
+- **Simulation doesn't hurt the clean synthetic score, and it adds one first word on your
+  audio:** the "Okay" in "Okay. So so…" is now right.
+- **The decisions stay the same.** All three backchannels and two of the three "So"
+  attempts are right. The quietest "So (gave up)" is heard as `none` or `mhm` in every
+  version, and "Yeah. Could be." is heard as `um` or `none`. One clip is 10 points here,
+  so these rows are not separable. A larger real eval set is now the limit.
 ## Why the channel matters (measured)
 
 Per 100 ms frame, your mic during the overlaps:
@@ -160,7 +192,8 @@ All in `research/bc-spotter/` on branch `claude/project-thread-5jvmuc`:
 - `eval_set.py`: the 10 labeled overlaps.
 - `synth.py`: Kokoro generator; `synth_deepgram.py` and `fish_synth.py`: the same prompts in Deepgram Aura-2 and Fish voices.
 - `split_takes.py` and `takes.txt`: your own recordings.
-- `train.py`: training, evaluation and ONNX export.
+- `train.py`: training, evaluation and ONNX export (`--p-sim`, `--banks`).
+- `mic_sim.py`: the browser-mic simulator; `prep_banks.py`: real rooms and noises from OpenSLR 28.
 
 Running it:
 

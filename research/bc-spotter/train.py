@@ -14,6 +14,7 @@ Evaluates on the 10 labeled overlaps (eval_set.py) at several W.
 import argparse, json, math, os, random, time
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
+from mic_sim import simulate
 from vocab import BACKCHANNEL, CLASSES, FLOOR_OPENER, IDX
 
 HOLDOUT = ['af_nova', 'bm_george', 'jf_alpha']  # synth.HOLDOUT: voices kept out of training
@@ -53,8 +54,9 @@ def rms(x):
 
 
 class Data:
-    def __init__(self, synth, real, seed=0, holdout=False, holdout_voices=HOLDOUT):
-        self.rng = np.random.default_rng(seed)
+    def __init__(self, synth, real, seed=0, holdout=False, holdout_voices=HOLDOUT, p_sim=0.0, banks=None):
+        self.rng = np.random.default_rng(seed); self.p_sim = p_sim
+        self.banks = dict(np.load(banks)) if banks else None
         self.s = {k: [] for k in ('audio', 'len', 'y', 'first_end', 'more')}
         for f in synth:  # synth.py output and split_takes.py output share one format
             s = np.load(f)
@@ -69,6 +71,19 @@ class Data:
         none = r['y'] == IDX['none']
         self.noise = r['audio'][none]  # mic with no user speech: room noise + echo residue
         self.agent = r['agent'][r['overlap']]  # agent playback on the mic clock
+
+    def raw_agent(self, n):
+        rng = self.rng
+        if rng.random() < 0.15:
+            return np.zeros(n, np.float32)
+        ag = self.agent[rng.integers(len(self.agent))].astype(np.float32)
+        i = rng.integers(0, max(1, len(ag) - n)); seg = ag[i:i + n]
+        return np.pad(seg, (0, n - len(seg)))
+
+    def raw_noise(self, n):
+        nz = self.noise[self.rng.integers(len(self.noise))].astype(np.float32)
+        i = self.rng.integers(0, max(1, len(nz) - n)); seg = nz[i:i + n]
+        return np.pad(seg, (0, n - len(seg)))
 
     def background(self, n):
         rng = self.rng
@@ -90,11 +105,15 @@ class Data:
         x = self.s['audio'][i][:self.s['len'][i]].astype(np.float32)
         lag = rng.uniform(0.0, 0.45)  # VAD onset comes after the speech starts
         n = int((PRE + W) * SR)
-        out = self.background(n)
         st = int((PRE - lag) * SR)
         seg = x[:max(0, n - st)]
-        g = db(rng.uniform(-38, -14)) / rms(x)
-        out[st:st + len(seg)] += seg * g
+        if rng.random() < self.p_sim:  # full browser-mic simulation (mic_sim.py)
+            clean = np.zeros(n, np.float32); clean[st:st + len(seg)] = seg
+            ag, nz = self.raw_agent(n), self.raw_noise(n)
+            out = simulate(clean, ag, nz, rng, self.banks)
+        else:
+            out = self.background(n)
+            out[st:st + len(seg)] += seg * db(rng.uniform(-38, -14)) / rms(x)
         fe = self.s['first_end'][i] - lag  # first word end, relative to the anchor
         more = bool(self.s['more'][i]) and fe + 0.12 < W
         return out, int(self.s['y'][i]), more
@@ -186,6 +205,8 @@ def main():
     ap.add_argument('--steps', type=int, default=3000); ap.add_argument('--batch', type=int, default=48)
     ap.add_argument('--lr', type=float, default=5e-5); ap.add_argument('--freeze-encoder', action='store_true')
     ap.add_argument('--p-real', type=float, default=0.25)
+    ap.add_argument('--p-sim', type=float, default=0.0, help='share of synthetic clips run through mic_sim.simulate')
+    ap.add_argument('--banks', help='prep_banks.py output: real RIRs and noises for mic_sim')
     ap.add_argument('--holdout', help='comma-separated voices (or a prefix ending in *) kept out of training and scored')
     ap.add_argument('--out', default='ckpt'); ap.add_argument('--export')
     ap.add_argument('--load', help='skip training, load this state dict')
@@ -204,8 +225,8 @@ def main():
             allv = sorted({str(v) for f in a.synth for v in np.load(f)['voice']})
             hv = [v for v in allv if any(v == h or (h.endswith('*') and v.startswith(h[:-1])) for h in a.holdout.split(','))]
             print('held-out voices:', hv)
-        data = Data(a.synth, a.real, holdout_voices=hv)
-        val = Data(a.synth, a.real, holdout=True, holdout_voices=hv)
+        data = Data(a.synth, a.real, holdout_voices=hv, p_sim=a.p_sim, banks=a.banks)
+        val = Data(a.synth, a.real, holdout=True, holdout_voices=hv, p_sim=a.p_sim, banks=a.banks)
         enc_p = list(model.enc.parameters()); head_p = [p for n, p in model.named_parameters() if not n.startswith('enc.')]
         if a.freeze_encoder:
             for p in enc_p: p.requires_grad = False
@@ -234,7 +255,7 @@ def main():
             allv = sorted({str(v) for v in np.load(f)['voice']})
             pick = allv if not a.test_voices else [v for v in allv if any(
                 v == h or (h.endswith('*') and v.startswith(h[:-1])) for h in a.test_voices.split(','))]
-            print(f'{f}: first-word acc {val_synth(model, Data([f], a.real, holdout=True, holdout_voices=pick), dev, n=30):.3f} '
+            print(f'{f}: first-word acc {val_synth(model, Data([f], a.real, holdout=True, holdout_voices=pick, p_sim=a.p_sim), dev, n=30):.3f} '
                   f'on {len(pick)} voices', flush=True)
     ev = evaluate(model, a.eval, dev)
     json.dump(ev, open(f'{a.out}/eval.json', 'w'), indent=1)
