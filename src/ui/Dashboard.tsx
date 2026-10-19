@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
 import type { Trajectory } from '../core/trajectory';
 import { TimelineModel, type Related } from './timeline';
 
@@ -25,16 +25,19 @@ const LEGEND: Record<string, string> = {
   mic: 'Microphone input: waveform peaks every 10 ms, placed when each frame arrived. Green shading: speech the VAD detected.',
   cleanup: 'Audio after noise/echo cleanup: what VAD and ASR hear. Small ticks under it: AEC double talk or the RNNoise gate closing. Hover for levels.',
   vad: 'Speech probability per frame (line) against the start and stop thresholds (dashed). Shaded: detected speech.',
-  asr:
-    'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
+  asr: 'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
   turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), grey dot = backchannel or noise, ignored.',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT, chunks and chars/s. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
-  speaker: 'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries.',
+  speaker:
+    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries.',
 };
 
 const AXIS = 20;
 const LABEL_W = 78;
+const VSCALE_KEY = 'frankenvoice.laneScale';
+const MIN_VSCALE = 0.5;
+const MAX_VSCALE = 5;
 const MIN_SPAN = 200;
 
 interface Hit {
@@ -95,7 +98,11 @@ function niceStep(span: number, px: number): number {
 
 function fmt(ms: number, step: number) {
   const s = ms / 1000;
-  return step < 1000 ? `${s.toFixed(step < 100 ? 2 : 1)}s` : s >= 60 ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}` : `${s.toFixed(0)}s`;
+  return step < 1000
+    ? `${s.toFixed(step < 100 ? 2 : 1)}s`
+    : s >= 60
+      ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
+      : `${s.toFixed(0)}s`;
 }
 
 /**
@@ -150,7 +157,24 @@ export function Dashboard({
   const [tick, setTick] = useState(0);
   const drag = useRef<{ x: number; end: number } | null>(null);
 
-  const totalH = AXIS + LANES.reduce((a, l) => a + l.height, 0);
+  // Lane heights scale together (pinch up/down, or pinch over the lane names).
+  const [vscale, setVscale] = useState(() => {
+    try {
+      const v = Number(localStorage.getItem(VSCALE_KEY));
+      return v >= MIN_VSCALE && v <= MAX_VSCALE ? v : 1;
+    } catch {
+      return 1;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(VSCALE_KEY, String(vscale));
+    } catch {
+      /* not saved */
+    }
+  }, [vscale]);
+  const lanes = useMemo(() => LANES.map((l) => ({ ...l, height: Math.round(l.height * vscale) })), [vscale]);
+  const totalH = AXIS + lanes.reduce((a, l) => a + l.height, 0);
 
   if (trajectory && modelRef.current?.traj !== trajectory) modelRef.current = new TimelineModel(trajectory);
   if (!trajectory) modelRef.current = null;
@@ -253,7 +277,7 @@ export function Dashboard({
     // lanes
     const laneY: Record<string, [number, number]> = {};
     let y = AXIS;
-    for (const l of LANES) {
+    for (const l of lanes) {
       laneY[l.id] = [y, y + l.height];
       if (l.id === selected) {
         g.fillStyle = col.bg;
@@ -366,7 +390,14 @@ export function Dashboard({
         g.globalAlpha = 0.12;
         g.fillRect(a, laneY.mic[0], b - a, laneY.vad[1] - laneY.mic[0]);
         g.globalAlpha = 1;
-        hits.push({ lane: 'vad', x0: a, x1: b, text: `speech ${((((s.t1 ?? head) - s.t0) / 1000) as number).toFixed(2)} s`, seqs: s.seqs, audio: [s.t0, s.t1 ?? head] });
+        hits.push({
+          lane: 'vad',
+          x0: a,
+          x1: b,
+          text: `speech ${((((s.t1 ?? head) - s.t0) / 1000) as number).toFixed(2)} s`,
+          seqs: s.seqs,
+          audio: [s.t0, s.t1 ?? head],
+        });
       }
 
       // mic waveform, and what the noise/echo stage made of it
@@ -466,7 +497,16 @@ export function Dashboard({
           g.strokeRect(x0 + 0.5, ly0 + (ly1 - ly0) * 0.08 + 0.5, x1 - x0 - 1, (ly1 - ly0) * 0.54);
           g.setLineDash([]);
           label(r.text, x0, x1, ly0 + (ly1 - ly0) * 0.35, col.muted);
-          hits.push({ lane: 'asr', x0, x1, y0: ly0, y1: ly0 + (ly1 - ly0) * 0.64, text: `partial transcript (may still change): ${r.text}`, seqs: r.seqs, audio: [r.a0, r.a1] });
+          hits.push({
+            lane: 'asr',
+            x0,
+            x1,
+            y0: ly0,
+            y1: ly0 + (ly1 - ly0) * 0.64,
+            text: `partial transcript (may still change): ${r.text}`,
+            seqs: r.seqs,
+            audio: [r.a0, r.a1],
+          });
         }
         // latency: end of the audio to arrival of this result
         g.strokeStyle = col.asr;
@@ -585,7 +625,15 @@ export function Dashboard({
             g.fillText(c.text.replace(/\s+/g, ' '), cx + 2, ly0 + h * 0.76);
             g.restore();
           }
-          hits.push({ lane: 'llm', y0: ly0 + h * 0.44, y1: ly1, x0: cx - 1, x1: Math.max(cx + 3, nx - 1), text: `+${(c.t - l.t0).toFixed(0)} ms  ${JSON.stringify(c.text)}\n${so}`, seqs: [c.seq] });
+          hits.push({
+            lane: 'llm',
+            y0: ly0 + h * 0.44,
+            y1: ly1,
+            x0: cx - 1,
+            x1: Math.max(cx + 3, nx - 1),
+            text: `+${(c.t - l.t0).toFixed(0)} ms  ${JSON.stringify(c.text)}\n${so}`,
+            seqs: [c.seq],
+          });
         });
       }
 
@@ -594,7 +642,15 @@ export function Dashboard({
         if (r.t < t0 || r.t > t1) continue;
         mark('tts', r.t, col.muted, 0.86, 'diamond');
         const [ly0, ly1] = laneY.tts;
-        hits.push({ lane: 'tts', x0: x(r.t) - 3, x1: x(r.t) + 3, y0: ly0 + (ly1 - ly0) * 0.72, y1: ly1, text: 'request sent to the TTS provider', seqs: [r.seq] });
+        hits.push({
+          lane: 'tts',
+          x0: x(r.t) - 3,
+          x1: x(r.t) + 3,
+          y0: ly0 + (ly1 - ly0) * 0.72,
+          y1: ly1,
+          text: 'request sent to the TTS provider',
+          seqs: [r.seq],
+        });
       }
       for (const s of m.tts) {
         const end = s.t1 ?? head;
@@ -608,7 +664,8 @@ export function Dashboard({
         const end = p.t1 ?? head;
         if (end < t0 || p.t0 > t1) continue;
         span('speaker', p.t0, end, col.sink, 0.1, '', 0, 1);
-        hits[hits.length - 1].text = `${p.interrupted ? 'interrupted' : 'played'} ${((end - p.t0) / 1000).toFixed(2)} s${p.heard !== undefined ? `\nheard: ${p.heard || '(nothing)'}` : ''}`;
+        hits[hits.length - 1].text =
+          `${p.interrupted ? 'interrupted' : 'played'} ${((end - p.t0) / 1000).toFixed(2)} s${p.heard !== undefined ? `\nheard: ${p.heard || '(nothing)'}` : ''}`;
         tag(p.seqs);
         if (p.interrupted) vline('speaker', end, col.danger);
       }
@@ -682,8 +739,7 @@ export function Dashboard({
         rels = hits.map((h, i) => rels[i] ?? relationOf(h, tipHit, rel, audio));
         g.fillStyle = col.accent;
         g.globalAlpha = 0.12;
-        for (const [a, b] of audio)
-          for (const l of ['mic', 'cleanup']) g.fillRect(x(a), laneY[l][0], Math.max(2, x(b) - x(a)), laneY[l][1] - laneY[l][0]);
+        for (const [a, b] of audio) for (const l of ['mic', 'cleanup']) g.fillRect(x(a), laneY[l][0], Math.max(2, x(b) - x(a)), laneY[l][1] - laneY[l][0]);
         g.globalAlpha = 1;
         const stroke: Record<Relation, string> = { self: col.text, up: col.warn, down: col.accent, audio: col.muted };
         g.lineWidth = 2;
@@ -761,7 +817,19 @@ export function Dashboard({
   const plotW = () => Math.max(1, size.w - LABEL_W);
   const currentEnd = () => window_(modelRef.current)[1];
 
-  // Pinch (which browsers report as ctrl+wheel) or ctrl/cmd+wheel zooms; a sideways swipe pans;
+  /** Scale the lane heights by `f`, keeping the point at `py` (canvas pixels) under the pointer. */
+  const zoomHeight = (f: number, py: number) => {
+    const v = Math.max(MIN_VSCALE, Math.min(MAX_VSCALE, vscale * f));
+    const body = wrapRef.current;
+    if (body) {
+      const ratio = (AXIS + LANES.reduce((a, l) => a + Math.round(l.height * v), 0)) / totalH;
+      requestAnimationFrame(() => (body.scrollTop = Math.max(0, (body.scrollTop + py) * ratio - py)));
+    }
+    setVscale(v);
+  };
+
+  // Pinch (which browsers report as ctrl+wheel) or ctrl/cmd+wheel zooms time; over the lane names or with
+  // shift it zooms lane height instead (trackpads don't report a pinch's direction). A sideways swipe pans;
   // an up/down swipe or plain wheel scrolls the lanes as usual.
   const onWheel = (e: WheelEvent) => {
     const zoom = e.ctrlKey || e.metaKey;
@@ -770,7 +838,11 @@ export function Dashboard({
     const rect = canvasRef.current!.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const end = currentEnd();
-    if (zoom) {
+    if (zoom && (e.shiftKey || px < LABEL_W)) {
+      // shift can turn the delta sideways
+      const d = e.deltaY || e.deltaX;
+      zoomHeight(Math.exp(-d * (Math.abs(d) < 40 ? 0.01 : 0.0015)), e.clientY - rect.top - (wrapRef.current?.scrollTop ?? 0));
+    } else if (zoom) {
       // zoom around the cursor
       // Trackpad pinches send many small deltas; mouse wheels a few large ones.
       const f = Math.exp(e.deltaY * (Math.abs(e.deltaY) < 40 ? 0.01 : 0.0015));
@@ -794,6 +866,50 @@ export function Dashboard({
     return () => c.removeEventListener('wheel', h);
   }, []);
 
+  // Two-finger pinch on a touchscreen: spreading the fingers sideways zooms time, up/down zooms lane height.
+  const pinch = useRef<{ dx: number; dy: number; span: number; end: number; axis: 'x' | 'y' | null; y: number } | null>(null);
+  const onTouch = (e: TouchEvent) => {
+    if (e.touches.length !== 2) {
+      pinch.current = null;
+      return;
+    }
+    const [a, b] = [e.touches[0], e.touches[1]];
+    const dx = Math.max(20, Math.abs(a.clientX - b.clientX));
+    const dy = Math.max(20, Math.abs(a.clientY - b.clientY));
+    const rect = canvasRef.current!.getBoundingClientRect();
+    e.preventDefault();
+    if (e.type === 'touchstart' || !pinch.current) {
+      pinch.current = { dx, dy, span: view.span, end: currentEnd(), axis: null, y: (a.clientY + b.clientY) / 2 - rect.top - (wrapRef.current?.scrollTop ?? 0) };
+      return;
+    }
+    const p = pinch.current;
+    if (!p.axis) {
+      const mx = Math.abs(Math.log(dx / p.dx));
+      const my = Math.abs(Math.log(dy / p.dy));
+      if (Math.max(mx, my) < 0.05) return;
+      p.axis = mx >= my ? 'x' : 'y';
+    }
+    if (p.axis === 'x') {
+      const span = Math.max(MIN_SPAN, Math.min(3_600_000, (p.span * p.dx) / dx));
+      const frac = Math.max(0, Math.min(1, ((a.clientX + b.clientX) / 2 - rect.left - LABEL_W) / plotW()));
+      const tMid = p.end - p.span + frac * p.span;
+      setView({ span, end: tMid + (1 - frac) * span });
+    } else {
+      zoomHeight(dy / p.dy, p.y);
+      p.dy = dy;
+    }
+  };
+  const touchRef = useRef(onTouch);
+  touchRef.current = onTouch;
+  useEffect(() => {
+    const c = canvasRef.current!;
+    const h = (e: TouchEvent) => touchRef.current(e);
+    for (const t of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) c.addEventListener(t, h as EventListener, { passive: false });
+    return () => {
+      for (const t of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) c.removeEventListener(t, h as EventListener);
+    };
+  }, []);
+
   const onMouseDown = (e: React.MouseEvent) => {
     drag.current = { x: e.clientX, end: currentEnd() };
   };
@@ -815,7 +931,7 @@ export function Dashboard({
     const t = currentEnd() - view.span + ((px - LABEL_W) / plotW()) * view.span;
     if (py < AXIS && px > LABEL_W) return onSeek(t);
     let y = AXIS;
-    for (const l of LANES) {
+    for (const l of lanes) {
       if (py >= y && py < y + l.height) {
         // A lane's name toggles its stage; an item shows its events; empty space seeks.
         if (px <= LABEL_W) return onSelect(l.id === selected ? null : l.id);
@@ -838,7 +954,7 @@ export function Dashboard({
   let tipLane: string | undefined;
   if (hover) {
     let y = AXIS;
-    for (const l of LANES) {
+    for (const l of lanes) {
       if (hover.y >= y && hover.y < y + l.height) tipLane = l.id;
       y += l.height;
     }
@@ -878,10 +994,21 @@ export function Dashboard({
       <div className="dashboard-bar">
         {transport}
         <span className="muted">
-          {trajectory ? (trajectory.meta.mode === 'replay' ? `replay of ${trajectory.meta.replayOf}` : playing ? `playing ${trajectory.meta.id}` : running ? 'live' : trajectory.meta.id) : 'no session yet: press Run live'}
+          {trajectory
+            ? trajectory.meta.mode === 'replay'
+              ? `replay of ${trajectory.meta.replayOf}`
+              : playing
+                ? `playing ${trajectory.meta.id}`
+                : running
+                  ? 'live'
+                  : trajectory.meta.id
+            : 'no session yet: press Run live'}
         </span>
         <span className="spacer" />
-        <small className="muted">click to seek · pinch or ⌘/ctrl+scroll to zoom · swipe sideways or drag to pan · click a lane's name to select its stage</small>
+        <small className="muted">
+          click to seek · pinch or ⌘/ctrl+scroll to zoom time · pinch over the lane names or with shift for lane height · swipe sideways or drag to pan · click
+          a lane's name to select its stage
+        </small>
         <button onClick={() => setView({ ...view, span: Math.max(MIN_SPAN, view.span / 1.5) })}>+</button>
         <button onClick={() => setView({ ...view, span: Math.min(3_600_000, view.span * 1.5) })}>−</button>
         <button onClick={fit}>Fit</button>
@@ -890,17 +1017,21 @@ export function Dashboard({
         </button>
       </div>
       <div className="dashboard-body" ref={wrapRef}>
-        {LANES.map((l, i) => {
+        {lanes.map((l, i) => {
           const which = l.id === 'mic' ? 'mic' : l.id === 'speaker' ? 'agent' : null;
           if (!which) return null;
-          const top = AXIS + LANES.slice(0, i).reduce((a, x) => a + x.height, 0) + l.height / 2 + 7;
+          const top = AXIS + lanes.slice(0, i).reduce((a, x) => a + x.height, 0) + l.height / 2 + 7;
           return (
             <button
               key={l.id}
               className={`lane-mute${muted[which] ? ' on' : ''}`}
               style={{ top }}
               onClick={() => onMute(which)}
-              title={muted[which] ? `Unmute ${which === 'mic' ? 'the recorded mic' : 'the agent'}` : `Mute ${which === 'mic' ? 'the recorded mic (heard in replays)' : 'the agent'}`}
+              title={
+                muted[which]
+                  ? `Unmute ${which === 'mic' ? 'the recorded mic' : 'the agent'}`
+                  : `Mute ${which === 'mic' ? 'the recorded mic (heard in replays)' : 'the agent'}`
+              }
             >
               {muted[which] ? '🔇' : '🔊'}
             </button>
@@ -956,7 +1087,14 @@ export function Dashboard({
  * flipped left or above when it would cross the edge. Positioned against the viewport so the
  * scrolling dashboard can't clip it; if it is taller than the dashboard it may extend past it, never past the window.
  */
-function Tip(props: { x: number; y: number; canvas: RefObject<HTMLCanvasElement | null>; frame: RefObject<HTMLDivElement | null>; className: string; children: ReactNode }) {
+function Tip(props: {
+  x: number;
+  y: number;
+  canvas: RefObject<HTMLCanvasElement | null>;
+  frame: RefObject<HTMLDivElement | null>;
+  className: string;
+  children: ReactNode;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const el = ref.current;
