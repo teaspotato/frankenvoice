@@ -196,15 +196,8 @@ button.danger-link { color: var(--danger); margin-left: auto; }
 .bubble { max-width: 88%; padding: 6px 9px; border-radius: 10px; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
 .bubble.user { align-self: flex-end; background: color-mix(in srgb, var(--accent) 16%, var(--panel)); border-bottom-right-radius: 3px; }
 .bubble.assistant { align-self: flex-start; background: var(--bg); border: 1px solid var(--border); border-bottom-left-radius: 3px; }
-.bubble.current { border: 1.5px solid var(--accent); }
-.bubble-thinking { color: var(--muted); font-size: 11px; font-style: italic; margin-bottom: 3px; }
-.bubble-thinking summary { cursor: pointer; }
-.bubble-other { font: 11px var(--mono); color: var(--muted); }
-.bubble-note { font-size: 10px; color: var(--muted); margin-top: 3px; }
-.chat { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
-.bubble { max-width: 88%; padding: 6px 9px; border-radius: 10px; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
-.bubble.user { align-self: flex-end; background: color-mix(in srgb, var(--accent) 16%, var(--panel)); border-bottom-right-radius: 3px; }
-.bubble.assistant { align-self: flex-start; background: var(--bg); border: 1px solid var(--border); border-bottom-left-radius: 3px; }
+.bubble.tool { align-self: flex-start; background: var(--bg); border: 1px dashed var(--border); font-size: 11px; }
+.chat-more { align-self: center; font-size: 11px; }
 .bubble.current { border: 1.5px solid var(--accent); }
 .bubble-thinking { color: var(--muted); font-size: 11px; font-style: italic; margin-bottom: 3px; white-space: pre-wrap; }
 .bubble-thinking summary { cursor: pointer; }
