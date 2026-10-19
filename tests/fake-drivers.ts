@@ -180,6 +180,22 @@ const openai: LiveDriver = (req, sink) => {
   return { send() {}, close: () => void (closed = true) };
 };
 
+const openaiResponses: LiveDriver = (req, sink) => {
+  const r = req as { body: { input: unknown[] } };
+  const tokens = `Responses reply ${r.body.input.length}. Short and sweet!`.match(/\S+\s*/g)!;
+  let closed = false;
+  let t = jitter(2, 3);
+  const ev = (e: Json) => {
+    t += jitter(0.5, 2);
+    later(t, () => !closed && sink.recv(e));
+  };
+  ev({ type: 'response.created', response: { id: 'r1', status: 'in_progress' } });
+  for (const tok of tokens) ev({ type: 'response.output_text.delta', item_id: 'm1', output_index: 0, content_index: 0, delta: tok });
+  ev({ type: 'response.completed', response: { id: 'r1', status: 'completed' } });
+  later(t + 1, () => !closed && sink.close());
+  return { send() {}, close: () => void (closed = true) };
+};
+
 const cartesia: LiveDriver = (req, sink) => {
   const { body } = req as { body: { transcript: string; output_format: { sample_rate: number } } };
   const n = Math.round(body.transcript.length * 0.004 * body.output_format.sample_rate);
@@ -289,4 +305,4 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp };
+export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, 'openai-responses': openaiResponses, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp };

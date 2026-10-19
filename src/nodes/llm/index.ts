@@ -1,7 +1,7 @@
 import type { NodeDef } from '../../core/node';
 import type { Json, JsonObject, Msg } from '../../core/types';
 import { anthropicAdapter } from './anthropic';
-import { openaiCompatAdapter } from './openai';
+import { openaiCompatAdapter, openaiResponsesAdapter } from './openai';
 import type { ChatTurn, LlmAdapter, LlmStreamParser } from './types';
 import { DEFAULT_DELEGATE_PROMPT, WORKER_TOOLS, toolCalls, workerStatus, workerUpdate, type ToolCall, type WorkerInfo } from './delegate';
 
@@ -67,6 +67,12 @@ export const llmAdapters: Record<string, LlmAdapter> = {
 const DEFAULT_SYSTEM =
   'You are a voice assistant in a live spoken conversation. Your words are converted to speech, so answer in short, natural spoken sentences. No markdown, lists, or emoji.';
 
+/** The adapter for these params: OpenAI-compatible endpoints speak Chat Completions or Responses. */
+export function llmAdapter(p: JsonObject): LlmAdapter {
+  if (p.provider === 'openai-compatible' && p.api === 'responses') return openaiResponsesAdapter;
+  return llmAdapters[p.provider as string];
+}
+
 const anthropic = { provider: ['anthropic'] };
 const openai = { provider: ['openai-compatible'] };
 
@@ -114,6 +120,15 @@ export const llmNode: NodeDef = {
       description: 'Named endpoint configured in the proxy (.env): base URL and key stay server-side.',
     },
     {
+      key: 'api',
+      label: 'API',
+      type: 'select',
+      options: ['chat', 'responses'],
+      default: 'chat',
+      when: openai,
+      description: 'chat: /chat/completions, which every compatible server has. responses: /responses (OpenAI, OpenRouter, vLLM, ...), sent stateless with the whole history.',
+    },
+    {
       key: 'model',
       label: 'Model',
       type: 'string',
@@ -146,11 +161,12 @@ export const llmNode: NodeDef = {
   channels: [
     { name: 'anthropic', description: 'Messages API stream (raw SDK stream events)' },
     { name: 'openai', description: 'Chat Completions SSE (parsed data lines)' },
+    { name: 'openai-responses', description: 'Responses API SSE (parsed data lines)' },
   ],
   requires: (p) => (p.provider === 'openai-compatible' ? [`openai/${String(p.endpoint)}`] : [String(p.provider)]),
   create(ctx) {
     const p = ctx.params as JsonObject;
-    const adapter = llmAdapters[p.provider as string];
+    const adapter = llmAdapter(p);
     const reqParams: JsonObject = { ...p, model: (p.model as string) || adapter?.defaultModel || '' };
     // Delegation: the worker tools, and how the workers' updates come back.
     const delegation = p.delegate && typeof p.delegate === 'object' && adapter?.provider === 'anthropic' ? (p.delegate as JsonObject) : null;

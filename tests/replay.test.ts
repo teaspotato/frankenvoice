@@ -125,6 +125,22 @@ describe('record and replay', () => {
     expect(runtime.trajectory.events).toEqual(run.events);
   }, 10_000);
 
+  it('runs an OpenAI-compatible endpoint over the Responses API and replays it exactly', async () => {
+    const g = testGraph();
+    Object.assign(g.nodes.find((n) => n.id === 'llm')!.params, { provider: 'openai-compatible', endpoint: 'openrouter', api: 'responses', model: 'some/model' });
+    const run = await recordLive(800, performance, g);
+    const opened = run.events.find((e) => e.kind === 'io.open' && e.node === 'llm')!;
+    expect(opened.data).toMatchObject({ channel: 'openai-responses', request: { endpoint: 'openrouter', body: { model: 'some/model', store: false } } });
+    const deltas = run.events.filter((e) => e.kind === 'msg' && (e.data as { type: string }).type === 'llm.delta');
+    expect(deltas.length).toBeGreaterThan(0);
+    const ends = run.events.filter((e) => e.kind === 'msg' && (e.data as { type: string }).type === 'llm.end');
+    expect(ends.length).toBeGreaterThan(0);
+    for (const e of ends) expect((e.data as { status: string }).status).not.toBe('error');
+    const { runtime, sim } = prepareReplay(run, { registry });
+    sim.runFast();
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 10_000);
+
   it('swaps TTS to Deepgram Aura (16-bit PCM) and replays it exactly', async () => {
     const g = testGraph();
     g.nodes.find((n) => n.id === 'tts')!.params = { provider: 'deepgram' };

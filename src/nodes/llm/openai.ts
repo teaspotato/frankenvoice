@@ -66,3 +66,81 @@ export const openaiCompatAdapter: LlmAdapter = {
     };
   },
 };
+
+/**
+ * OpenAI-compatible Responses API (`/responses`: OpenAI, OpenRouter, vLLM, ...).
+ * Stateless: the whole history goes in `input` every time (`store: false`), as
+ * with Chat Completions, so a request is all a replay needs. Payloads are the
+ * parsed `data:` lines; every one carries its event `type`.
+ */
+export const openaiResponsesAdapter: LlmAdapter = {
+  provider: 'openai-compatible',
+  channel: 'openai-responses',
+  buildRequest(history: ChatTurn[], p: JsonObject): Json {
+    const input: JsonObject[] = [];
+    for (const t of history) {
+      const last = input[input.length - 1];
+      if (last?.role === t.role && t.role === 'user') last.content = `${last.content as string}\n${t.text}`;
+      else input.push({ role: t.role, content: t.text });
+    }
+    let extra: JsonObject = {};
+    if (typeof p.extraBody === 'string' && p.extraBody.trim()) extra = JSON.parse(p.extraBody) as JsonObject;
+    return {
+      endpoint: p.endpoint,
+      body: {
+        model: p.model,
+        ...(p.system ? { instructions: p.system } : {}),
+        input,
+        stream: true,
+        store: false,
+        ...(p.maxTokens ? { max_output_tokens: p.maxTokens } : {}),
+        ...extra,
+      },
+    };
+  },
+  parser() {
+    let stopReason: string | null = null;
+    let ended = false;
+    const end = (): LlmStreamEvent[] => {
+      if (ended) return [];
+      ended = true;
+      return [{ type: 'end', stopReason }];
+    };
+    return {
+      recv(data): LlmStreamEvent[] {
+        const e = data as JsonObject;
+        switch (e.type) {
+          case 'response.output_text.delta':
+            return typeof e.delta === 'string' && e.delta ? [{ type: 'delta', text: e.delta }] : [];
+          case 'response.output_item.added':
+            return (e.item as JsonObject | undefined)?.type === 'reasoning' ? [{ type: 'thinking' }] : [];
+          case 'response.reasoning_text.delta':
+          case 'response.reasoning_summary_text.delta':
+            return [{ type: 'thinking' }];
+          case 'response.completed':
+            stopReason = 'completed';
+            return end();
+          case 'response.incomplete': {
+            const why = ((e.response as JsonObject | undefined)?.incomplete_details as JsonObject | undefined)?.reason;
+            stopReason = typeof why === 'string' ? why : 'incomplete';
+            return end();
+          }
+          case 'response.failed':
+            return [{ type: 'error', error: ((e.response as JsonObject | undefined)?.error as Json) ?? e }];
+          case 'error':
+            return [{ type: 'error', error: (e.error as Json) ?? e }];
+          default:
+            // Servers that answer with a bare error object instead of an event.
+            return e.error ? [{ type: 'error', error: e.error }] : [];
+        }
+      },
+      close(data) {
+        const d = data as JsonObject | null;
+        return d?.error ? [{ type: 'error', error: d.error }] : end();
+      },
+      native() {
+        return null;
+      },
+    };
+  },
+};

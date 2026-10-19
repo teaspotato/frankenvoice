@@ -116,6 +116,54 @@ describe('openai-compatible adapter', () => {
   });
 });
 
+describe('openai-compatible Responses adapter', () => {
+  it('builds a stateless responses request and parses the SSE events', async () => {
+    const { openaiResponsesAdapter } = await import('../src/nodes/llm/openai');
+    const req = openaiResponsesAdapter.buildRequest(
+      [
+        { role: 'user', text: 'hi' },
+        { role: 'assistant', text: 'hello' },
+        { role: 'user', text: 'how' },
+        { role: 'user', text: 'are you' },
+      ],
+      { endpoint: 'openai', model: 'm', system: 'sys', maxTokens: 50, extraBody: '{"reasoning":{"effort":"minimal"}}' },
+    ) as { endpoint: string; body: Record<string, unknown> };
+    expect(req).toEqual({
+      endpoint: 'openai',
+      body: {
+        model: 'm',
+        instructions: 'sys',
+        stream: true,
+        store: false,
+        max_output_tokens: 50,
+        reasoning: { effort: 'minimal' },
+        input: [
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content: 'hello' },
+          { role: 'user', content: 'how\nare you' },
+        ],
+      },
+    });
+    const p = openaiResponsesAdapter.parser();
+    expect(p.recv({ type: 'response.created', response: { status: 'in_progress' } })).toEqual([]);
+    expect(p.recv({ type: 'response.output_item.added', item: { type: 'reasoning' } })).toEqual([{ type: 'thinking' }]);
+    expect(p.recv({ type: 'response.reasoning_summary_text.delta', delta: 'hm' })).toEqual([{ type: 'thinking' }]);
+    expect(p.recv({ type: 'response.output_text.delta', delta: 'Hi' })).toEqual([{ type: 'delta', text: 'Hi' }]);
+    expect(p.recv({ type: 'response.completed', response: { status: 'completed' } })).toEqual([{ type: 'end', stopReason: 'completed' }]);
+    expect(p.close(null)).toEqual([]);
+    const q = openaiResponsesAdapter.parser();
+    expect(q.recv({ type: 'response.incomplete', response: { incomplete_details: { reason: 'max_output_tokens' } } })).toEqual([
+      { type: 'end', stopReason: 'max_output_tokens' },
+    ]);
+    expect(openaiResponsesAdapter.parser().recv({ type: 'error', code: 'x', message: 'bad' })).toEqual([
+      { type: 'error', error: { type: 'error', code: 'x', message: 'bad' } },
+    ]);
+    expect(openaiResponsesAdapter.parser().recv({ type: 'response.failed', response: { error: { message: 'boom' } } })).toEqual([
+      { type: 'error', error: { message: 'boom' } },
+    ]);
+  });
+});
+
 describe('TrackStore', () => {
   it('reads sample ranges across chunks without merging', () => {
     const ts = new TrackStore();

@@ -235,27 +235,32 @@ async function postJson(url: string, body: Json, signal: AbortSignal): Promise<R
   return fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
 }
 
-/** OpenAI-compatible chat completions; each SSE data line is recorded parsed, `[DONE]` as {"$done": true}. */
-const openai: LiveDriver = (req, sink) => {
-  const r = req as { endpoint: string; body: Json };
-  const ac = new AbortController();
-  (async () => {
-    const res = await postJson(`/api/openai/${encodeURIComponent(r.endpoint)}/chat/completions`, r.body, ac.signal);
-    if (!res.ok || !res.body) return sink.close({ error: { status: res.status, body: await res.text() } });
-    for await (const data of sseData(res.body)) {
-      if (data === '[DONE]') sink.recv({ $done: true });
-      else {
-        try {
-          sink.recv(JSON.parse(data) as Json);
-        } catch {
-          sink.recv({ $unparsed: data });
+/** An OpenAI-compatible SSE stream at `path`; each data line is recorded parsed, `[DONE]` as {"$done": true}. */
+const openaiSse =
+  (path: string): LiveDriver =>
+  (req, sink) => {
+    const r = req as { endpoint: string; body: Json };
+    const ac = new AbortController();
+    (async () => {
+      const res = await postJson(`/api/openai/${encodeURIComponent(r.endpoint)}${path}`, r.body, ac.signal);
+      if (!res.ok || !res.body) return sink.close({ error: { status: res.status, body: await res.text() } });
+      for await (const data of sseData(res.body)) {
+        if (data === '[DONE]') sink.recv({ $done: true });
+        else {
+          try {
+            sink.recv(JSON.parse(data) as Json);
+          } catch {
+            sink.recv({ $unparsed: data });
+          }
         }
       }
-    }
-    sink.close(null);
-  })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
-  return { send() {}, close: () => ac.abort() };
-};
+      sink.close(null);
+    })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
+    return { send() {}, close: () => ac.abort() };
+  };
+
+const openai = openaiSse('/chat/completions');
+const openaiResponses = openaiSse('/responses');
 
 /** POST a JSON request and stream the raw response bytes back (TTS providers). */
 type RawRequest = { endpoint?: string; path: string; query?: Record<string, Json>; body: Json };
@@ -748,4 +753,4 @@ const embed: LiveDriver = (req, sink) => {
   };
 };
 
-export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel, embed, acp };
+export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, 'openai-responses': openaiResponses, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel, embed, acp };
