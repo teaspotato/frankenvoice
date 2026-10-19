@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import type { Trajectory } from '../core/trajectory';
 import type { Json, TrajEvent } from '../core/types';
+import { JsonView } from './JsonView';
 
 /** One IO exchange (an API call, a websocket) as recorded: what was sent and what came back. */
 interface Exchange {
@@ -67,13 +68,17 @@ function ExchangeView({ x, related }: { x: Exchange; related: Set<number> }) {
       </div>
       <details open={!long}>
         <summary>Request</summary>
-        <pre>{pretty(request)}</pre>
-        {sends.length > 0 && <pre>{sends.map((e) => pretty(obj(e.data).payload)).join('\n\n')}</pre>}
+        <JsonView value={request} open={3} />
+        {sends.map((e) => (
+          <JsonView key={e.seq} value={obj(e.data).payload} />
+        ))}
       </details>
       {reply && (
         <details open>
           <summary>Response</summary>
-          <pre>{reply}</pre>
+          <div className="reply-text">{reply.text}</div>
+          <div className="muted reply-meta">stop_reason: {reply.stop || '(none yet)'}</div>
+          <JsonView value={reply.usage} open={0} label="usage" />
         </details>
       )}
       <details open={!reply && !long}>
@@ -82,16 +87,26 @@ function ExchangeView({ x, related }: { x: Exchange; related: Set<number> }) {
           {long ? ` of ${x.recvs.length} messages, those behind the selection` : ` message${recvs.length === 1 ? '' : 's'}`}
           {x.recvs.some((e) => e.bin) ? ', with binary data' : ''})
         </summary>
-        <pre>
-          {recvs.every((e) => obj(e.data).payload == null && e.bin)
-            ? `${recvs.length} binary chunks, ${recvs.reduce((a, e) => a + (e.bin?.length ?? 0), 0).toLocaleString()} bytes (audio: see the Playback lane)`
-            : recvs.map((e) => (obj(e.data).payload == null && e.bin ? `(${e.bin.length} bytes)` : pretty(obj(e.data).payload))).join('\n')}
-        </pre>
+        {recvs.every((e) => obj(e.data).payload == null && e.bin) ? (
+          <p className="muted">
+            {recvs.length} binary chunks, {recvs.reduce((a, e) => a + (e.bin?.length ?? 0), 0).toLocaleString()} bytes (audio: see the Playback lane)
+          </p>
+        ) : (
+          recvs.map((e) =>
+            obj(e.data).payload == null && e.bin ? (
+              <p key={e.seq} className="muted">
+                ({e.bin.length} bytes)
+              </p>
+            ) : (
+              <JsonView key={e.seq} value={obj(e.data).payload} open={recvs.length > 3 ? 0 : 2} label={`${((e.t - (x.open?.t ?? e.t)) / 1000).toFixed(3)} s`} />
+            ),
+          )
+        )}
       </details>
       {x.close && close.payload != null && (
         <details open={!!obj(close.payload).error}>
           <summary>Close</summary>
-          <pre>{pretty(close.payload)}</pre>
+          <JsonView value={close.payload} />
         </details>
       )}
     </div>
@@ -138,7 +153,7 @@ function collect(traj: Trajectory, seqs: number[]) {
 }
 
 /** The reply an Anthropic message stream adds up to: text, thinking, tool calls, stop reason and usage. */
-function reassembleAnthropic(payloads: Json[]): string | null {
+function reassembleAnthropic(payloads: Json[]): { text: string; stop: string; usage: Json } | null {
   const evs = payloads.map(obj);
   if (!evs.some((p) => p.type === 'message_start')) return null;
   const blocks: { type: string; text: string }[] = [];
@@ -156,13 +171,13 @@ function reassembleAnthropic(payloads: Json[]): string | null {
     } else if (p.type === 'message_delta') {
       stop = String(obj(p.delta).stop_reason ?? '');
       usage = { ...usage, ...obj(p.usage) };
-    } else if (p.type === 'error') return `error: ${pretty(p.error)}`;
+    } else if (p.type === 'error') return { text: `error: ${pretty(p.error)}`, stop: 'error', usage };
   }
   const body = blocks
     .filter(Boolean)
     .map((b) => (b.type === 'text' ? b.text : `[${b.type}] ${b.text}`))
     .join('\n\n');
-  return `${body}\n\n— stop_reason: ${stop || '(none yet)'} · usage: ${JSON.stringify(usage)}`;
+  return { text: body, stop, usage };
 }
 
 const pretty = (j: Json | undefined) => (j === undefined ? '(none)' : JSON.stringify(j, null, 2));
