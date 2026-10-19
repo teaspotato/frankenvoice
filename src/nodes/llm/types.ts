@@ -16,6 +16,8 @@ export interface ChatTurn {
 /** What every provider stream is reduced to. */
 export type LlmStreamEvent =
   | { type: 'delta'; text: string }
+  /** The model is reasoning (a thinking block opened, or reasoning tokens arrived); no text for the user. */
+  | { type: 'thinking' }
   | { type: 'end'; stopReason: string | null }
   | { type: 'error'; error: Json };
 

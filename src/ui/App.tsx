@@ -498,7 +498,12 @@ export function App() {
 
   const loadServerSession = async (id: string) => {
     const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
-    const traj = decodeBundle(new Uint8Array(await res.arrayBuffer()));
+    let traj;
+    try {
+      traj = decodeBundle(new Uint8Array(await res.arrayBuffer()));
+    } catch (e) {
+      return setNotice(`${id}: ${String(e)}`);
+    }
     // The file name is the session's name; it changes when the session is renamed.
     traj.meta.id = id;
     const s = { traj, saved: id };

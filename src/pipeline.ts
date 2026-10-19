@@ -3,13 +3,13 @@
 // changing the topology means editing this file.
 
 import type { EdgeSpec, GraphSpec, NodeSpec } from './core/graph';
-import { GRAPH_FORMAT, GRAPH_FORMAT_VERSION } from './core/graph';
+import { checkGraph, GRAPH_FORMAT, GRAPH_FORMAT_VERSION } from './core/graph';
 import { resolveParams } from './core/node';
 import type { Json } from './core/types';
-import { migrateGraph, registry } from './nodes';
+import { registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'llm' | 'tts' | 'speaker';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'llm' | 'opener' | 'tts' | 'speaker';
 
 export interface StageDef {
   id: StageId;
@@ -32,7 +32,8 @@ export const STAGES: StageDef[] = [
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
-  { id: 'tts', label: 'TTS', variants: { api: 'tts', browser: 'tts.browser', tone: 'tts.tone' } },
+  { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', off: 'opener.off' } },
+  { id: 'tts', label: 'TTS', variants: { api: 'tts', 'deepgram-stream': 'tts.stream', browser: 'tts.browser', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
 ];
 
@@ -84,6 +85,7 @@ const COLUMN: Record<StageId, [number, number]> = {
   asr: [420, 200],
   turn: [630, 110],
   llm: [840, 110],
+  opener: [840, 200],
   tts: [1050, 110],
   speaker: [1260, 110],
 };
@@ -92,7 +94,7 @@ const e = (from: string, fp: string, to: string, tp: string): EdgeSpec => ({ fro
 
 /**
  * The fixed topology: mic → noise/echo cleanup → VAD + turn model + ASR → turn-taking → LLM → TTS → speaker,
- * with playback fed back to turn-taking and what was played to the turn model (the agent's channel).
+ * the opener watching the LLM and speaking through TTS too, with playback fed back to turn-taking and what was played to the turn model (the agent's channel).
  */
 export function buildGraph(c: PipelineConfig): GraphSpec {
   const stages = activeStages(c);
@@ -117,9 +119,13 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     ...(hasSpeaker ? [e('speaker', 'played', 'turnmodel', 'played')] : []),
     ...(registry[stageType(c, 'turn')].inputs.some((p) => p.name === 'scores') ? [e('turnmodel', 'scores', 'turn', 'scores')] : []),
     e('vad', 'vad', 'turn', 'vad'),
+    // Speech end: ASR flushes its final words now rather than at its own endpointing.
+    e('vad', 'vad', 'asr', 'vad'),
     e('asr', 'transcript', 'turn', 'transcript'),
     e('turn', 'turn', 'llm', 'turn'),
     e('llm', 'text', 'tts', 'text'),
+    e('llm', 'text', 'opener', 'text'),
+    e('opener', 'text', 'tts', 'text'),
     ...(hasSpeaker ? [e('tts', 'audio', 'speaker', 'audio'), e('speaker', 'playback', 'turn', 'playback')] : [e('tts', 'playback', 'turn', 'playback')]),
     ...(hasSpeaker && wantsReference ? [e('speaker', 'played', 'cleanup', 'ref')] : []),
     // Barge-in: turn-taking can stop the reply in flight.
@@ -132,21 +138,12 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
 
 /** Recover the stage config a recorded session ran with (stages it lacks keep their defaults). */
 export function configFromGraph(graph: GraphSpec): PipelineConfig {
-  const g = migrateGraph(graph);
+  const g = checkGraph(graph);
   const c = defaultConfig();
   for (const s of STAGES) {
     const n = g.nodes.find((x) => x.id === s.id) ?? g.nodes.find((x) => Object.values(s.variants).includes(x.type));
     const variant = n && Object.entries(s.variants).find(([, t]) => t === n.type)?.[0];
     if (n && variant) c[s.id] = { variant, params: { ...c[s.id].params, [variant]: n.params } };
-  }
-  // Sessions from before the turn model ran without one.
-  if (!g.nodes.some((x) => x.type.startsWith('turnmodel.'))) c.turnmodel = { variant: 'off', params: {} };
-  // Sessions from before the cleanup stage set browser processing on the mic.
-  const mic = g.nodes.find((x) => x.type === 'mic');
-  if (mic && !g.nodes.some((x) => x.type.startsWith('cleanup.'))) {
-    const keys = ['echoCancellation', 'noiseSuppression', 'autoGainControl'];
-    const flags = Object.fromEntries(keys.map((k) => [k, mic.params[k] !== false]));
-    c.cleanup = Object.values(flags).some(Boolean) ? { variant: 'browser', params: { browser: flags } } : { variant: 'off', params: {} };
   }
   return c;
 }

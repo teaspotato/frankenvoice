@@ -136,9 +136,15 @@ export const browserTtsNode: NodeDef = {
             segNo = 0;
             llmDone = false;
             break;
+          case 'opener.say':
           case 'llm.delta':
             if (msg.rid !== rid) return;
             for (const seg of splitter.push(msg.text as string)) enqueue(seg);
+            if (msg.type === 'opener.say') {
+              // An opener is said as soon as it arrives, whatever its punctuation.
+              const rest = splitter.flush();
+              if (rest) enqueue(rest);
+            }
             break;
           case 'llm.end': {
             if (msg.rid !== rid) return;

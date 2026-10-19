@@ -20,10 +20,20 @@ export const asrNode: NodeDef = {
   title: 'ASR',
   category: 'asr',
   description: 'Streaming speech-to-text with interim results and endpointing. Providers: Deepgram.',
-  inputs: [{ name: 'audio', type: 'audio' }],
+  inputs: [
+    { name: 'audio', type: 'audio' },
+    { name: 'vad', type: 'vad', description: 'speech_end: ask the provider to finalize now' },
+  ],
   outputs: [{ name: 'transcript', type: 'transcript' }],
   params: [
     { key: 'provider', label: 'Provider', type: 'select', options: Object.keys(asrAdapters), default: 'deepgram' },
+    {
+      key: 'finalizeOnVad',
+      label: 'Finalize when the VAD hears speech end',
+      type: 'boolean',
+      default: true,
+      description: 'Ask the provider for the final words as soon as the VAD says the user stopped, instead of waiting for its own endpointing, so turn-taking has the full text sooner.',
+    },
     ...providerParams(Object.values(asrAdapters)),
   ],
   channels: Object.values(asrAdapters).map((a) => ({ name: a.channel, description: `${a.provider} streaming connection` })),
@@ -53,7 +63,15 @@ export const asrNode: NodeDef = {
     const send = (m: AudioMsg) => io!.send(null, { bin: adapter!.encode(m.samples), media: { track, start: m.start, end: m.end }, logBin: false });
 
     return {
-      onInput(_port, msg) {
+      onInput(port, msg) {
+        if (port === 'vad') {
+          const fin = adapter?.finalizeMessage?.();
+          if (msg.type === 'vad.speech_end' && p.finalizeOnVad && fin !== undefined && io && !io.closed && !stopping) {
+            io.send(fin);
+            ctx.setState('finalized', ctx.now());
+          }
+          return;
+        }
         if (!isAudioMsg(msg) || !adapter || stopping) return;
         if (!track) track = msg.track;
         if (msg.track !== track) return;
@@ -90,6 +108,7 @@ export const asrNode: NodeDef = {
                       text: ev.text,
                       confidence: ev.confidence,
                       speechFinal: ev.speechFinal,
+                      ...(ev.fromFinalize ? { fromFinalize: true } : {}),
                       track,
                       start: toSample(ev.start),
                       end: toSample(ev.end),

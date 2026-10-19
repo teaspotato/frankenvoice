@@ -3,11 +3,20 @@ import type { ChatTurn, LlmAdapter, LlmStreamEvent } from './types';
 
 type Block = JsonObject & { type: string };
 
+/** How a model turns thinking off; Opus models cannot, so nothing is sent for them. */
+export function thinkingOff(p: JsonObject): JsonObject {
+  if (p.thinking !== 'off') return {};
+  const model = String(p.model ?? '');
+  if (model.includes('haiku')) return { thinking: { type: 'disabled' } };
+  if (model.includes('sonnet')) return { thinking: { type: 'between_tools' } };
+  return {};
+}
+
 /** Claude Messages API. Payloads are the SDK's raw stream events. */
 export const anthropicAdapter: LlmAdapter = {
   provider: 'anthropic',
   channel: 'anthropic',
-  defaultModel: 'claude-opus-5-5',
+  defaultModel: 'claude-haiku-5-5',
   buildRequest(history: ChatTurn[], p: JsonObject): Json {
     const messages: { role: string; content: Json }[] = [];
     for (const t of history) {
@@ -23,6 +32,7 @@ export const anthropicAdapter: LlmAdapter = {
       system: p.system,
       messages: messages as Json,
       output_config: { effort: p.effort },
+      ...thinkingOff(p),
       ...(p.fallbacks ? { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' } : {}),
     };
   },
@@ -34,9 +44,11 @@ export const anthropicAdapter: LlmAdapter = {
       recv(data): LlmStreamEvent[] {
         const ev = data as JsonObject;
         switch (ev.type) {
-          case 'content_block_start':
-            blocks[ev.index as number] = { ...(ev.content_block as Block) };
-            return [];
+          case 'content_block_start': {
+            const b = { ...(ev.content_block as Block) };
+            blocks[ev.index as number] = b;
+            return b.type === 'thinking' || b.type === 'redacted_thinking' ? [{ type: 'thinking' }] : [];
+          }
           case 'content_block_delta': {
             const b = blocks[ev.index as number];
             const d = ev.delta as JsonObject;

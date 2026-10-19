@@ -12,6 +12,8 @@ export type AsrEvent =
       text: string;
       confidence: number | null;
       speechFinal: boolean;
+      /** This final was flushed by a finalize request, not by the provider's own endpointing. */
+      fromFinalize?: boolean;
       start: number;
       end: number;
       words: { word: string; start: number; end: number }[];
@@ -28,5 +30,7 @@ export interface AsrAdapter {
   encode(samples: Float32Array): Uint8Array;
   /** Sent before closing, to flush final results. */
   closeMessage?(): Json;
+  /** Asks for the final transcript of the audio sent so far right away, keeping the stream open. */
+  finalizeMessage?(): Json;
   parse(data: Json): AsrEvent[];
 }

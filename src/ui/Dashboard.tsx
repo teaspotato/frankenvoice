@@ -17,6 +17,7 @@ export const LANES: Lane[] = [
   { id: 'asr', label: 'ASR', height: 46 },
   { id: 'turn', label: 'Turn', height: 52 },
   { id: 'llm', label: 'LLM', height: 60 },
+  { id: 'opener', label: 'Opener', height: 28 },
   { id: 'tts', label: 'TTS', height: 36 },
   { id: 'speaker', label: 'Playback', height: 48 },
 ];
@@ -31,7 +32,9 @@ const LEGEND: Record<string, string> = {
   asr:
     'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
   turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), grey dot = backchannel or noise, ignored.',
-  llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT, chunks and chars/s. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
+  llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
+  opener:
+    'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
   speaker:
     'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries.',
@@ -682,6 +685,56 @@ export function Dashboard({
         });
       });
 
+      // LLM drafts: a request started on the user's words before the turn was committed (outlined)
+      for (const d of m.drafts) {
+        const end = d.t1 ?? head;
+        if (end < t0 || d.t0 > t1) continue;
+        const [ly0, ly1] = laneY.llm;
+        const h = ly1 - ly0;
+        const kept = d.status === 'kept';
+        const x0 = x(d.t0);
+        const x1 = Math.max(x(end), x0 + 2);
+        g.strokeStyle = kept ? col.llm : col.muted;
+        g.setLineDash([3, 2]);
+        g.strokeRect(x0 + 0.5, ly0 + h * 0.06 + 0.5, x1 - x0 - 1, h * 0.34);
+        g.setLineDash([]);
+        if (!kept) label(`draft ${d.status ?? '…'}`, x0 + 2, x1, ly0 + h * 0.23, col.muted);
+        hits.push({
+          lane: 'llm',
+          x0,
+          x1,
+          y0: ly0,
+          y1: ly0 + h * 0.44,
+          text: `draft on the words so far${d.status ? `, ${d.status}${d.why ? ` (${d.why})` : ''}` : ''} after ${(end - d.t0).toFixed(0)} ms: ${d.text}`,
+          seqs: d.seqs,
+        });
+      }
+
+      // Opener: the wait a filler was said after, and a diamond when it was said
+      m.openers.forEach((o, i) => {
+        const end = o.t1 ?? head;
+        if (end < t0 || o.t0 > t1) return;
+        const [ly0, ly1] = laneY.opener;
+        const h = ly1 - ly0;
+        const x0 = x(o.t0);
+        const x1 = Math.max(x(end), x0 + 2);
+        g.globalAlpha = 0.25;
+        g.fillStyle = col.warn;
+        g.fillRect(x0, ly0 + h * 0.3, x1 - x0, h * 0.4);
+        g.globalAlpha = 1;
+        mark('opener', end, col.warn, 0.5, 'diamond', 4);
+        const next = m.openers[i + 1];
+        label(o.text, x1 + 6, Math.min(x1 + 200, next ? x(next.t0) - 3 : Infinity), ly0 + h * 0.5, col.warn);
+        const ms = (end - o.t0).toFixed(0);
+        hits.push({
+          lane: 'opener',
+          x0,
+          x1: x1 + 4,
+          text: `filler "${o.text}", said ${ms} ms after the reply started${o.why ? `\n${o.why}` : ''}`,
+          seqs: o.seqs,
+        });
+      });
+
       // LLM: waiting for the first token, then generating; below, each chunk at its arrival
       for (const l of m.llm) {
         const end = l.t1 ?? head;
@@ -690,11 +743,14 @@ export function Dashboard({
         const h = ly1 - ly0;
         const ft = l.firstToken ?? end;
         const dur = (end - ft) / 1000;
-        const stats = `${l.firstToken ? `TTFT ${(l.firstToken - l.t0).toFixed(0)} ms` : 'waiting…'} · ${l.chunks.length} chunks${dur > 0.05 ? ` · ${(l.text.length / dur).toFixed(0)} ch/s` : ''}${l.status ? ` · ${l.status}` : ''}`;
+        const head0 = l.headStartMs !== undefined ? `draft kept, started ${l.headStartMs.toFixed(0)} ms early · ` : '';
+        const think = l.thinkingAt !== undefined ? ` · thinking at +${(l.thinkingAt - l.t0).toFixed(0)} ms` : '';
+        const stats = `${head0}${l.firstToken ? `TTFT ${(l.firstToken - l.t0).toFixed(0)} ms` : 'waiting…'}${think} · ${l.chunks.length} chunks${dur > 0.05 ? ` · ${(l.text.length / dur).toFixed(0)} ch/s` : ''}${l.status ? ` · ${l.status}` : ''}`;
         span('llm', l.t0, ft, col.llm, 0.15, '', 0.06, 0.4);
         hits.pop();
         span('llm', ft, end, col.llm, 0.35, stats, 0.06, 0.4);
         hits.pop();
+        if (l.thinkingAt !== undefined) vline('llm', l.thinkingAt, col.muted, 0.04, 0.42);
         hits.push({ lane: 'llm', x0: x(l.t0), x1: x(end), text: `${stats}\n${l.text}`, seqs: l.seqs });
         let so = '';
         l.chunks.forEach((c, i) => {

@@ -61,26 +61,24 @@ describe('SimScheduler', () => {
   });
 });
 
-describe('migrateGraph', () => {
-  it('upgrades format-1 per-provider node types to provider params', async () => {
-    const { migrateGraph, registry } = await import('../src/nodes');
-    const old: import('../src/core/graph').GraphSpec = {
-      format: 'frankenvoice-graph',
-      formatVersion: 1,
-      name: 'old',
-      nodes: [
-        { id: 'asr', type: 'asr.deepgram', params: { model: 'nova-2' } },
-        { id: 'llm', type: 'llm.claude', params: { effort: 'high' } },
-        { id: 'tts', type: 'tts.cartesia', params: { modelId: 'sonic-x', minSegmentChars: 5 } },
-      ],
-      edges: [],
-    };
-    const g = migrateGraph(old);
-    expect(g.nodes.map((n) => n.type)).toEqual(['asr', 'llm', 'tts']);
-    expect(g.nodes[0].params).toEqual({ provider: 'deepgram', 'deepgram.model': 'nova-2' });
-    expect(g.nodes[1].params).toEqual({ provider: 'anthropic', effort: 'high' });
-    expect(g.nodes[2].params).toEqual({ provider: 'cartesia', 'cartesia.model': 'sonic-x', minSegmentChars: 5 });
-    for (const n of g.nodes) expect(registry[n.type]).toBeDefined();
+describe('pipeline format', () => {
+  it('refuses graphs and sessions of another format', async () => {
+    const { checkGraph } = await import('../src/core/graph');
+    const g = buildGraph(defaultConfig());
+    expect(checkGraph(g)).toBe(g);
+    expect(() => configFromGraph({ ...g, formatVersion: g.formatVersion - 1 })).toThrow(/only loads format/);
+    const { decodeBundle, encodeBundle } = await import('../src/core/bundle');
+    const traj = (graph: typeof g) => new Trajectory({ format: TRAJECTORY_FORMAT, formatVersion: 1, id: 't', createdAt: '', mode: 'live', graph, graphHash: '' });
+    expect(decodeBundle(encodeBundle(traj(g))).meta.graph).toEqual(g);
+    expect(() => decodeBundle(encodeBundle(traj({ ...g, formatVersion: 7 })))).toThrow(/recorded with pipeline format 7/);
+  });
+
+  it('runs the opener stage between the LLM and TTS', () => {
+    const g = buildGraph(defaultConfig());
+    expect(g.nodes.find((n) => n.id === 'opener')?.type).toBe('opener.filler');
+    const to = (from: string) => g.edges.filter((x) => x.from.node === from && x.from.port === 'text').map((x) => x.to.node);
+    expect(to('llm')).toEqual(['tts', 'opener']);
+    expect(to('opener')).toEqual(['tts']);
   });
 });
 
@@ -243,16 +241,5 @@ describe('SimScheduler seek', () => {
     wall = 20;
     await done;
     expect(fired).toEqual([10, 500, 520]);
-  });
-});
-
-describe('configFromGraph', () => {
-  it('turns the turn model off for sessions recorded without one', () => {
-    const c = defaultConfig();
-    c.turnmodel.variant = 'off';
-    const g = buildGraph(c);
-    g.nodes = g.nodes.filter((n) => n.id !== 'turnmodel');
-    expect(configFromGraph(g).turnmodel.variant).toBe('off');
-    expect(configFromGraph(buildGraph(defaultConfig())).turnmodel.variant).toBe('ssl_turn');
   });
 });

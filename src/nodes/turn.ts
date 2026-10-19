@@ -87,6 +87,10 @@ interface DuplexParams {
   minSpeechMs: number;
   backchannels: string;
   maxBackchannelMs: number;
+  speculate: boolean;
+  draftAt: number;
+  modelNeedsVad: boolean;
+  maxSilenceMs: number;
 }
 
 /** Who holds the floor, and whether the user is talking over the agent while it does. */
@@ -118,7 +122,18 @@ type Candidate = {
   finals: { text: string; start: number; end: number }[];
 };
 
+/** How long before the VAD's speech end a held end of turn still counts (the VAD's hangover and some). */
+const EOT_HOLD_MS = 600;
+
+type Partial_ = { text: string; start: number; end: number };
+
 const words = (s: string) => s.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? [];
+const FILLERS = new Set(['um', 'umm', 'uh', 'uhh', 'er', 'erm', 'ah']);
+/** What a draft must match: the words, without case, punctuation or fillers. */
+export const draftKey = (s: string) =>
+  words(s)
+    .filter((w) => !FILLERS.has(w))
+    .join(' ');
 
 /**
  * Full-duplex turn taking, as the state machine in FLOOR. The user can take
@@ -136,6 +151,16 @@ const words = (s: string) => s.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? [];
  *
  * Every barge-in decision is also emitted as a `turn.decision` message
  * (candidate, backchannel, interrupt, continue) so the timeline can show it.
+ *
+ * Speculative replies: while the user is silent and their turn looks like it
+ * is ending (the model's end-of-turn score reaches `draftAt`, or just silence
+ * without the model), and ASR has caught up (a result arrived during the
+ * silence, or the words are all final), the words so far go out as a
+ * `turn.draft` so the LLM can start early. A draft is redone whenever the
+ * words change during the silence and dropped (`turn.draft_drop`) if the user goes on. At commit the turn
+ * names the draft (`draft`) when the words still match, and the LLM keeps the
+ * reply it already started; otherwise the draft is dropped and the turn is
+ * sent as usual.
  */
 export const duplexTurnNode: NodeDef<DuplexParams> = {
   type: 'turn.duplex',
@@ -159,6 +184,22 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       type: 'boolean',
       default: true,
       description: 'Decide on the turn model’s end-of-turn and take-the-floor events while it runs. The rules below apply when it is off or not loaded yet.',
+    },
+    {
+      key: 'modelNeedsVad',
+      label: 'Model floor takes need VAD speech',
+      type: 'boolean',
+      default: true,
+      description: 'Ignore the model’s take-the-floor events while the VAD hears no speech (it fires them in silence too).',
+      when: { useModel: [true] },
+    },
+    {
+      key: 'maxSilenceMs',
+      label: 'Commit after silence (ms)',
+      type: 'number',
+      default: 1500,
+      description: 'With the model: commit the user’s words after this much silence even if the model hasn’t called the end of their turn (0 = never).',
+      when: { useModel: [true] },
     },
     {
       key: 'asrGraceMs',
@@ -201,6 +242,22 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       description: 'Speech over the agent longer than this interrupts, whatever the words or the model say',
       when: { bargeIn: [true] },
     },
+    {
+      key: 'speculate',
+      label: 'Draft replies early',
+      type: 'boolean',
+      default: true,
+      description:
+        'Start the LLM on the words so far while the user is silent, before the turn is committed. Kept if the final words match, else dropped and resent. Costs the tokens of dropped drafts.',
+    },
+    {
+      key: 'draftAt',
+      label: 'Draft at end-of-turn score',
+      type: 'number',
+      default: 0,
+      description: 'With the turn model: draft only once its end-of-turn score for the user reaches this (it commits at its own threshold). 0 drafts on any silence once ASR has the words, as without the model.',
+      when: { speculate: [true], useModel: [true] },
+    },
   ],
   create(ctx) {
     const p = ctx.params;
@@ -210,15 +267,28 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let to = -1;
     let turnNo = 0;
     /** The last committed turn, for resending it when the user wasn't done. */
-    let last: { id: string; text: string; from: number; to: number } | null = null;
+    let last: { id: string; text: string; from: number; to: number; tail?: Partial_; base?: string[] } | null = null;
     let replaces: string | null = null;
     let candidate: Candidate | null = null;
     /** Latest ASR partial since the last final, while listening. */
-    let partial: { text: string; start: number; end: number } | null = null;
+    let partial: Partial_ | null = null;
+    /** The model ended the turn while the VAD still heard speech: acted on if the speech ends right after. */
+    let eotHeld: { why: string; at: number } | null = null;
     /** The model ended the turn, but ASR hasn't finalised its last words yet. */
     let eotWait: { why: string; timer: TimerHandle } | null = null;
     /** The turn model is loaded and scoring. */
     let model = false;
+    /** With the model: commits the words if the user stays silent this long without its end of turn. */
+    let silence: TimerHandle | null = null;
+    /** The user is talking (VAD). */
+    let speaking = false;
+    /** ASR has caught up with the silence: a result arrived during it, or the words before it were all final. */
+    let caughtUp = false;
+    /** The model's latest end-of-turn score for the user. */
+    let eotUser = 0;
+    /** The reply being drafted on the words so far, before the turn is committed. */
+    let draft: { id: string; key: string } | null = null;
+    let draftNo = 0;
     const useModel = () => p.useModel && model;
     /**
      * The model decides barge-in only over the agent's speech: while the agent is
@@ -275,14 +345,47 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       to = end;
       ctx.setState('pending', parts.join(' '));
     };
-    const commit = (why: string) => {
+    const dropDraft = (why: string) => {
+      if (!draft) return;
+      ctx.emit('turn', { type: 'turn.draft_drop', draftId: draft.id, why });
+      draft = null;
+      ctx.setState('draft', '');
+    };
+    /** Draft a reply on the words so far, if the turn looks like it is ending and they changed. */
+    const maybeDraft = (why: string) => {
+      if (!p.speculate || state !== 'listening' || speaking || !caughtUp) return;
+      if (useModel() && eotUser < p.draftAt) return;
+      const text = [...parts, partial?.text ?? ''].join(' ').trim();
+      const key = draftKey(text);
+      if (!key || draft?.key === key) return;
+      dropDraft('words changed');
+      draft = { id: `${ctx.id}-d${draftNo++}`, key };
+      const span = partial ? { from: from < 0 ? partial.start : from, to: partial.end } : { from, to };
+      ctx.emit('turn', { type: 'turn.draft', draftId: draft.id, text, ...span, why, ...(replaces ? { replaces } : {}) });
+      ctx.setState('draft', text);
+    };
+    /** The words changed: redo the draft during silence, drop it if the user is still talking. */
+    const refreshDraft = (why: string) => {
+      if (draft && speaking && draftKey([...parts, partial?.text ?? ''].join(' ')) !== draft.key) return dropDraft('user went on');
+      maybeDraft(why);
+    };
+    /** Commit the turn. `tail`: its last words are an ASR partial whose final may still come. */
+    const commit = (why: string, tail?: Partial_) => {
       eotWait?.timer.clear();
       eotWait = null;
+      silence?.clear();
+      silence = null;
       const text = parts.join(' ').trim();
       if (!text || state !== 'listening') return;
       const turnId = `${ctx.id}-u${turnNo++}`;
-      ctx.emit('turn', { type: 'turn.user', turnId, text, from, to, ...(replaces ? { replaces } : {}) });
-      last = { id: turnId, text, from, to };
+      let kept: string | null = null;
+      if (draft && draft.key === draftKey(text)) {
+        kept = draft.id;
+        draft = null;
+        ctx.setState('draft', '');
+      } else dropDraft('final words differ');
+      ctx.emit('turn', { type: 'turn.user', turnId, text, from, to, ...(replaces ? { replaces } : {}), ...(kept ? { draft: kept } : {}) });
+      last = { id: turnId, text, from, to, ...(tail ? { tail, base: parts.slice(0, -1) } : {}) };
       replaces = null;
       parts = [];
       partial = null;
@@ -299,13 +402,29 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         () => {
           const w = eotWait!;
           eotWait = null;
+          const tail = partial ?? undefined;
           if (partial) collect(partial.text, partial.start, partial.end);
           partial = null;
-          commit(`${w.why}; no ASR final in time`);
+          commit(`${w.why}; no ASR final in time`, tail);
         },
         'eot-wait',
       );
       eotWait = { why, timer };
+    };
+
+    /** The model may never call the end of the turn: don't let silence go on forever. */
+    const armSilence = () => {
+      silence?.clear();
+      silence = null;
+      if (!useModel() || p.maxSilenceMs <= 0 || state !== 'listening' || speaking) return;
+      silence = ctx.setTimer(
+        p.maxSilenceMs,
+        () => {
+          silence = null;
+          if (state === 'listening' && !speaking && (parts.length || partial)) endOfTurn(`${p.maxSilenceMs} ms of silence without the model's end of turn`);
+        },
+        'silence',
+      );
     };
 
     /** The user takes the floor: stop the reply and start listening. */
@@ -318,13 +437,19 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       if (wasThinking && last) {
         // They weren't done: resend their turn together with what they say now.
         replaces = last.id;
-        parts = [last.text];
+        // A turn committed on a partial: its final is still to come, so the partial stays a partial.
+        parts = last.tail ? [...last.base!] : [last.text];
+        partial = last.tail ?? null;
         from = last.from;
         to = last.to;
         ctx.setState('pending', parts.join(' '));
       }
       go('take_floor', why);
-      for (const f of c.finals) collect(f.text, f.start, f.end);
+      for (const f of c.finals) {
+        if (partial && f.start <= partial.end) partial = null;
+        collect(f.text, f.start, f.end);
+      }
+      armSilence();
     };
 
     /** Rules without the model: enough speech that isn't only backchannel words. */
@@ -365,6 +490,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     return {
       onInput(port, msg) {
         if (port === 'scores') {
+          if (msg.type === 'turnmodel.frame') {
+            eotUser = (msg.eot as number[])[0];
+            if (useModel() && eotUser >= p.draftAt) maybeDraft(`model: end of turn likely p=${eotUser}`);
+            return;
+          }
           if (msg.type === 'turnmodel.status') {
             model = msg.status === 'ready';
             if (p.useModel) ctx.setState('using', model ? 'turn model' : 'rules');
@@ -373,9 +503,14 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           if (!useModel() || msg.who !== 'user') return;
           const why = `model: ${msg.type === 'turnmodel.eot' ? 'end of turn' : 'take the floor'} p=${msg.p}`;
           if (msg.type === 'turnmodel.int' && p.bargeIn && state !== 'listening') {
+            if (p.modelNeedsVad && !speaking) return void ctx.log('debug', 'model floor take ignored: the VAD hears no speech', { why });
             const c = overlap(msg.at as number, why);
             if (c) yieldFloor(c, why);
-          } else if (msg.type === 'turnmodel.eot' && state === 'listening') endOfTurn(why);
+          } else if (msg.type === 'turnmodel.eot' && state === 'listening') {
+            // Not while the VAD still hears them; if their speech ends right after, it stands.
+            if (speaking) eotHeld = { why, at: ctx.now() };
+            else endOfTurn(why);
+          }
           return;
         }
         if (port === 'playback') {
@@ -397,6 +532,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         if (port === 'vad') {
           if (msg.type === 'vad.speech_start') {
             ctx.setState('userSpeaking', true);
+            speaking = true;
+            caughtUp = false;
+            eotHeld = null;
+            silence?.clear();
+            silence = null;
             if (state === 'thinking' || state === 'speaking') overlap(msg.at as number, 'user speech (VAD)');
             else if (eotWait) {
               // They went on after the model called the end of their turn: wait for the next one.
@@ -405,6 +545,13 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             }
           } else if (msg.type === 'vad.speech_end') {
             ctx.setState('userSpeaking', false);
+            speaking = false;
+            // A partial from before the silence usually lacks the last words: wait for ASR to catch up.
+            caughtUp = !partial;
+            if (state === 'listening') maybeDraft('silence, words final');
+            armSilence();
+            if (eotHeld && state === 'listening' && ctx.now() - eotHeld.at <= EOT_HOLD_MS) endOfTurn(`${eotHeld.why}, then VAD speech end`);
+            eotHeld = null;
             if (candidate) {
               const c = candidate;
               c.timer?.clear();
@@ -428,15 +575,21 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           if (msg.type === 'asr.final' && text) ctx.log('info', 'ignored short speech while the agent has the floor', { text });
           return;
         }
+        if (!speaking) caughtUp = true;
         if (msg.type === 'asr.partial') {
           partial = text ? { text, start: msg.start as number, end: msg.end as number } : null;
+          if (text) refreshDraft('ASR partial');
         } else if (msg.type === 'asr.final') {
           collect(text, msg.start as number, msg.end as number);
           partial = null;
           if (eotWait) commit(eotWait.why);
-          else if (!useModel() && msg.speechFinal && p.commitOn === 'speech_final') commit('speech_final');
+          // A final flushed because the VAD heard the speech end is as good as ASR endpointing (and sooner).
+          else if (!useModel() && p.commitOn === 'speech_final' && (msg.speechFinal || (msg.fromFinalize && !speaking)))
+            commit(msg.speechFinal ? 'speech_final' : 'finalized on VAD speech end');
+          else refreshDraft('ASR final');
         } else if (msg.type === 'asr.utterance_end') {
-          commit('utterance_end');
+          if (speaking) ctx.log('debug', 'utterance end ignored: the VAD still hears speech');
+          else commit('utterance_end');
         }
       },
     };
