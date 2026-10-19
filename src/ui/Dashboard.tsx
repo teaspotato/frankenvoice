@@ -761,14 +761,19 @@ export function Dashboard({
   const plotW = () => Math.max(1, size.w - LABEL_W);
   const currentEnd = () => window_(modelRef.current)[1];
 
+  // Pinch (which browsers report as ctrl+wheel) or ctrl/cmd+wheel zooms; a sideways swipe pans;
+  // an up/down swipe or plain wheel scrolls the lanes as usual.
   const onWheel = (e: WheelEvent) => {
+    const zoom = e.ctrlKey || e.metaKey;
+    if (!zoom && Math.abs(e.deltaY) >= Math.abs(e.deltaX)) return;
     e.preventDefault();
     const rect = canvasRef.current!.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const end = currentEnd();
-    if (e.ctrlKey || e.metaKey || Math.abs(e.deltaY) > Math.abs(e.deltaX) * 2) {
+    if (zoom) {
       // zoom around the cursor
-      const f = Math.exp(e.deltaY * 0.0015);
+      // Trackpad pinches send many small deltas; mouse wheels a few large ones.
+      const f = Math.exp(e.deltaY * (Math.abs(e.deltaY) < 40 ? 0.01 : 0.0015));
       const span = Math.max(MIN_SPAN, Math.min(3_600_000, view.span * f));
       const tCursor = end - view.span + ((px - LABEL_W) / plotW()) * view.span;
       const frac = (px - LABEL_W) / plotW();
@@ -876,7 +881,7 @@ export function Dashboard({
           {trajectory ? (trajectory.meta.mode === 'replay' ? `replay of ${trajectory.meta.replayOf}` : playing ? `playing ${trajectory.meta.id}` : running ? 'live' : trajectory.meta.id) : 'no session yet: press Run live'}
         </span>
         <span className="spacer" />
-        <small className="muted">click to seek · scroll to zoom · drag to pan · click a lane's name to select its stage</small>
+        <small className="muted">click to seek · pinch or ⌘/ctrl+scroll to zoom · swipe sideways or drag to pan · click a lane's name to select its stage</small>
         <button onClick={() => setView({ ...view, span: Math.max(MIN_SPAN, view.span / 1.5) })}>+</button>
         <button onClick={() => setView({ ...view, span: Math.min(3_600_000, view.span * 1.5) })}>−</button>
         <button onClick={fit}>Fit</button>
