@@ -205,6 +205,11 @@ export const draftKey = (s: string) =>
  * names the draft (`draft`) when the words still match, and the LLM keeps the
  * reply it already started; otherwise the draft is dropped and the turn is
  * sent as usual.
+ *
+ * Early interjection: the user's uncommitted words are emitted as `turn.words`
+ * whenever they change while listening. An `interject.take` commits them at
+ * once (its turn names the check in `interject`), unless the agent has the
+ * floor or a draft is already out; `turn.interject` says which.
  */
 export const duplexTurnNode: NodeDef<DuplexParams> = {
   type: 'turn.duplex',
@@ -216,6 +221,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     { name: 'vad', type: 'vad' },
     { name: 'playback', type: 'playback' },
     { name: 'scores', type: 'turnscores' },
+    { name: 'interject', type: 'interject', description: 'interject.take: commit the words so far now, for an early interjection' },
   ],
   outputs: [
     { name: 'turn', type: 'turn' },
@@ -825,7 +831,30 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       ctx.emit('turn', { type: 'turn.pending', words: has });
     };
 
+    /** The uncommitted words, told whenever they change while listening (for early interjections). */
+    let lastWords = '';
+    const syncWords = () => {
+      const text = state === 'listening' ? [...parts, partial?.text ?? ''].join(' ').trim() : '';
+      if (text === lastWords) return;
+      lastWords = text;
+      ctx.emit('turn', { type: 'turn.words', text, ...(text && replaces ? { replaces } : {}) });
+    };
+
     const handle = (port: string, msg: Msg) => {
+      if (port === 'interject') {
+        if (msg.type !== 'interject.take') return;
+        const why =
+          state !== 'listening' ? 'the agent has the floor' : draft ? 'a draft is already out' : !parts.length && !partial?.text ? 'no words to commit' : null;
+        ctx.emit('turn', { type: 'turn.interject', checkId: msg.checkId as string, taken: !why, ...(why ? { why } : {}) });
+        if (why) return;
+        eotHeld = null;
+        // A partial's final may still come: it stays the turn's tail, as at the model's end of turn.
+        const tail = partial ?? undefined;
+        if (partial) collect(partial.text, partial.start, partial.end);
+        partial = null;
+        commit(`early interjection: ${String(msg.why ?? 'the LLM cuts in')}`, tail, { interject: msg.checkId as string });
+        return;
+      }
       if (port === 'scores') {
         if (msg.type === 'turnmodel.frame') {
           eotUser = (msg.eot as number[])[0];
@@ -996,6 +1025,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       onInput(port, msg) {
         handle(port, msg);
         syncPending();
+        syncWords();
       },
     };
   },

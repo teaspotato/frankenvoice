@@ -86,6 +86,14 @@ const openai = { provider: ['openai-compatible'] };
  *
  * The first sign of reasoning in a reply (a thinking block, reasoning tokens)
  * is emitted as `llm.thinking`, for the opener stage to fill the wait with.
+ *
+ * An `interject.check` (the user's words so far, while they still talk) asks
+ * whether to cut in: a request like a draft's, with the check's prompt after
+ * the words, its stream held back. As soon as the reply is clearly not the
+ * pass reply, `llm.check_verdict` says `interject` (else `pass`, and the check
+ * ends). A committed turn that names the check (`interject`) keeps it the way
+ * a kept draft is kept; the history records the user's words, marked as cut
+ * off, without the prompt.
  */
 export const llmNode: NodeDef = {
   type: 'llm',
@@ -97,6 +105,7 @@ export const llmNode: NodeDef = {
     { name: 'control', type: 'control' },
     { name: 'updates', type: 'workers', description: "The workers' progress, answers and results" },
     { name: 'vad', type: 'vad', description: 'When the user speaks, so worker results wait for a pause' },
+    { name: 'interject', type: 'interject', description: 'interject.check / interject.drop: whether to cut in on the words so far' },
   ],
   outputs: [
     { name: 'text', type: 'text' },
@@ -204,9 +213,16 @@ export const llmNode: NodeDef = {
       rounds: number;
       /** A reply to workers' news, started on its own rather than for a user turn: the news it carried. */
       news?: { turns: ChatTurn[]; workers: string[] };
+      /** An interjection check: its id, the pass reply, and the verdict once known. */
+      checkId?: string;
+      pass?: string;
+      verdict?: 'interject' | 'pass';
+      /** What the history records for the user if this reply is kept, when not `user` itself. */
+      record?: ChatTurn;
     }
     let active: Reply | undefined;
     let draft: Reply | undefined;
+    let check: Reply | undefined;
 
     /** End the active reply. `unheard`: nothing of it was played, so it leaves no trace in the history. */
     const finish = (status: 'done' | 'cancelled' | 'error', error?: Json, unheard = false) => {
@@ -341,6 +357,7 @@ export const llmNode: NodeDef = {
       } catch (e) {
         ctx.log('error', `could not build request: ${String(e)}`);
         if (r === draft) draft = undefined;
+        else if (r === check) endCheck('error', String(e));
         else if (r === active) finish('error', String(e));
         return false;
       }
@@ -360,6 +377,48 @@ export const llmNode: NodeDef = {
     const route = (r: Reply, events: Events) => {
       if (r === active) handle(events);
       else if (r === draft) r.held.push(...events);
+      else if (r === check) {
+        r.held.push(...events);
+        judgeCheck(r);
+      }
+    };
+    /** Pass replies, compared without case or spaces. */
+    const squash = (s: string) => s.toLowerCase().replace(/\s+/g, '');
+    /** Decide a check as soon as its reply is clearly the pass reply or not; a pass ends it. */
+    const judgeCheck = (r: Reply) => {
+      if (r.verdict) return;
+      const text = r.held.flatMap((e) => (e.type === 'delta' ? [e.text] : [])).join('');
+      const said = squash(text);
+      const pass = squash(r.pass ?? '');
+      const ended = r.held.some((e) => e.type === 'end' || e.type === 'error');
+      const passing = !said || (pass && (pass.startsWith(said) || said.startsWith(pass)));
+      // Calls a tool instead of saying anything: not an interjection.
+      const tool = r.held.some((e) => e.type === 'end' && e.stopReason === 'tool_use');
+      if (!ended && passing) return;
+      r.verdict = ended && (passing || tool) ? 'pass' : 'interject';
+      ctx.emit('text', { type: 'llm.check_verdict', rid: r.rid, checkId: r.checkId!, verdict: r.verdict, text: text.trim(), ms: Math.round(ctx.now() - r.t0) });
+      if (r.verdict === 'pass') endCheck('pass');
+    };
+    const endCheck = (status: string, why?: string) => {
+      if (!check) return;
+      const c = check;
+      check = undefined;
+      if (c.io && !c.io.closed) c.io.close({ status: status === 'pass' ? 'done' : 'cancelled' });
+      ctx.emit('text', { type: 'llm.check_end', rid: c.rid, checkId: c.checkId!, status, ...(why ? { why } : {}) });
+    };
+    const startCheck = (msg: Msg) => {
+      endCheck('dropped', 'checked again');
+      const text = String(msg.text ?? '');
+      const user: ChatTurn = { role: 'user', text: `${text}\n\n${String(msg.prompt ?? '')}`.trim() };
+      const r = reply(user, {
+        checkId: msg.checkId as string,
+        pass: String(msg.pass ?? ''),
+        record: { role: 'user', text: `${text}—` },
+        ...(msg.replaces ? { replaces: msg.replaces as string } : {}),
+      });
+      ctx.emit('text', { type: 'llm.check', rid: r.rid, checkId: r.checkId!, text });
+      check = r;
+      send(r, historyFor(user, msg.replaces));
     };
     const dropDraft = (why: string) => {
       if (!draft) return;
@@ -412,9 +471,12 @@ export const llmNode: NodeDef = {
     /** A committed user turn: answer it (with the draft made for it, if it still stands). */
     const commitTurn = (msg: Msg) => {
       finish('cancelled');
+      // An interjection the turn was committed for: its held reply is the answer.
+      const cut = msg.interject && check?.checkId === msg.interject && check.verdict === 'interject' && !notes.speak ? check : undefined;
+      if (!cut) endCheck('dropped', notes.speak && msg.interject ? 'a worker result came in' : 'turn committed without it');
       // A draft went out without a worker result that has come in since: the turn is sent again with it.
-      const kept = msg.draft && draft?.draftId === msg.draft && !notes.speak ? draft : undefined;
-      if (!kept) dropDraft(notes.speak && msg.draft ? 'a worker result came in' : 'turn committed without it');
+      const kept = cut ?? (msg.draft && draft?.draftId === msg.draft && !notes.speak ? draft : undefined);
+      if (!kept || cut) dropDraft(notes.speak && msg.draft ? 'a worker result came in' : 'turn committed without it');
       if (msg.replaces) {
         // The user wasn't done: this turn replaces an earlier one and whatever followed it.
         const i = history.findIndex((t) => t.role === 'user' && t.turnId === msg.replaces);
@@ -424,13 +486,23 @@ export const llmNode: NodeDef = {
       // A kept draft's request went out without the workers' progress notes: those wait for the next request.
       if (!kept) flushNotes();
       if (kept) {
-        // The draft's words stand: keep its reply. The history records what the request said.
-        draft = undefined;
-        history.push({ ...kept.user, turnId });
+        // The draft's words stand: keep its reply. The history records what the request said
+        // (for an interjection, the words without the check's prompt).
+        if (cut) check = undefined;
+        else draft = undefined;
+        history.push({ ...(kept.record ?? kept.user), turnId });
         const held = kept.held;
         kept.held = [];
-        ctx.emit('text', { type: 'llm.draft_end', rid: kept.rid, draftId: kept.draftId!, status: 'kept', chunks: held.filter((e) => e.type === 'delta').length });
-        ctx.emit('text', { type: 'llm.start', rid: kept.rid, turnId: turnId ?? null, draft: kept.draftId!, headStartMs: Math.round(ctx.now() - kept.t0) });
+        const chunks = held.filter((e) => e.type === 'delta').length;
+        if (cut) ctx.emit('text', { type: 'llm.check_end', rid: kept.rid, checkId: kept.checkId!, status: 'kept', chunks });
+        else ctx.emit('text', { type: 'llm.draft_end', rid: kept.rid, draftId: kept.draftId!, status: 'kept', chunks });
+        ctx.emit('text', {
+          type: 'llm.start',
+          rid: kept.rid,
+          turnId: turnId ?? null,
+          ...(cut ? { interject: kept.checkId! } : { draft: kept.draftId! }),
+          headStartMs: Math.round(ctx.now() - kept.t0),
+        });
         ctx.setState('status', 'generating');
         kept.turnId = turnId;
         active = kept;
@@ -497,8 +569,15 @@ export const llmNode: NodeDef = {
         if (port === 'control') {
           if (msg.type === 'cancel') {
             dropDraft('cancelled');
+            endCheck('dropped', 'cancelled');
             finish('cancelled');
           }
+          return;
+        }
+        if (port === 'interject') {
+          if (msg.type === 'interject.check') {
+            if (adapter && reqParams.model) startCheck(msg);
+          } else if (msg.type === 'interject.drop' && check?.checkId === msg.checkId) endCheck('dropped', (msg.why as string) ?? 'dropped');
           return;
         }
         if (msg.type === 'turn.draft') {
@@ -543,6 +622,7 @@ export const llmNode: NodeDef = {
       stop() {
         deliverTimer?.clear();
         dropDraft('stopped');
+        endCheck('dropped', 'stopped');
         finish('cancelled');
       },
     };

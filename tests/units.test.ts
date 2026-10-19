@@ -77,7 +77,7 @@ describe('pipeline format', () => {
     const g = buildGraph(defaultConfig());
     expect(g.nodes.find((n) => n.id === 'opener')?.type).toBe('opener.filler');
     const to = (from: string) => g.edges.filter((x) => x.from.node === from && x.from.port === 'text').map((x) => x.to.node);
-    expect(to('llm')).toEqual(['tts', 'opener']);
+    expect(to('llm')).toEqual(['interject', 'tts', 'opener']);
     expect(to('opener')).toEqual(['tts']);
   });
 });
