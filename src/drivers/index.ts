@@ -532,11 +532,21 @@ const outputContexts = new Set<AudioContext>();
 /** While set, outputs drop what they are asked to play: a replay is skipping ahead. */
 let outputSuppressed = false;
 const playingSources = new Set<AudioBufferSourceNode>();
+/** Outputs holding audio scheduled during a skip; each plays the part still ahead once the skip ends. */
+const heldOutputs = new Set<() => void>();
 
-/** Silence outputs while a replay fast-forwards, cutting off whatever is playing. */
+/**
+ * Silence outputs while a replay fast-forwards, cutting off whatever is playing.
+ * Audio scheduled to play at a session time is held instead of dropped, so when
+ * the skip lands in the middle of the agent speaking, the rest of it still plays.
+ */
 export function setOutputSuppressed(on: boolean) {
   outputSuppressed = on;
-  if (!on) return;
+  if (!on) {
+    for (const release of heldOutputs) release();
+    heldOutputs.clear();
+    return;
+  }
   for (const s of playingSources) s.stop();
   playingSources.clear();
   if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
@@ -581,7 +591,7 @@ function outputContext(which: 'agent' | 'mic', sampleRate?: number) {
  * exactly where it ended on the audio clock instead of at a time converted from the session clock,
  * which jitters by a millisecond or so and left tiny gaps and overlaps: a steady crackle.
  */
-function pcmOutput(which: 'agent' | 'mic') {
+function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
   let o: ReturnType<typeof outputContext> | null = null;
   let next = 0; // audio-clock end of the last chunk
   let nextAt = NaN; // and its session time, when chunks carry one
@@ -589,45 +599,65 @@ function pcmOutput(which: 'agent' | 'mic') {
   // Ducking, ahead of the mute switch; kept across a context change.
   let level = 1;
   let duck: GainNode | null = null;
+  /** Timed chunks that arrived while a replay was skipping ahead (needs `clock`). */
+  let held: { samples: Float32Array<ArrayBuffer>; sampleRate: number; at: number }[] = [];
+  const release = () => {
+    const chunks = held;
+    held = [];
+    const now = clock!();
+    for (const c of chunks) {
+      const cut = Math.max(0, Math.round(((now - c.at) / 1000) * c.sampleRate));
+      if (cut >= c.samples.length) continue;
+      play(c.samples.subarray(cut), c.sampleRate, Math.max(c.at, now), now);
+    }
+  };
   const stop = () => {
     for (const src of playing) src.stop();
     playing.clear();
     nextAt = NaN;
+    held = [];
   };
+  /** Play `samples`; at session time `at` (ms, with the session clock `now`), or else right after the previous chunk. */
+  function play(samples: Float32Array<ArrayBuffer>, sampleRate: number, at?: number, now?: number) {
+    if (!samples.length) return;
+    if (outputSuppressed) {
+      if (at === undefined || !clock) return;
+      held.push({ samples, sampleRate, at });
+      heldOutputs.add(release);
+      return;
+    }
+    if (!o || o.ctx.sampleRate !== sampleRate) {
+      stop();
+      o?.close();
+      o = outputContext(which, sampleRate);
+      duck = o.ctx.createGain();
+      duck.gain.value = level;
+      duck.connect(o.out);
+    }
+    const { ctx } = o;
+    const out = duck!;
+    const buf = ctx.createBuffer(1, samples.length, sampleRate);
+    buf.copyToChannel(samples, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(out);
+    src.onended = () => {
+      playing.delete(src);
+      playingSources.delete(src);
+    };
+    playing.add(src);
+    playingSources.add(src);
+    const live = next >= ctx.currentTime;
+    let t: number;
+    if (at === undefined) t = live && next <= ctx.currentTime + 0.5 ? next : ctx.currentTime + 0.08;
+    else if (live && Math.abs(at - nextAt) < 2) t = next;
+    else t = Math.max(ctx.currentTime, ctx.currentTime + (at - now!) / 1000);
+    src.start(t);
+    next = t + buf.duration;
+    nextAt = at === undefined ? NaN : at + buf.duration * 1000;
+  }
   return {
-    /** Play `samples`; at session time `at` (ms, with the session clock `now`), or else right after the previous chunk. */
-    play(samples: Float32Array<ArrayBuffer>, sampleRate: number, at?: number, now?: number) {
-      if (outputSuppressed || !samples.length) return;
-      if (!o || o.ctx.sampleRate !== sampleRate) {
-        stop();
-        o?.close();
-        o = outputContext(which, sampleRate);
-        duck = o.ctx.createGain();
-        duck.gain.value = level;
-        duck.connect(o.out);
-      }
-      const { ctx } = o;
-      const out = duck!;
-      const buf = ctx.createBuffer(1, samples.length, sampleRate);
-      buf.copyToChannel(samples, 0);
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.connect(out);
-      src.onended = () => {
-        playing.delete(src);
-        playingSources.delete(src);
-      };
-      playing.add(src);
-      playingSources.add(src);
-      const live = next >= ctx.currentTime;
-      let t: number;
-      if (at === undefined) t = live && next <= ctx.currentTime + 0.5 ? next : ctx.currentTime + 0.08;
-      else if (live && Math.abs(at - nextAt) < 2) t = next;
-      else t = Math.max(ctx.currentTime, ctx.currentTime + (at - now!) / 1000);
-      src.start(t);
-      next = t + buf.duration;
-      nextAt = at === undefined ? NaN : at + buf.duration * 1000;
-    },
+    play,
     stop,
     /** Fade to `g` (linear) over a few tens of ms, so the step doesn't click. */
     setGain(g: number) {
@@ -659,9 +689,9 @@ export function setOutputPaused(paused: boolean) {
 }
 
 const speaker: LiveDriver = (_req, sink, env) => {
-  const out = pcmOutput('agent');
+  const out = pcmOutput('agent', env.now);
   // Backchannels play on their own output, so they neither wait for nor shift the reply's audio.
-  const cues = pcmOutput('agent');
+  const cues = pcmOutput('agent', env.now);
   setTimeout(() => sink.recv({ type: 'ready' }), 0);
   return {
     send(data, bin) {
