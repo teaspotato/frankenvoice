@@ -1,7 +1,7 @@
 import type { Json } from './types';
 
 export const GRAPH_FORMAT = 'frankenvoice-graph';
-export const GRAPH_FORMAT_VERSION = 10;
+export const GRAPH_FORMAT_VERSION = 11;
 
 export interface NodeSpec {
   id: string;

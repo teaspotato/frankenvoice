@@ -3,7 +3,7 @@
 //
 //   const ts = await TurnStream.create(ort, { encoder, head, frames: 2, ep: 'webgpu' });
 //   for each 80 ms block: const outs = await ts.push(user, agent)   // two Float32Array(1280), 16 kHz
-//   -> [{ t, eot: [c0, c1], int: [c0, c1], silent: [c0, c1], post }, ...]
+//   -> [{ t, eot: [c0, c1], int: [c0, c1], silent: [c0, c1], post, fine: [c0, c1] }, ...]
 //
 // `frames` (K) must match the encoder file: the encoder runs once per K blocks and returns K
 // frames. Frame t's newest audio is block t - 1, so with K > 1 the earlier frames of a chunk wait
@@ -28,6 +28,8 @@ export interface TurnFrame {
   int: [number, number];
   silent: [number, number];
   post: number[];
+  /** Per speaker, the head's 18-way frame-class distribution (what the backchannel head reads). */
+  fine: [number[], number[]];
 }
 
 type OrtModule = typeof Ort;
@@ -88,7 +90,7 @@ export class TurnStream {
     const o = await this.head.run({ feat: new T('float32', feat, [2, K, FEAT]), n, kcache: this.kc, vcache: this.vc });
     this.kc = o.kcache_out;
     this.vc = o.vcache_out;
-    const [eot, intr, silent, post] = (await Promise.all(['eot', 'int', 'silent', 'post'].map((k) => o[k].getData()))) as Float32Array[];
+    const [eot, intr, silent, post, fine] = (await Promise.all(['eot', 'int', 'silent', 'post', 'fine'].map((k) => o[k].getData()))) as Float32Array[];
     const out: TurnFrame[] = [];
     for (let j = 0; j < K; j++) {
       out.push({
@@ -97,6 +99,7 @@ export class TurnStream {
         int: [intr[2 * j], intr[2 * j + 1]],
         silent: [silent[2 * j], silent[2 * j + 1]],
         post: [...post.subarray(16 * j, 16 * j + 16)],
+        fine: [[...fine.subarray(36 * j, 36 * j + 18)], [...fine.subarray(36 * j + 18, 36 * j + 36)]],
       });
     }
     return out;

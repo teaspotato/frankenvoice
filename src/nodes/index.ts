@@ -12,9 +12,10 @@ import { streamingTtsNode } from './tts/stream';
 import { speakerNode } from './speaker';
 import { browserTtsNode } from './browser-tts';
 import { echoLlmNode, toneTtsNode } from './mocks';
+import { backchannelNode, noBackchannelNode } from './backchannel';
 
 export const registry: NodeRegistry = Object.fromEntries(
-  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, energyVadNode, asrNode, turnModelNode, noTurnModelNode, duplexTurnNode, halfDuplexTurnNode, llmNode, fillerOpenerNode, noOpenerNode, ttsNode, streamingTtsNode, browserTtsNode, speakerNode, echoLlmNode, toneTtsNode].map(
+  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, energyVadNode, asrNode, turnModelNode, noTurnModelNode, duplexTurnNode, halfDuplexTurnNode, llmNode, fillerOpenerNode, noOpenerNode, ttsNode, streamingTtsNode, browserTtsNode, speakerNode, echoLlmNode, toneTtsNode, backchannelNode, noBackchannelNode].map(
     (d) => [d.type, d],
   ),
 );
