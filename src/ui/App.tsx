@@ -9,7 +9,7 @@ import { decodeBundle, encodeBundle } from '../core/bundle';
 import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
 import type { Json } from '../core/types';
-import { browserDrivers, micMonitor, setOutputMuted, setOutputPaused, setOutputSuppressed } from '../drivers';
+import { browserDrivers, micMonitor, sessionTitle, setOutputMuted, setOutputPaused, setOutputSuppressed } from '../drivers';
 import {
   CONFIG_FORMAT,
   activeStages,
@@ -33,6 +33,30 @@ import { ActivityTracker, NO_ACTIVITY, type Activity } from './activity';
 const CONFIG_KEY = 'frankenvoice.pipeline';
 const AUTOSAVE_KEY = 'frankenvoice.autosave';
 const MUTE_KEY = 'frankenvoice.mute';
+const TITLE_KEY = 'frankenvoice.autoTitle';
+
+/** What was said in a session, for naming it: user turns and the agent's replies, in order. */
+function transcriptOf(traj: Trajectory): string {
+  const lines: string[] = [];
+  for (const e of traj.events) {
+    if (e.kind !== 'msg') continue;
+    const d = e.data as { type?: string; text?: string };
+    if (d.type === 'turn.user' && d.text) lines.push(`User: ${d.text}`);
+    else if (d.type === 'llm.end' && d.text) lines.push(`Agent: ${d.text}`);
+  }
+  return lines.join('\n').slice(0, 6000);
+}
+
+/** A title made safe as a session (file) name. */
+function titleToName(title: string): string {
+  return title
+    .replace(/[\/\\:*?"<>|\x00-\x1f]/g, ' ')
+    .replace(/^[\s.]+/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60)
+    .trim();
+}
 
 function loadConfig(): PipelineConfig {
   try {
@@ -99,6 +123,8 @@ export function App() {
   /** Node type behind each entry of nodeStates (the run they came from may predate a config change). */
   const [stateTypes, setStateTypes] = useState<Record<string, string>>({});
   const [sessions, setSessions] = useState<Session[]>([]);
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
   const [current, setCurrent] = useState<Session | null>(null);
   const [health, setHealth] = useState<Record<string, boolean> | null>(null);
   const [replayOpts, setReplayOpts] = useState({ audible: true, realtime: true, useCurrentConfig: false, liveChannels: '' });
@@ -107,6 +133,31 @@ export function App() {
   const [renaming, setRenaming] = useState<Session | string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [serverSessions, setServerSessions] = useState<string[]>([]);
+  /** Name each finished live session from its content, with this model ('' = off). */
+  const [autoTitle, setAutoTitle] = useState(() => {
+    try {
+      return localStorage.getItem(TITLE_KEY) ?? 'claude-haiku-5-5';
+    } catch {
+      return 'claude-haiku-5-5';
+    }
+  });
+  const [titleOn, setTitleOn] = useState(() => {
+    try {
+      return localStorage.getItem(TITLE_KEY + '.on') !== 'off';
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(TITLE_KEY, autoTitle);
+      localStorage.setItem(TITLE_KEY + '.on', titleOn ? 'on' : 'off');
+    } catch {
+      /* storage unavailable */
+    }
+  }, [autoTitle, titleOn]);
+  const titleRef = useRef({ on: titleOn, model: autoTitle });
+  titleRef.current = { on: titleOn, model: autoTitle };
   const [autosave, setAutosave] = useState(() => {
     try {
       return localStorage.getItem(AUTOSAVE_KEY) !== 'off';
@@ -204,6 +255,34 @@ export function App() {
     stopActivity.current();
     setPaused(false);
     if (rt.trajectory.meta.mode === 'live' && autosaveRef.current) await saveSession(s);
+    if (rt.trajectory.meta.mode === 'live' && titleRef.current.on && titleRef.current.model) void nameSession(s, titleRef.current.model);
+  };
+
+  /** Rename a finished session after what it was about; on any failure it keeps its generated id. */
+  const nameSession = async (s: Session, model: string) => {
+    const transcript = transcriptOf(s.traj);
+    if (!transcript) return;
+    let name: string;
+    try {
+      name = titleToName(await sessionTitle(model, transcript));
+    } catch (e) {
+      return setNotice(`Could not title the session with ${model}: ${String(e).slice(0, 200)}`);
+    }
+    if (!name) return;
+    const from = s.traj.meta.id;
+    for (let n = 1; n <= 9; n++) {
+      const to = n === 1 ? name : `${name} ${n}`;
+      if (s.saved) {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(from)}`, { method: 'PATCH', body: JSON.stringify({ id: to }) }).catch(() => null);
+        if (res?.status === 409) continue;
+        if (!res?.ok) return;
+        s.saved = ((await res.json()) as { path: string }).path;
+        setServerSessions((l) => l.map((x) => (x === from ? to : x)));
+      } else if (sessionsRef.current.some((x) => x !== s && x.traj.meta.id === to)) continue;
+      s.traj.meta.id = to;
+      setSessions((ss) => [...ss]);
+      return;
+    }
   };
 
   const saveSession = async (s: Session) => {
@@ -565,6 +644,10 @@ export function App() {
         <h3>Sessions</h3>
         <label className="autosave" title="Save each live session to the proxy's sessions folder when it stops">
           <input type="checkbox" checked={autosave} onChange={(e) => setAutosave(e.target.checked)} /> autosave live sessions
+        </label>
+        <label className="autosave" title="When a live session stops, ask this model for a short title and rename the session to it (uses the Anthropic key)">
+          <input type="checkbox" checked={titleOn} onChange={(e) => setTitleOn(e.target.checked)} /> name sessions with{' '}
+          <input className="title-model" value={autoTitle} disabled={!titleOn} onChange={(e) => setAutoTitle(e.target.value)} />
         </label>
         <div className="replay-opts">
           <label>

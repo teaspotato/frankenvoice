@@ -169,3 +169,4 @@ button.danger-link { color: var(--danger); margin-left: auto; }
 .lane-mute { position: absolute; left: 6px; z-index: 2; padding: 0 3px; height: 16px; line-height: 14px; font-size: 11px; border: 1px solid var(--border); border-radius: 3px; background: var(--panel); cursor: pointer; opacity: 0.75; }
 .lane-mute:hover { opacity: 1; }
 .lane-mute.on { opacity: 1; border-color: var(--danger, #c33); }
+.title-model { width: 9.5em; font: 11px var(--mono); margin-left: 2px; }

@@ -126,6 +126,21 @@ const claude = new Anthropic({
   dangerouslyAllowBrowser: true,
 });
 
+/**
+ * A short title for a finished session, from its transcript. Called by the UI, outside the pipeline,
+ * so it is not part of the recording.
+ */
+export async function sessionTitle(model: string, transcript: string): Promise<string> {
+  const msg = await claude.messages.create({
+    model,
+    max_tokens: 40,
+    system:
+      'You name recorded voice conversations between a user and a voice agent. Reply with a title of 2 to 6 words that says what the conversation was about, in the language of the conversation. No quotes, no trailing punctuation.',
+    messages: [{ role: 'user', content: `<transcript>\n${transcript}\n</transcript>\n\nTitle:` }],
+  });
+  return msg.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('').trim();
+}
+
 const anthropic: LiveDriver = (req, sink) => {
   // The request is recorded verbatim; extra SDK fields such as `fallbacks` pass through.
   const stream = claude.beta.messages.stream(req as unknown as Parameters<typeof claude.beta.messages.stream>[0]);
