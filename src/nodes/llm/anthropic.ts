@@ -16,7 +16,7 @@ export function thinkingOff(p: JsonObject): JsonObject {
 export const anthropicAdapter: LlmAdapter = {
   provider: 'anthropic',
   channel: 'anthropic',
-  defaultModel: 'claude-opus-5-5',
+  defaultModel: 'claude-haiku-5-5',
   buildRequest(history: ChatTurn[], p: JsonObject): Json {
     const messages: { role: string; content: Json }[] = [];
     for (const t of history) {

@@ -55,7 +55,7 @@ export const llmNode: NodeDef = {
       label: 'Model',
       type: 'string',
       default: '',
-      description: 'Empty uses the provider default (Anthropic: claude-opus-5-5). OpenAI-compatible endpoints need a model name, e.g. an OpenRouter slug.',
+      description: 'Empty uses the provider default (Anthropic: claude-haiku-5-5). OpenAI-compatible endpoints need a model name, e.g. an OpenRouter slug.',
     },
     { key: 'effort', label: 'Effort', type: 'select', options: ['low', 'medium', 'high', 'xhigh', 'max'], default: 'low', when: anthropic },
     {
@@ -63,7 +63,7 @@ export const llmNode: NodeDef = {
       label: 'Thinking',
       type: 'select',
       options: ['model default', 'off'],
-      default: 'model default',
+      default: 'off',
       when: anthropic,
       description: 'Off sends thinking {type: "disabled"} (Haiku) or {type: "between_tools"} (Sonnet). Opus cannot turn it off.',
     },
