@@ -1,13 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { Runtime } from '../src/core/runtime';
 import { LiveScheduler } from '../src/core/scheduler';
-import { LiveWorld } from '../src/core/world';
+import { LiveWorld, type Delivery } from '../src/core/world';
 import { prepareReplay } from '../src/core/replay';
 import { decodeBundle, encodeBundle } from '../src/core/bundle';
 import { registry } from '../src/nodes';
 import { buildGraph, defaultConfig } from '../src/pipeline';
 import type { Trajectory } from '../src/core/trajectory';
-import type { GraphSpec } from '../src/core/graph';
+import { GRAPH_FORMAT, GRAPH_FORMAT_VERSION, type GraphSpec } from '../src/core/graph';
+import type { NodeDef } from '../src/core/node';
 import { fakeDrivers } from './fake-drivers';
 
 function testGraph(): GraphSpec {
@@ -173,4 +174,50 @@ describe('record and replay', () => {
       expect(runtime.trajectory.events).toEqual(run.events);
     }, 10_000);
   }
+});
+
+describe('live timers', () => {
+  it('fire at their time even when the event loop runs them late, so the replay matches', () => {
+    // A node that waits 10 ms for an answer and gives up; the answer arrives at 20 ms,
+    // while the timer, held up behind a busy event loop, has not run yet.
+    const node: NodeDef = {
+      type: 'waiter',
+      title: 'Waiter',
+      category: 'llm',
+      inputs: [],
+      outputs: [{ name: 'out', type: 'x' }],
+      params: [],
+      channels: [{ name: 'x' }],
+      create(ctx) {
+        let timer: { clear(): void } | undefined;
+        return {
+          start() {
+            timer = ctx.setTimer(10, () => ctx.emit('out', { type: 'gave_up' }));
+            ctx.io.open('x', {}, { onRecv: () => (timer?.clear(), ctx.emit('out', { type: 'answered' })) });
+          },
+        };
+      },
+    };
+    const reg = { ...registry, waiter: node };
+    let now = 0;
+    const late: (() => void)[] = [];
+    const scheduler = { now: () => now, at: (_t: number, fn: () => void) => (late.push(fn), () => {}) };
+    let sink: Delivery | undefined;
+    const world = new LiveWorld({ x: (_r, s) => ((sink = s), { send() {}, close() {} }) }, scheduler);
+    const graph: GraphSpec = { format: GRAPH_FORMAT, formatVersion: GRAPH_FORMAT_VERSION, name: 't', nodes: [{ id: 'w', type: 'waiter', params: {} }], edges: [] };
+    const rt = new Runtime({ graph, registry: reg, scheduler, world, mode: 'live' });
+    rt.start();
+    now = 20;
+    sink!.recv({ ok: true });
+    for (const fn of late) fn();
+    rt.stop();
+    const outs = (t: Trajectory) => t.events.filter((e) => e.kind === 'msg').map((e) => [e.t, (e.data as { type: string }).type]);
+    expect(outs(rt.trajectory)).toEqual([
+      [10, 'gave_up'],
+      [20, 'answered'],
+    ]);
+    const { runtime, sim } = prepareReplay(rt.trajectory, { registry: reg });
+    sim.runFast();
+    expect(runtime.trajectory.events).toEqual(rt.trajectory.events);
+  });
 });
