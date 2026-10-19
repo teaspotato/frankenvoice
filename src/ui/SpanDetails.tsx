@@ -56,7 +56,8 @@ function ExchangeView({ x, related }: { x: Exchange; related: Set<number> }) {
   const recvs = long ? x.recvs.filter((e) => related.has(e.seq)) : x.recvs;
   const sends = (long ? x.sends.filter((e) => related.has(e.seq)) : x.sends).filter((e) => obj(e.data).payload != null);
   const payloads = recvs.map((e) => obj(e.data).payload);
-  const reply = reassembleAnthropic(payloads);
+  const reply = reassembleAnthropic(payloads) ?? reassembleOpenAI(payloads);
+  const chat = chatOf(request);
   const close = obj(x.close?.data);
   const dur = x.open && x.close ? Math.round(x.close.t - x.open.t) : undefined;
   return (
@@ -66,18 +67,33 @@ function ExchangeView({ x, related }: { x: Exchange; related: Set<number> }) {
         {dur !== undefined && <span className="muted"> · {dur} ms</span>}
         {x.close && <span className={close.payload && obj(close.payload).error ? 'warn' : 'muted'}> · closed by {String(close.by)}</span>}
       </div>
-      <details open={!long}>
-        <summary>Request</summary>
-        <JsonView value={request} open={3} />
-        {sends.map((e) => (
-          <JsonView key={e.seq} value={obj(e.data).payload} />
-        ))}
-      </details>
-      {reply && (
+      {chat ? (
+        <>
+          <Chat turns={chat.turns} reply={reply} />
+          <div className="muted reply-meta">
+            {Object.entries(chat.params)
+              .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
+              .join(' · ')}
+          </div>
+          {reply && <JsonView value={reply.usage} open={0} label="usage" />}
+          <details>
+            <summary>Raw request</summary>
+            <JsonView value={request} open={1} />
+          </details>
+        </>
+      ) : (
+        <details open={!long}>
+          <summary>Request</summary>
+          <JsonView value={request} open={3} />
+          {sends.map((e) => (
+            <JsonView key={e.seq} value={obj(e.data).payload} />
+          ))}
+        </details>
+      )}
+      {reply && !chat && (
         <details open>
           <summary>Response</summary>
-          <div className="reply-text">{reply.text}</div>
-          <div className="muted reply-meta">stop_reason: {reply.stop || '(none yet)'}</div>
+          <Chat turns={[]} reply={reply} />
           <JsonView value={reply.usage} open={0} label="usage" />
         </details>
       )}
@@ -152,11 +168,21 @@ function collect(traj: Trajectory, seqs: number[]) {
   return { events, exchanges, related };
 }
 
+interface Block {
+  type: string;
+  text: string;
+}
+interface Reply {
+  blocks: Block[];
+  stop: string;
+  usage: Json;
+}
+
 /** The reply an Anthropic message stream adds up to: text, thinking, tool calls, stop reason and usage. */
-function reassembleAnthropic(payloads: Json[]): { text: string; stop: string; usage: Json } | null {
+function reassembleAnthropic(payloads: Json[]): Reply | null {
   const evs = payloads.map(obj);
   if (!evs.some((p) => p.type === 'message_start')) return null;
-  const blocks: { type: string; text: string }[] = [];
+  const blocks: Block[] = [];
   let stop = '';
   let usage: Obj = {};
   for (const p of evs) {
@@ -171,13 +197,90 @@ function reassembleAnthropic(payloads: Json[]): { text: string; stop: string; us
     } else if (p.type === 'message_delta') {
       stop = String(obj(p.delta).stop_reason ?? '');
       usage = { ...usage, ...obj(p.usage) };
-    } else if (p.type === 'error') return { text: `error: ${pretty(p.error)}`, stop: 'error', usage };
+    } else if (p.type === 'error') return { blocks: [{ type: 'error', text: pretty(p.error) }], stop: 'error', usage };
   }
-  const body = blocks
-    .filter(Boolean)
-    .map((b) => (b.type === 'text' ? b.text : `[${b.type}] ${b.text}`))
-    .join('\n\n');
-  return { text: body, stop, usage };
+  return { blocks: blocks.filter(Boolean), stop, usage };
+}
+
+/** The reply an OpenAI-compatible chat completion stream adds up to. */
+function reassembleOpenAI(payloads: Json[]): Reply | null {
+  const evs = payloads.map(obj).filter((p) => Array.isArray(p.choices));
+  if (!evs.length) return null;
+  let text = '';
+  let reasoning = '';
+  let stop = '';
+  let usage: Json = {};
+  for (const p of evs) {
+    const c = obj((p.choices as Json[])[0]);
+    const d = obj(c.delta);
+    if (typeof d.content === 'string') text += d.content;
+    const r = d.reasoning ?? d.reasoning_content;
+    if (typeof r === 'string') reasoning += r;
+    if (c.finish_reason) stop = String(c.finish_reason);
+    if (p.usage) usage = p.usage;
+  }
+  return { blocks: [...(reasoning ? [{ type: 'thinking', text: reasoning }] : []), { type: 'text', text }], stop, usage };
+}
+
+/** A chat request's conversation as turns of blocks, without the system prompt (it is in the LLM settings), plus its other parameters. */
+function chatOf(request: Json | undefined): { turns: { role: string; blocks: Block[] }[]; params: Obj } | null {
+  const r = obj(request);
+  if (!Array.isArray(r.messages)) return null;
+  const turns = r.messages.map(obj).flatMap((m) => {
+    const role = String(m.role ?? '');
+    if (role === 'system' || role === 'developer') return [];
+    const content = typeof m.content === 'string' ? [{ type: 'text', text: m.content } as Obj] : Array.isArray(m.content) ? m.content.map(obj) : [];
+    const blocks = content.map((b): Block => {
+      if (b.type === 'text') return { type: 'text', text: String(b.text ?? '') };
+      if (b.type === 'thinking') return { type: 'thinking', text: String(b.thinking ?? '') };
+      if (b.type === 'redacted_thinking') return { type: 'thinking', text: '' };
+      if (b.type === 'tool_use') return { type: 'tool_use', text: `${String(b.name)} ${JSON.stringify(b.input)}` };
+      if (b.type === 'tool_result') return { type: 'tool_result', text: typeof b.content === 'string' ? b.content : JSON.stringify(b.content) };
+      return { type: String(b.type), text: JSON.stringify(b) };
+    });
+    return [{ role, blocks }];
+  });
+  const params: Obj = {};
+  for (const [k, v] of Object.entries(r)) if (!['messages', 'system', 'stream'].includes(k)) params[k] = v;
+  return { turns, params };
+}
+
+/** The conversation as message bubbles, ending with this call's reply. */
+function Chat({ turns, reply }: { turns: { role: string; blocks: Block[] }[]; reply: Reply | null }) {
+  return (
+    <div className="chat">
+      {turns.map((t, i) => (
+        <Bubble key={i} role={t.role} blocks={t.blocks} />
+      ))}
+      {reply && <Bubble role="assistant" blocks={reply.blocks} current note={`this reply · ${reply.stop || 'not finished'}`} />}
+    </div>
+  );
+}
+
+function Bubble({ role, blocks, current, note }: { role: string; blocks: Block[]; current?: boolean; note?: string }) {
+  return (
+    <div className={`bubble ${role === 'user' ? 'user' : 'assistant'}${current ? ' current' : ''}`}>
+      {blocks.map((b, i) =>
+        b.type === 'text' ? (
+          <div key={i}>{b.text}</div>
+        ) : b.type === 'thinking' && !b.text ? (
+          <div key={i} className="bubble-thinking">
+            thinking (text not returned by the API)
+          </div>
+        ) : b.type === 'thinking' ? (
+          <details key={i} className="bubble-thinking">
+            <summary>thinking</summary>
+            {b.text}
+          </details>
+        ) : (
+          <div key={i} className="bubble-other">
+            <b>{b.type}</b> {b.text}
+          </div>
+        ),
+      )}
+      {note && <div className="bubble-note">{note}</div>}
+    </div>
+  );
 }
 
 const pretty = (j: Json | undefined) => (j === undefined ? '(none)' : JSON.stringify(j, null, 2));

@@ -190,6 +190,23 @@ button.danger-link { color: var(--danger); margin-left: auto; }
 .j-punct, .j-preview { color: var(--muted); }
 .j-folded { cursor: pointer; }
 .j-more { color: var(--muted); font-style: italic; }
-.reply-text { white-space: pre-wrap; font-size: 13px; line-height: 1.5; padding: 6px 8px; background: var(--bg); border-radius: 4px; border: 1px solid var(--border); }
 .reply-meta { font-size: 11px; margin: 4px 0 2px; }
 @media (prefers-color-scheme: dark) { .j-str { color: #8ce99a; } .j-num { color: #ffa94d; } .j-bool, .j-null { color: #d0bfff; } }
+.chat { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
+.bubble { max-width: 88%; padding: 6px 9px; border-radius: 10px; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+.bubble.user { align-self: flex-end; background: color-mix(in srgb, var(--accent) 16%, var(--panel)); border-bottom-right-radius: 3px; }
+.bubble.assistant { align-self: flex-start; background: var(--bg); border: 1px solid var(--border); border-bottom-left-radius: 3px; }
+.bubble.current { border: 1.5px solid var(--accent); }
+.bubble-thinking { color: var(--muted); font-size: 11px; font-style: italic; margin-bottom: 3px; }
+.bubble-thinking summary { cursor: pointer; }
+.bubble-other { font: 11px var(--mono); color: var(--muted); }
+.bubble-note { font-size: 10px; color: var(--muted); margin-top: 3px; }
+.chat { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
+.bubble { max-width: 88%; padding: 6px 9px; border-radius: 10px; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+.bubble.user { align-self: flex-end; background: color-mix(in srgb, var(--accent) 16%, var(--panel)); border-bottom-right-radius: 3px; }
+.bubble.assistant { align-self: flex-start; background: var(--bg); border: 1px solid var(--border); border-bottom-left-radius: 3px; }
+.bubble.current { border: 1.5px solid var(--accent); }
+.bubble-thinking { color: var(--muted); font-size: 11px; font-style: italic; margin-bottom: 3px; white-space: pre-wrap; }
+.bubble-thinking summary { cursor: pointer; }
+.bubble-other { font: 11px var(--mono); color: var(--muted); }
+.bubble-note { font-size: 10px; color: var(--muted); margin-top: 3px; }
