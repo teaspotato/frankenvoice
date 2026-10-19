@@ -89,6 +89,8 @@ interface DuplexParams {
   maxBackchannelMs: number;
   speculate: boolean;
   draftAt: number;
+  modelNeedsVad: boolean;
+  maxSilenceMs: number;
 }
 
 /** Who holds the floor, and whether the user is talking over the agent while it does. */
@@ -184,6 +186,22 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       description: 'Decide on the turn model’s end-of-turn and take-the-floor events while it runs. The rules below apply when it is off or not loaded yet.',
     },
     {
+      key: 'modelNeedsVad',
+      label: 'Model floor takes need VAD speech',
+      type: 'boolean',
+      default: true,
+      description: 'Ignore the model’s take-the-floor events while the VAD hears no speech (it fires them in silence too).',
+      when: { useModel: [true] },
+    },
+    {
+      key: 'maxSilenceMs',
+      label: 'Commit after silence (ms)',
+      type: 'number',
+      default: 1500,
+      description: 'With the model: commit the user’s words after this much silence even if the model hasn’t called the end of their turn (0 = never).',
+      when: { useModel: [true] },
+    },
+    {
       key: 'asrGraceMs',
       label: 'Wait for ASR after end of turn (ms)',
       type: 'number',
@@ -260,6 +278,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let eotWait: { why: string; timer: TimerHandle } | null = null;
     /** The turn model is loaded and scoring. */
     let model = false;
+    /** With the model: commits the words if the user stays silent this long without its end of turn. */
+    let silence: TimerHandle | null = null;
     /** The user is talking (VAD). */
     let speaking = false;
     /** ASR has caught up with the silence: a result arrived during it, or the words before it were all final. */
@@ -353,6 +373,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     const commit = (why: string, tail?: Partial_) => {
       eotWait?.timer.clear();
       eotWait = null;
+      silence?.clear();
+      silence = null;
       const text = parts.join(' ').trim();
       if (!text || state !== 'listening') return;
       const turnId = `${ctx.id}-u${turnNo++}`;
@@ -390,6 +412,21 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       eotWait = { why, timer };
     };
 
+    /** The model may never call the end of the turn: don't let silence go on forever. */
+    const armSilence = () => {
+      silence?.clear();
+      silence = null;
+      if (!useModel() || p.maxSilenceMs <= 0 || state !== 'listening' || speaking) return;
+      silence = ctx.setTimer(
+        p.maxSilenceMs,
+        () => {
+          silence = null;
+          if (state === 'listening' && !speaking && (parts.length || partial)) endOfTurn(`${p.maxSilenceMs} ms of silence without the model's end of turn`);
+        },
+        'silence',
+      );
+    };
+
     /** The user takes the floor: stop the reply and start listening. */
     const yieldFloor = (c: Candidate, why: string) => {
       c.timer?.clear();
@@ -412,6 +449,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         if (partial && f.start <= partial.end) partial = null;
         collect(f.text, f.start, f.end);
       }
+      armSilence();
     };
 
     /** Rules without the model: enough speech that isn't only backchannel words. */
@@ -465,6 +503,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           if (!useModel() || msg.who !== 'user') return;
           const why = `model: ${msg.type === 'turnmodel.eot' ? 'end of turn' : 'take the floor'} p=${msg.p}`;
           if (msg.type === 'turnmodel.int' && p.bargeIn && state !== 'listening') {
+            if (p.modelNeedsVad && !speaking) return void ctx.log('debug', 'model floor take ignored: the VAD hears no speech', { why });
             const c = overlap(msg.at as number, why);
             if (c) yieldFloor(c, why);
           } else if (msg.type === 'turnmodel.eot' && state === 'listening') {
@@ -496,6 +535,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             speaking = true;
             caughtUp = false;
             eotHeld = null;
+            silence?.clear();
+            silence = null;
             if (state === 'thinking' || state === 'speaking') overlap(msg.at as number, 'user speech (VAD)');
             else if (eotWait) {
               // They went on after the model called the end of their turn: wait for the next one.
@@ -508,6 +549,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             // A partial from before the silence usually lacks the last words: wait for ASR to catch up.
             caughtUp = !partial;
             if (state === 'listening') maybeDraft('silence, words final');
+            armSilence();
             if (eotHeld && state === 'listening' && ctx.now() - eotHeld.at <= EOT_HOLD_MS) endOfTurn(`${eotHeld.why}, then VAD speech end`);
             eotHeld = null;
             if (candidate) {

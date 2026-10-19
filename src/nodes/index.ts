@@ -30,7 +30,8 @@ export function migrateGraph(g: GraphSpec): GraphSpec {
   const older = (n: NodeSpec) => {
     if (g.formatVersion < 3) n = noDrafts(n);
     if (g.formatVersion < 4) n = noThinking(n);
-    return noOpener(n);
+    if (g.formatVersion < 5) n = noOpener(n);
+    return oldModelRules(n);
   };
   if (g.formatVersion >= 2) return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: g.nodes.map(older) };
   const prefix = (provider: string, params: Record<string, Json>, rename: Record<string, string> = {}) => ({
@@ -68,4 +69,7 @@ const noThinking = (n: NodeSpec): NodeSpec => {
 };
 /** Before format 5 there was no canned opener (format 4's opener asked an LLM, and is gone). */
 const noOpener = (n: NodeSpec): NodeSpec => (n.type === 'llm' ? { ...n, params: { ...n.params, opener: 'off' } } : n);
+/** Before format 6 the turn model's floor takes counted without VAD speech, and silence never committed. */
+const oldModelRules = (n: NodeSpec): NodeSpec =>
+  n.type === 'turn.duplex' ? { ...n, params: { modelNeedsVad: false, maxSilenceMs: 0, ...n.params } } : n;
 const noDrafts = (n: NodeSpec): NodeSpec => (n.type === 'turn.duplex' && n.params.speculate === undefined ? { ...n, params: { ...n.params, speculate: false } } : n);

@@ -197,7 +197,7 @@ describe('sessions recorded before drafts', () => {
   it('replay without them', async () => {
     const { migrateGraph } = await import('../src/nodes');
     const g = migrateGraph({ format: 'frankenvoice-graph', formatVersion: 2, name: 'old', nodes: [{ id: 'turn', type: 'turn.duplex', params: {} }], edges: [] });
-    expect(g.nodes[0].params).toEqual({ speculate: false });
+    expect(g.nodes[0].params).toEqual({ speculate: false, modelNeedsVad: false, maxSilenceMs: 0 });
   });
 });
 
@@ -258,13 +258,49 @@ describe('turn-taking fixes from the smoothie session', () => {
     h.send(1200, 'scores', eot(1200));
     h.advance(1800); // no final in time: commits on the partial
     expect(h.of('turn.user')).toMatchObject([{ text: 'I was thinking' }]);
-    h.send(1900, 'scores', int(1900)); // they go on: the reply is dropped
-    h.send(2000, 'vad', vad(true, 2000));
+    h.send(1900, 'vad', vad(true, 1900));
+    h.send(2000, 'scores', int(2000)); // they go on: the reply is dropped
     h.send(2100, 'transcript', { ...asr(true, 1100, 'I was thinking'), fromFinalize: true });
     h.send(2600, 'transcript', asr(false, 2600, 'about'));
     h.send(2700, 'vad', vad(false, 2700));
     h.send(2900, 'transcript', asr(true, 2900, 'about'));
     h.send(3000, 'scores', eot(3000));
     expect(h.of('turn.user').at(-1)).toMatchObject({ text: 'I was thinking about', replaces: 'turn-u0' });
+  });
+
+  it('ignores a model floor take while the VAD hears nothing (Building a Voice Chat App, 64.1 s)', () => {
+    const h = harness(duplexTurnNode, {});
+    h.send(0, 'scores', ready);
+    h.send(0, 'vad', vad(true, 0));
+    h.send(900, 'transcript', asr(true, 900, 'It sounds fine. Right?', true));
+    h.send(1000, 'vad', vad(false, 1000));
+    h.send(1100, 'scores', eot(1100));
+    expect(h.of('turn.user')).toHaveLength(1);
+    h.send(1300, 'scores', int(1300)); // silence: no floor take
+    expect(h.of('cancel')).toHaveLength(0);
+    expect(h.of('turn.decision')).toHaveLength(0);
+  });
+
+  it('commits after maxSilenceMs when the model never calls the end of the turn', () => {
+    const h = harness(duplexTurnNode, { maxSilenceMs: 1500 });
+    h.send(0, 'scores', ready);
+    h.send(0, 'vad', vad(true, 0));
+    h.send(900, 'transcript', asr(true, 900, 'It sounds fine. Right?', true));
+    h.send(1000, 'vad', vad(false, 1000));
+    h.advance(2400);
+    expect(h.of('turn.user')).toHaveLength(0);
+    h.advance(2500);
+    expect(h.of('turn.user')).toMatchObject([{ text: 'It sounds fine. Right?' }]);
+  });
+
+  it('restarts the silence wait when the user speaks again', () => {
+    const h = harness(duplexTurnNode, { maxSilenceMs: 1500 });
+    h.send(0, 'scores', ready);
+    h.send(0, 'vad', vad(true, 0));
+    h.send(900, 'transcript', asr(true, 900, 'So', true));
+    h.send(1000, 'vad', vad(false, 1000));
+    h.send(2000, 'vad', vad(true, 2000));
+    h.advance(3000);
+    expect(h.of('turn.user')).toHaveLength(0);
   });
 });
