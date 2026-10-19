@@ -229,7 +229,9 @@ export class TimelineModel {
       this.errors.push({ t: e.t, node: e.node, text: String(d.message), seq: e.seq });
       return;
     }
-    if (e.kind === 'io.open' && e.node === 'tts') {
+    // A request per sentence, or on the streaming socket, each flush (a sentence sent to be spoken).
+    const flush = e.kind === 'io.send' && e.node === 'tts' && (e.data as { payload?: { type?: string } })?.payload?.type === 'Flush';
+    if ((e.kind === 'io.open' && e.node === 'tts') || flush) {
       this.ttsRequests.push({ t: e.t, seq: e.seq });
       return;
     }
