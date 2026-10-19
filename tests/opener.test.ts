@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { llmNode } from '../src/nodes/llm';
-import { parseOpenerLines, pickOpener } from '../src/nodes/llm/opener';
+import { choiceRequest, parseOpenerChoices, parseOpenerLines, pickOpener, readChoice } from '../src/nodes/llm/opener';
 import { resolveParams, type IOHandlers, type NodeContext } from '../src/core/node';
 import type { Json, Msg } from '../src/core/types';
 
 function harness(params: Record<string, unknown>) {
   let now = 0;
   const out: Msg[] = [];
+  const timers: { at: number; fn: () => void }[] = [];
   const ios: { channel: string; request: Json; h: IOHandlers; closed: boolean }[] = [];
   const ctx: NodeContext = {
     id: 'llm',
@@ -16,7 +17,7 @@ function harness(params: Record<string, unknown>) {
     emit: (_port, msg) => out.push(msg),
     setState() {},
     log() {},
-    setTimer: () => ({ clear() {} }),
+    setTimer: (ms, fn) => (timers.push({ at: now + ms, fn }), { clear() {} }),
     io: {
       open(channel, request, h) {
         const x = { channel, request, h, closed: false };
@@ -32,7 +33,12 @@ function harness(params: Record<string, unknown>) {
   const of = (type: string) => out.filter((m) => m.type === type);
   const chat = () => ios.filter((x) => x.channel === 'openai');
   const embeds = () => ios.filter((x) => x.channel === 'embed');
-  return { send, of, ios, chat, embeds, at: (t: number) => void (now = t) };
+  const advance = (t: number) => {
+    now = t;
+    const due = timers.filter((x) => x.at <= t);
+    for (const x of due) timers.splice(timers.indexOf(x), 1), x.fn();
+  };
+  return { send, of, ios, chat, embeds, advance, choices: () => ios.filter((x) => x.channel === 'typesafe') };
 }
 
 const lines = 'Hmm, let me think. = why is that | which one\n- = thanks';
@@ -124,5 +130,64 @@ describe('canned openers', () => {
   it('tells TTS the lines at start', () => {
     const h = harness(params);
     expect(h.of('llm.opener_lines')).toEqual([{ type: 'llm.opener_lines', lines: ['Hmm, let me think.'] }]);
+  });
+});
+
+describe('openers picked by TypeSafe Choice', () => {
+  const options = 'Hmm, let me think. = needs weighing up\nOh? = a teaser, invite them to go on\n- = anything else';
+  const cparams = { provider: 'openai-compatible', model: 'big', system: 'sys', opener: 'choice', openerChoices: options, openerInstructions: 'Pick.', openerMinConfidence: 0.5 };
+  const answer = (choice: string, confidence: number) => ({ model: 'jev-1.13.0', answers: { opener: { type: 'choice', choice, confidence, probabilities: {} } } });
+
+  it('builds the request from the whole conversation and reads the answer', () => {
+    const req = choiceRequest(
+      [
+        { role: 'user', text: 'hi' },
+        { role: 'assistant', text: 'Hello!' },
+        { role: 'user', text: "I'm cooking some interesting stuff." },
+      ],
+      parseOpenerChoices(options),
+      'Pick.',
+      'jev-latest',
+    );
+    expect(req).toEqual({
+      model: 'jev-latest',
+      state: "User: hi\nAgent: Hello!\nUser: I'm cooking some interesting stuff.",
+      questions: { opener: { type: 'choice', instructions: 'Pick.', criteria: { 'Hmm, let me think.': 'needs weighing up', 'Oh?': 'a teaser, invite them to go on', '-': 'anything else' } } },
+    });
+    expect(readChoice(answer('Oh?', 0.8), 0.5)).toEqual({ line: 'Oh?', score: 0.8, example: 'Oh?' });
+    expect(readChoice(answer('Oh?', 0.4), 0.5)?.line).toBeNull();
+    expect(readChoice(answer('-', 0.9), 0.5)?.line).toBeNull();
+    expect(readChoice({ error: 'x' }, 0.5)).toBeNull();
+  });
+
+  it('sends the conversation, says the chosen line and tells the model', () => {
+    const h = harness(cparams);
+    expect(h.of('llm.opener_lines')).toEqual([{ type: 'llm.opener_lines', lines: ['Hmm, let me think.', 'Oh?'] }]);
+    h.send(1000, { type: 'turn.user', turnId: 'u0', text: "I'm cooking some interesting stuff." });
+    expect(h.chat()).toHaveLength(0);
+    expect(h.choices()[0].request).toMatchObject({ path: '/v1/systemone', body: { state: "User: I'm cooking some interesting stuff." } });
+    h.choices()[0].h.onRecv!(answer('Oh?', 0.9), undefined);
+    expect(h.of('llm.delta')).toMatchObject([{ text: 'Oh? ', opener: true }]);
+    expect(body(h.chat()[0].request).messages[0].content).toContain('You have already said aloud: "Oh?"');
+  });
+
+  it('gives up waiting after openerWaitMs and sends the request without an opener', () => {
+    const h = harness({ ...cparams, openerWaitMs: 300 });
+    h.send(1000, { type: 'turn.user', turnId: 'u0', text: 'why is the sky blue' });
+    h.advance(1299);
+    expect(h.chat()).toHaveLength(0);
+    h.advance(1300);
+    expect(h.chat()).toHaveLength(1);
+    expect(body(h.chat()[0].request).messages[0].content).toBe('sys');
+    h.choices()[0].h.onRecv!(answer('Hmm, let me think.', 0.9), undefined);
+    expect(h.of('llm.delta')).toHaveLength(0);
+    expect(h.chat()).toHaveLength(1);
+  });
+
+  it('asks again when the conversation before the same words differs', () => {
+    const h = harness(cparams);
+    h.send(1000, { type: 'turn.draft', draftId: 'd0', text: 'yeah' });
+    h.send(1100, { type: 'turn.draft', draftId: 'd1', text: 'yeah' });
+    expect(h.choices()).toHaveLength(1);
   });
 });
