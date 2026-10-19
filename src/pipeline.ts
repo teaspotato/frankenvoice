@@ -9,7 +9,7 @@ import type { Json } from './core/types';
 import { migrateGraph, registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'cleanup' | 'vad' | 'asr' | 'turn' | 'llm' | 'tts' | 'speaker';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'llm' | 'tts' | 'speaker';
 
 export interface StageDef {
   id: StageId;
@@ -28,6 +28,7 @@ export const STAGES: StageDef[] = [
     variants: { browser: 'cleanup.browser', aec: 'cleanup.aec', rnnoise: 'cleanup.rnnoise', off: 'cleanup.off' },
   },
   { id: 'vad', label: 'VAD', variants: { silero: 'vad.silero', energy: 'vad.energy' } },
+  { id: 'turnmodel', label: 'Turn model', variants: { ssl_turn: 'turnmodel.ssl', off: 'turnmodel.off' } },
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
@@ -79,6 +80,7 @@ const COLUMN: Record<StageId, [number, number]> = {
   mic: [0, 110],
   cleanup: [210, 110],
   vad: [420, 20],
+  turnmodel: [420, 110],
   asr: [420, 200],
   turn: [630, 110],
   llm: [840, 110],
@@ -88,7 +90,10 @@ const COLUMN: Record<StageId, [number, number]> = {
 
 const e = (from: string, fp: string, to: string, tp: string): EdgeSpec => ({ from: { node: from, port: fp }, to: { node: to, port: tp } });
 
-/** The fixed topology: mic → noise/echo cleanup → VAD + ASR → turn-taking → LLM → TTS → speaker, with playback fed back to turn-taking. */
+/**
+ * The fixed topology: mic → noise/echo cleanup → VAD + turn model + ASR → turn-taking → LLM → TTS → speaker,
+ * with playback fed back to turn-taking and what was played to the turn model (the agent's channel).
+ */
 export function buildGraph(c: PipelineConfig): GraphSpec {
   const stages = activeStages(c);
   const cleanupType = stageType(c, 'cleanup');
@@ -108,6 +113,9 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('mic', 'audio', 'cleanup', 'audio'),
     e('cleanup', 'audio', 'vad', 'audio'),
     e('cleanup', 'audio', 'asr', 'audio'),
+    e('cleanup', 'audio', 'turnmodel', 'audio'),
+    ...(hasSpeaker ? [e('speaker', 'played', 'turnmodel', 'played')] : []),
+    ...(registry[stageType(c, 'turn')].inputs.some((p) => p.name === 'scores') ? [e('turnmodel', 'scores', 'turn', 'scores')] : []),
     e('vad', 'vad', 'turn', 'vad'),
     e('asr', 'transcript', 'turn', 'transcript'),
     e('turn', 'turn', 'llm', 'turn'),

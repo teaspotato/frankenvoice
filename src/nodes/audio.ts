@@ -51,3 +51,65 @@ export class Framer {
     }
   }
 }
+
+/**
+ * Audio the speaker played, placed on the session clock at one sample rate:
+ * a ring buffer indexed by absolute sample number (session ms × rate / 1000).
+ * Overlapping chunks add up; positions never written read as silence.
+ */
+export class PlayedTrack {
+  private ring: Float32Array;
+  private hi = 0;
+
+  constructor(
+    readonly rate: number,
+    seconds = 60,
+    minSamples = 0,
+  ) {
+    this.ring = new Float32Array(Math.max(minSamples, Math.round(seconds * rate)));
+  }
+
+  /** Sample `k`, or 0 outside what is held. */
+  get(k: number): number {
+    if (k < 0 || k >= this.hi || k < this.hi - this.ring.length) return 0;
+    return this.ring[k % this.ring.length];
+  }
+
+  /** Copy samples [k0, k0 + out.length) into `out`. */
+  read(k0: number, out: Float32Array): Float32Array {
+    for (let i = 0; i < out.length; i++) out[i] = this.get(k0 + i);
+    return out;
+  }
+
+  /** Ensure ring positions up to `k` exist (zeroed). */
+  private extend(k: number) {
+    const n = this.ring.length;
+    if (k - this.hi >= n) {
+      this.ring.fill(0);
+      this.hi = k - n;
+    }
+    for (; this.hi < k; this.hi++) this.ring[this.hi % n] = 0;
+  }
+
+  /** Add played audio starting at session time `atMs` (linearly resampled to `rate`). */
+  add(atMs: number, samples: Float32Array, sampleRate: number) {
+    const k0 = Math.round((atMs * this.rate) / 1000);
+    const n = Math.floor((samples.length * this.rate) / sampleRate);
+    this.extend(k0 + n);
+    const step = sampleRate / this.rate;
+    for (let i = 0; i < n; i++) {
+      const pos = i * step;
+      const j = Math.floor(pos);
+      const f = pos - j;
+      const v = samples[j] * (1 - f) + (j + 1 < samples.length ? samples[j + 1] : samples[j]) * f;
+      const k = k0 + i;
+      if (k >= this.hi - this.ring.length) this.ring[k % this.ring.length] += v;
+    }
+  }
+
+  /** Playback was cut at `atMs`: nothing after that will be heard. */
+  truncate(atMs: number) {
+    const k0 = Math.round((atMs * this.rate) / 1000);
+    for (let k = Math.max(k0, this.hi - this.ring.length); k < this.hi; k++) this.ring[k % this.ring.length] = 0;
+  }
+}

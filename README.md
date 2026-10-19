@@ -19,6 +19,7 @@ Open http://localhost:5173 and press **Run live**. Allow microphone access. Pres
 - **Dashboard** (middle): one lane per stage on a shared time axis, live while running and the same for replays and loaded sessions.
   - *Mic*: waveform. *Cleaned*: what the noise/echo stage passes on, with how much it removed (in − out, 0–30 dB line); red ticks mark double talk (echo canceller not adapting) or RNNoise gating. *VAD*: speech probability with the start/stop thresholds; detected speech is shaded across Mic and VAD.
   - *ASR*: each result drawn over the audio it covers (dashed while partial, solid when final), with a line to the dot where it arrived, so recognition latency is visible.
+  - *Turn model*: end-of-turn (blue) and take-the-floor (orange) scores per 80 ms, the user solid and the agent faint, against the thresholds (dashed); diamonds for the user's committed events, hollow dots for the agent's. Hover for the values.
   - *Turn*: floor state (thinking, speaking) and committed user turns. Below it, each time the user talked over the agent: a band for how long, ending in the verdict (red *interrupt*, amber *continue*, grey *backchannel*). Hover for the reason and what the ASR had heard.
   - *LLM*: waiting for the first token (light), then generating (solid), labelled with time to first token, chunk count and chars/s. Below it, each streamed chunk gets a dot and its text at the moment it arrived (zoom in to read them); hover a chunk for its offset and the text so far.
   - *TTS*: a diamond per request sent and each sentence's audio stream. *Playback*: the scheduled agent audio, sentence starts (diamonds), word boundaries (dots), and interruptions.
@@ -36,11 +37,11 @@ The pipeline runs in the browser. The small proxy in `server/` keeps API keys ou
 
 ```
                        ┌─> vad (Silero) ──┐
-mic ─> noise/echo ─────┤                  ├─> turn ─> llm ─> tts ─> speaker
+mic ─> noise/echo ─────┼─> turn model ────┼─> turn ─> llm ─> tts ─> speaker
           ^            └─> asr (streaming)┘    ^ │                   │  │
-          │                                    │ └ cancel ─> llm, tts, speaker
-          │                                    └──── playback ───────┘  │
-          └──────────────── echo reference (what was played) ───────────┘
+          │                     ^              │ └ cancel ─> llm, tts, speaker
+          │                     │              └──── playback ───────┘  │
+          └─────────────────────┴─ what was played (echo reference, agent audio)
 ```
 
 The wiring lives in `src/pipeline.ts` (`STAGES` and `buildGraph`). Each stage lists the node types that can fill it; the UI only chooses among those and sets their params. To change the topology, edit that file.
@@ -76,7 +77,17 @@ For OpenRouter, set the LLM stage provider to `openai-compatible`, endpoint `ope
 
 Each provider is a small pure adapter (`src/nodes/{asr,llm,tts}/`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`src/drivers/index.ts`). Recordings keep the provider's raw payloads, so replay feeds the same bytes through the same adapter. Adding a provider means one adapter, plus a driver and proxy route if it speaks a new protocol.
 
-Turn-taking is full-duplex by default (`turn.duplex` in `src/nodes/turn.ts`); `half-duplex` is still selectable and ignores the user while the agent talks. The full-duplex stage commits a user turn on ASR endpointing like before. When VAD hears the user while the agent is thinking or speaking, it waits *min speech to interrupt* (400 ms), then decides:
+Turn-taking is full-duplex by default (`turn.duplex` in `src/nodes/turn.ts`); `half-duplex` is still selectable and ignores the user while the agent talks. The full-duplex stage is an explicit state machine (`FLOOR` in `src/nodes/turn.ts`): listening, thinking, speaking, and thinking+user / speaking+user while the user talks over the agent. Every transition is emitted as a `turn.transition` message with what triggered it.
+
+### Turn model
+
+The *Turn model* stage (`turnmodel.ssl` in `src/nodes/turn-model.ts`) runs the ssl_turn model from the [turn-playground Space](https://huggingface.co/spaces/shinohararin/turn-playground) in a worker (WebGPU, or WASM on the CPU). Its two channels are the user (cleaned mic) and the agent (what the speaker played, placed on the same clock), and every 80 ms it scores both for *end of turn* and *take the floor*. The thresholds (TurnBench dev operating points 0.64 / 0.18, 0.5 s refractory) are applied in the node, on the recorded scores, so they can be retuned on a replay. The model files (213 MB) download from the Space on first use and are cached by the browser; *Model files URL* points elsewhere (for example a retrained export). The *Turn model* lane shows both scores for both speakers against the thresholds, and the events committed.
+
+While the model runs, turn-taking uses it: the user's *take the floor* stops the agent at once, user speech over the agent that ends without one is a backchannel (whatever the words), and the user's *end of turn* commits the turn, waiting up to *wait for ASR* (600 ms) for the final words. *Max backchannel* still applies as a safety net, and so does ASR `utterance_end`. Until the model is ready, or if it fails or falls behind real time (it gives up 3.2 s behind), the rules below apply.
+
+To try the model on a recorded session, tick **replay with current config**, put `turn-model` in **live channels**, and replay in realtime (a fast replay feeds it faster than it can run).
+
+Without the model, the stage commits a user turn on ASR endpointing. When VAD hears the user while the agent is thinking or speaking, it waits *min speech to interrupt* (400 ms), then decides:
 
 - **backchannel**: the speech ended first, or the ASR so far is only *backchannel words* (yeah, okay, mhm, …) and it is shorter than *max backchannel* (1200 ms). The agent keeps going.
 - **interrupt**: the agent was speaking. It sends `cancel` to the LLM, TTS and speaker. The speaker reports how much of the reply was heard (whole sentences played, plus the words of the current one in proportion to its playback), and the LLM's history keeps only that, ending in "—".

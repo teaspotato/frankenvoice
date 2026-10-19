@@ -7,7 +7,7 @@ const W = 150;
 const H = 64;
 
 /**
- * Fixed layout: one column per step, VAD and ASR stacked in the third. The
+ * Fixed layout: one column per step, VAD, turn model and ASR stacked in the third. The
  * playback feedback runs above the main row and the echo reference below it,
  * where nothing else is drawn.
  */
@@ -15,6 +15,7 @@ const POS: Record<StageId, [number, number]> = {
   mic: [10, 88],
   cleanup: [210, 88],
   vad: [410, 10],
+  turnmodel: [410, 88],
   asr: [410, 166],
   turn: [610, 88],
   llm: [810, 88],
@@ -22,7 +23,7 @@ const POS: Record<StageId, [number, number]> = {
   speaker: [1210, 88],
 };
 const VIEW_W = 1370;
-const VIEW_H = 272;
+const VIEW_H = 290;
 const FEEDBACK_Y = 60;
 /** The echo reference runs under everything, below ASR. */
 const REFERENCE_Y = 250;
@@ -80,7 +81,9 @@ export function PipelineView({
     link('mic.audio', right('mic'), left('cleanup'), 'audio'),
     link('cleanup.audio', right('cleanup'), left('vad'), 'clean'),
     link('cleanup.audio', right('cleanup'), left('asr'), 'clean'),
+    link('cleanup.audio', right('cleanup'), left('turnmodel'), ''),
     link('vad.vad', right('vad'), left('turn'), 'speech'),
+    ...(registry[stageType(config, 'turn')].inputs.some((p) => p.name === 'scores') ? [link('turnmodel.scores', right('turnmodel'), left('turn'), 'scores')] : []),
     link('asr.transcript', right('asr'), left('turn'), 'transcript'),
     link('turn.turn', right('turn'), left('llm'), 'turn'),
     link('llm.text', right('llm'), left('tts'), 'text'),
@@ -123,6 +126,21 @@ export function PipelineView({
       label: 'echo reference (what was played)',
       lx: (sx + cx) / 2,
       ly: REFERENCE_Y - 6,
+    });
+  }
+
+  // The agent's channel for the turn model: what the speaker played, along the bottom and up the gap left of the column.
+  if (out === 'speaker') {
+    const [sx, sy] = [POS.speaker[0] + W / 2 + 20, POS.speaker[1] + H];
+    const gx = POS.turnmodel[0] - 16;
+    const ey = POS.turnmodel[1] + H - 12;
+    const by = REFERENCE_Y + 12;
+    edges.push({
+      src: 'speaker.played',
+      d: `M${sx},${sy} L${sx},${by - r} Q${sx},${by} ${sx - r},${by} L${gx + r},${by} Q${gx},${by} ${gx},${by - r} L${gx},${ey + r} Q${gx},${ey} ${gx + r},${ey} L${POS.turnmodel[0] - 2},${ey}`,
+      label: 'agent audio (to the turn model)',
+      lx: (sx + gx) / 2 + 120,
+      ly: by + 12,
     });
   }
 

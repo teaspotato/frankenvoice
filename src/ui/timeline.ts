@@ -79,6 +79,12 @@ export class TimelineModel {
   vadThreshold?: number;
   vadNegThreshold?: number;
   speech: Span[] = [];
+  /** Turn model scores per frame, [user, agent], placed on the audio they have heard. */
+  turnScores: { t: number; eot: number[]; int: number[] }[] = [];
+  /** End-of-turn / take-the-floor events the turn model committed. */
+  turnEvents: (Marker & { kind: 'eot' | 'int'; who: string; p: number; arrived: number })[] = [];
+  turnEotThreshold?: number;
+  turnIntThreshold?: number;
   /** Latest ASR result per segment (keyed by its first audio sample). */
   asr = new Map<number, AsrResult>();
   asrArrivals: { t: number; final: boolean; text: string; seq: number; a0?: number; a1?: number }[] = [];
@@ -203,6 +209,11 @@ export class TimelineModel {
       this.vadNegThreshold = d.params?.negThreshold;
       return;
     }
+    if (e.kind === 'node.start' && d.type === 'turnmodel.ssl') {
+      this.turnEotThreshold = d.params?.eotThreshold;
+      this.turnIntThreshold = d.params?.intThreshold;
+      return;
+    }
     if (e.kind === 'log' && d.level === 'error') {
       this.errors.push({ t: e.t, node: e.node, text: String(d.message), seq: e.seq });
       return;
@@ -249,6 +260,13 @@ export class TimelineModel {
         break;
       case 'vad.frame':
         this.vad.push({ t: this.sampleToT(d.end), p: d.p });
+        break;
+      case 'turnmodel.frame':
+        this.turnScores.push({ t: this.sampleToT(d.at), eot: d.eot, int: d.int });
+        break;
+      case 'turnmodel.eot':
+      case 'turnmodel.int':
+        this.turnEvents.push({ t: this.sampleToT(d.at), arrived: e.t, kind: d.type === 'turnmodel.eot' ? 'eot' : 'int', who: d.who, p: d.p, text: '', seq: e.seq });
         break;
       case 'vad.speech_start':
         this.speech.push({ t0: this.sampleToT(d.at), text: '', seqs: [e.seq] });

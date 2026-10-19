@@ -13,6 +13,7 @@ export const LANES: Lane[] = [
   { id: 'mic', label: 'Mic', height: 48 },
   { id: 'cleanup', label: 'Cleaned', height: 52 },
   { id: 'vad', label: 'VAD', height: 60 },
+  { id: 'turnmodel', label: 'Turn model', height: 64 },
   { id: 'asr', label: 'ASR', height: 46 },
   { id: 'turn', label: 'Turn', height: 52 },
   { id: 'llm', label: 'LLM', height: 60 },
@@ -25,6 +26,8 @@ const LEGEND: Record<string, string> = {
   mic: 'Microphone input: waveform peaks every 10 ms, placed when each frame arrived. Green shading: speech the VAD detected.',
   cleanup: 'Audio after noise/echo cleanup: what VAD and ASR hear. Small ticks under it: AEC double talk or the RNNoise gate closing. Hover for levels.',
   vad: 'Speech probability per frame (line) against the start and stop thresholds (dashed). Shaded: detected speech.',
+  turnmodel:
+    'Turn model scores per 80 ms frame, placed on the audio they had heard: end of turn (blue) and take the floor (orange). Solid: the user; faint: the agent. Dashed: the thresholds.\nDiamonds: events the model committed for the user (top: end of turn, bottom: take the floor); hollow dots: the same for the agent.',
   asr:
     'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
   turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), grey dot = backchannel or noise, ignored.',
@@ -423,6 +426,64 @@ export function Dashboard({
         }
         g.stroke();
         g.lineWidth = 1;
+      }
+
+      // Turn model: end-of-turn and take-the-floor scores, user solid and agent faint
+      {
+        const [ly0, ly1] = laneY.turnmodel;
+        const yv = (p: number) => ly1 - 6 - p * (ly1 - ly0 - 12);
+        const kinds = [
+          ['eot', col.accent, m.turnEotThreshold],
+          ['int', col.turn, m.turnIntThreshold],
+        ] as const;
+        g.setLineDash([3, 3]);
+        for (const [, c, th] of kinds) {
+          if (typeof th !== 'number') continue;
+          g.strokeStyle = c;
+          g.globalAlpha = 0.6;
+          g.beginPath();
+          g.moveTo(LABEL_W, yv(th) + 0.5);
+          g.lineTo(W, yv(th) + 0.5);
+          g.stroke();
+        }
+        g.setLineDash([]);
+        for (const who of [1, 0]) {
+          for (const [k, c] of kinds) {
+            g.strokeStyle = c;
+            g.globalAlpha = who === 0 ? 1 : 0.3;
+            g.lineWidth = who === 0 ? 1.5 : 1;
+            g.beginPath();
+            let started = false;
+            for (const f of m.turnScores) {
+              if (f.t < t0 - 200 || f.t > t1 + 200) continue;
+              if (!started) g.moveTo(x(f.t), yv(f[k][who]));
+              else g.lineTo(x(f.t), yv(f[k][who]));
+              started = true;
+            }
+            g.stroke();
+          }
+        }
+        g.globalAlpha = 1;
+        g.lineWidth = 1;
+        for (const ev of m.turnEvents) {
+          if (ev.t < t0 || ev.t > t1) continue;
+          const c = ev.kind === 'eot' ? col.accent : col.turn;
+          const at = ev.kind === 'eot' ? 0.12 : 0.88;
+          if (ev.who === 'user') mark('turnmodel', ev.t, c, at, 'diamond', 4);
+          else {
+            g.strokeStyle = c;
+            g.beginPath();
+            g.arc(x(ev.t), ly0 + (ly1 - ly0) * at, 3, 0, Math.PI * 2);
+            g.stroke();
+          }
+          hits.push({
+            lane: 'turnmodel',
+            x0: x(ev.t) - 4,
+            x1: x(ev.t) + 4,
+            text: `${ev.who}: ${ev.kind === 'eot' ? 'end of turn' : 'takes the floor'} (p = ${ev.p}), committed ${(ev.arrived - ev.t).toFixed(0)} ms after the audio it is about`,
+            seqs: [ev.seq],
+          });
+        }
       }
 
       // ASR: results on the audio they cover; ticks where they arrived
@@ -844,6 +905,14 @@ export function Dashboard({
     if (best >= 0 && bd < 100) vadAt = `p = ${fr[best].p.toFixed(3)}`;
   }
 
+  let turnAt: string | undefined;
+  if (hover && tipLane === 'turnmodel' && modelRef.current) {
+    const t = currentEnd() - view.span + ((hover.x - LABEL_W) / plotW()) * view.span;
+    let best: (typeof modelRef.current.turnScores)[number] | undefined;
+    for (const f of modelRef.current.turnScores) if (!best || Math.abs(f.t - t) < Math.abs(best.t - t)) best = f;
+    if (best && Math.abs(best.t - t) < 120) turnAt = `user: end of turn ${best.eot[0].toFixed(2)} · take floor ${best.int[0].toFixed(2)}\nagent: end of turn ${best.eot[1].toFixed(2)} · take floor ${best.int[1].toFixed(2)}`;
+  }
+
   return (
     <div className="dashboard">
       <div className="dashboard-bar">
@@ -877,9 +946,10 @@ export function Dashboard({
             {legend}
           </div>
         )}
-        {hover && !legend && (tip || vadAt || cleanAt) && (
+        {hover && !legend && (tip || vadAt || cleanAt || turnAt) && (
           <div className="dashboard-tip" style={{ left: Math.min(hover.x + 12, size.w - 320), top: hover.y + 14 }}>
             {vadAt && <div>{vadAt}</div>}
+            {turnAt && <div>{turnAt}</div>}
             {cleanAt && <div>{cleanAt}</div>}
             {tip && <div>{tip.text}</div>}
             {relInfo && relInfo.up.length > 0 && (

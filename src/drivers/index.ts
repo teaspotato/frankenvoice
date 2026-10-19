@@ -290,6 +290,45 @@ const rnnoise: LiveDriver = (req, sink) => {
   };
 };
 
+/**
+ * The ssl_turn turn-taking model, in a worker. Each send is one 80 ms block: 1280 user samples
+ * then 1280 agent samples (16 kHz). Replies: progress while downloading, `ready` once the
+ * model is compiled, then `frames` with per-frame scores as inference catches up.
+ */
+const turnModel: LiveDriver = (req, sink) => {
+  const r = req as { encoderUrl: string; headUrl: string; frames: number; ep: string };
+  const worker = new Worker(new URL('./turn-model.worker.ts', import.meta.url), { type: 'module' });
+  let closed = false;
+  worker.onmessage = (e: MessageEvent<{ type: string; text?: string }>) => {
+    if (closed) return;
+    if (e.data.type === 'error') {
+      closed = true;
+      worker.terminate();
+      sink.close({ error: e.data.text ?? 'turn model failed' });
+    } else sink.recv(toJson(e.data));
+  };
+  worker.onerror = (e) => {
+    if (closed) return;
+    closed = true;
+    worker.terminate();
+    sink.close({ error: e.message || 'turn model worker failed to start' });
+  };
+  worker.postMessage({ type: 'init', ...r });
+  return {
+    send(_data, bin) {
+      if (closed || !bin) return;
+      const x = new Float32Array(bin.slice().buffer);
+      const a = x.slice(0, x.length / 2);
+      const b = x.slice(x.length / 2);
+      worker.postMessage({ type: 'block', a, b }, [a.buffer, b.buffer]);
+    },
+    close() {
+      closed = true;
+      worker.terminate();
+    },
+  };
+};
+
 /** Built-in speechSynthesis, one utterance per exchange. Closing the exchange cancels speech. */
 const liveUtterances = new Set<SpeechSynthesisUtterance>(); // Chrome drops events of utterances that get garbage collected
 const speechSynthesisDriver: LiveDriver = (req, sink) => {
@@ -391,4 +430,4 @@ const speaker: LiveDriver = (_req, sink, env) => {
   };
 };
 
-export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker };
+export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel };
