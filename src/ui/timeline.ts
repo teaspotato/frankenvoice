@@ -41,7 +41,7 @@ export interface LlmSpan extends Span {
   /** A reply the model gave on its own, to the workers' news (these workers). */
   workers?: string[];
   /** Worker tools it called, when. */
-  tools: { t: number; name: string; text: string; seq: number }[];
+  tools: { t: number; name: string; text: string; seq: number; error?: boolean }[];
 }
 
 /** One tool call a worker made, from start to finish. */
@@ -201,6 +201,14 @@ export class TimelineModel {
   /** Session time of mic peak `i` (peaks are equally spaced in audio time). */
   peakToT(i: number): number {
     return this.sampleToT((i + 0.5) * this.micRate * (PEAK_MS / 1000));
+  }
+
+  /** The first Workers lane row with no bar open at `t`. */
+  private freeRow(t: number): number {
+    const busy = new Set(this.workers.filter((w) => w.t1 === undefined || w.t1 > t).map((w) => w.row));
+    let row = 0;
+    while (busy.has(row)) row++;
+    return row;
   }
 
   private closeHold(at: number, seq: number) {
@@ -411,18 +419,13 @@ export class TimelineModel {
         break;
       case 'llm.tool': {
         const l = this.llm.find((x) => x.rid === d.rid);
-        l?.tools.push({ t: e.t, name: d.name, text: `${d.name}(${JSON.stringify(d.input)})\n→ ${d.result}`, seq: e.seq });
+        l?.tools.push({ t: e.t, name: d.name, text: `${d.name}(${JSON.stringify(d.input)})\n→ ${d.result}`, seq: e.seq, ...(d.error ? { error: true } : {}) });
         l?.seqs.push(e.seq);
         break;
       }
-      case 'worker.started': {
-        // The first row free at this moment.
-        const busy = new Set(this.workers.filter((w) => w.t1 === undefined || w.t1 > e.t).map((w) => w.row));
-        let row = 0;
-        while (busy.has(row)) row++;
-        this.workers.push({ id: d.workerId, t0: e.t, text: d.task ?? '', status: 'starting', row, steps: [], thinking: [], marks: [], seqs: [e.seq] });
+      case 'worker.started':
+        this.workers.push({ id: d.workerId, t0: e.t, text: d.task ?? '', status: 'starting', row: this.freeRow(e.t), steps: [], thinking: [], marks: [], seqs: [e.seq] });
         break;
-      }
       case 'worker.ready':
       case 'worker.thinking':
       case 'worker.text':
@@ -453,11 +456,14 @@ export class TimelineModel {
           if (!d.allowed) w.marks.push({ t: e.t, kind: 'denied', text: `refused: ${d.title} (${d.kind})`, seq: e.seq });
         } else if (d.type === 'worker.progress') w.marks.push({ t: e.t, kind: 'progress', text: d.text ?? '', seq: e.seq });
         else if (d.type === 'worker.steer') {
-          w.marks.push({ t: e.t, kind: 'steer', text: d.text ?? '', seq: e.seq });
           if (d.followUp) {
-            w.status = 'running';
-            w.t1 = undefined;
-          }
+            // A follow-up is a new bar for the same worker, in whichever row is free now.
+            const f: WorkerSpan = { id: w.id, t0: e.t, text: `follow-up: ${d.text ?? ''}`, status: 'running', row: this.freeRow(e.t), steps: [], thinking: [], marks: [], seqs: [e.seq] };
+            this.workers.push(f);
+          } else w.marks.push({ t: e.t, kind: 'steer', text: d.text ?? '', seq: e.seq });
+        } else if (d.type === 'worker.stopped' && w.t1 !== undefined) {
+          // Stopped after it finished: its result stands.
+          w.marks.push({ t: e.t, kind: 'stop', text: 'stopped', seq: e.seq });
         } else {
           w.t1 = e.t;
           w.status = d.type === 'worker.done' ? 'done' : d.type === 'worker.error' ? 'error' : 'stopped';

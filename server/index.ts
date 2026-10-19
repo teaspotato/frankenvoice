@@ -325,17 +325,22 @@ process.on('exit', () => {
     }
   }
 });
-for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => process.exit(130));
+for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]] as const) process.on(sig, () => process.exit(code));
 
 async function acp(client: WebSocket) {
   // The browser starts talking as soon as the socket opens: hold its lines until the agent is up.
   const early: string[] = [];
   let write = (line: string) => void early.push(line);
   client.on('message', (data: Buffer) => write(data.toString('utf8')));
+  // The browser may hang up while the agent is still starting: stop it as soon as there is one.
+  let hungUp = false;
+  let onHangUp = () => void (hungUp = true);
+  client.on('close', () => onHangUp());
   const command = setting('FV_ACP_COMMAND');
   if (!command) return client.close(1011, 'FV_ACP_COMMAND is not set (set it in Settings)');
   const cwd = resolve(setting('FV_ACP_CWD')!);
   await mkdir(cwd, { recursive: true });
+  if (hungUp) return;
   const env: NodeJS.ProcessEnv = { ...process.env };
   const key = keyOf(upstreams.anthropic);
   if (key) env.ANTHROPIC_API_KEY = key;
@@ -361,16 +366,17 @@ async function acp(client: WebSocket) {
   write = (line) => void (child.stdin.writable && child.stdin.write(`${line}\n`));
   for (const line of early.splice(0)) write(line);
   child.on('error', (e) => client.readyState === WebSocket.OPEN && client.close(1011, `could not start the agent: ${String(e)}`.slice(0, 120)));
-  child.on('exit', (code, signal) => {
+  // 'close', not 'exit': it comes after stdout and stderr are drained, so the last lines go out first.
+  child.on('close', (code, signal) => {
     agents.delete(child.pid!);
     if (client.readyState === WebSocket.OPEN) client.close(code === 0 ? 1000 : 1011, `agent exited (${signal ?? code})`);
   });
-  client.on('close', () => {
+  onHangUp = () => {
     if (child.exitCode === null && child.pid) {
       kill('SIGTERM');
       setTimeout(() => child.exitCode === null && kill('SIGKILL'), 3000).unref();
     }
-  });
+  };
 }
 
 // Last resort: one bad request must not stop the proxy, which would drop every connection of a live session.

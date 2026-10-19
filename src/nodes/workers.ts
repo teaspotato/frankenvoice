@@ -16,7 +16,8 @@ type Io = { send(data: Json): void; close(reason?: Json): void; readonly closed:
 interface Worker {
   id: string;
   task: string;
-  status: 'starting' | 'running' | 'done' | 'stopped' | 'error';
+  /** closed: done, and its agent process has ended (idle too long behind newer workers, or it exited). */
+  status: 'starting' | 'running' | 'done' | 'closed' | 'stopped' | 'error';
   io: Io;
   t0: number;
   rpc: number;
@@ -153,20 +154,36 @@ export const workersNode: NodeDef = {
       return e ? `${String(e.message ?? 'error')}${e.data ? `: ${JSON.stringify(e.data)}` : ''}` : null;
     };
 
-    const prompt = (w: Worker, text: string) => {
+    /** A new turn: the text so far belongs to the last one. */
+    const freshTurn = (w: Worker) => {
       w.text = '';
       w.thinking = false;
+    };
+
+    /** Done workers keep their agent process for follow-ups, up to maxWorkers of them: the oldest go first. */
+    const closeIdle = () => {
+      const idle = [...workers.values()].filter((x) => x.status === 'done');
+      for (const w of idle.slice(0, Math.max(0, idle.length - Number(p.maxWorkers)))) {
+        w.status = 'closed';
+        if (!w.io.closed) w.io.close({ status: 'idle' });
+      }
+    };
+
+    const prompt = (w: Worker, text: string) => {
       const id = w.rpc + 1;
       w.prompt = id;
       call(w, 'session/prompt', { sessionId: w.sessionId!, prompt: [{ type: 'text', text }] }, (res) => {
-        // An earlier prompt returns when the agent takes in the next one: only the latest one ends the work.
-        if (w.prompt !== id || w.status !== 'running') return;
+        if (w.status !== 'running') return;
+        // An earlier prompt returns when the agent takes in the next one: what follows answers that one,
+        // and only the latest prompt ends the work.
+        if (w.prompt !== id) return freshTurn(w);
         const err = rpcError(res);
         if (err) return fail(w, err);
         const stopReason = String((res.result as JsonObject | undefined)?.stopReason ?? '');
         if (stopReason === 'refusal') return fail(w, 'the agent declined the task');
         w.status = 'done';
         emit(w, 'worker.done', { text: w.text.trim() || '(no answer)', stopReason, ms: Math.round(ctx.now() - w.t0) });
+        closeIdle();
         count();
       });
     };
@@ -215,8 +232,9 @@ export const workersNode: NodeDef = {
       const allow = p.permissions === 'allow' || (p.permissions === 'read-only' && READ_KINDS.has(kind));
       const pick = allow ? ['allow_once', 'allow_always'] : ['reject_once', 'reject_always'];
       const option = pick.map((k) => options.find((o) => o.kind === k)).find(Boolean);
-      emit(w, 'worker.permission', { title: String(tool.title ?? ''), kind, allowed: allow });
-      respond(w, id, { result: { outcome: option ? { outcome: 'selected', optionId: option.optionId } : { outcome: 'cancelled' } } });
+      emit(w, 'worker.permission', { title: String(tool.title ?? ''), kind, allowed: allow && !!option });
+      if (option) respond(w, id, { result: { outcome: { outcome: 'selected', optionId: option.optionId } } });
+      else respond(w, id, { error: { code: -32602, message: `no ${allow ? 'allow' : 'reject'} option to choose` } });
     };
 
     const update = (w: Worker, u: JsonObject) => {
@@ -231,7 +249,7 @@ export const workersNode: NodeDef = {
           break;
         case 'user_message_chunk':
           // The agent took in our latest message: what it says next answers that.
-          w.text = '';
+          freshTurn(w);
           break;
         case 'tool_call':
           if (w.text.trim()) emit(w, 'worker.text', { text: w.text.trim() });
@@ -249,7 +267,7 @@ export const workersNode: NodeDef = {
     };
 
     const recv = (w: Worker, msg: JsonObject) => {
-      if (w.status === 'stopped' || w.status === 'error') return;
+      if (w.status === 'closed' || w.status === 'stopped' || w.status === 'error') return;
       if (msg.$open) {
         w.cwd = String((msg.$open as JsonObject).cwd ?? '');
         return;
@@ -281,7 +299,8 @@ export const workersNode: NodeDef = {
         {
           onRecv: (d) => recv(w, (d ?? {}) as JsonObject),
           onClose: (d) => {
-            if (w.status === 'stopped' || w.status === 'error') return;
+            if (w.status === 'done') w.status = 'closed';
+            if (w.status === 'closed' || w.status === 'stopped' || w.status === 'error') return;
             const why = (d as JsonObject | null)?.error ?? (d as JsonObject | null)?.reason;
             fail(w, `the agent process ended${why ? ` (${String(why)})` : ''}${w.stderr.length ? `: ${w.stderr.join(' | ')}` : ''}`);
           },
@@ -314,12 +333,18 @@ export const workersNode: NodeDef = {
         } else if (msg.type === 'worker.send') {
           const text = String(msg.message ?? '');
           if (w.status === 'stopped' || w.status === 'error') return void ctx.log('warn', `worker ${id} is ${w.status}`);
+          if (w.status === 'closed') {
+            w.status = 'error';
+            emit(w, 'worker.error', { error: 'session closed', text: `Worker ${id}'s session has ended. Start a new worker, with what it needs to know from this one.` });
+            return count();
+          }
           const followUp = w.status === 'done';
           emit(w, 'worker.steer', { text, followUp });
           if (w.status === 'starting') return void w.queued.push(text);
           if (followUp) {
             w.status = 'running';
             w.t0 = ctx.now();
+            freshTurn(w);
           }
           prompt(w, `Message from the voice assistant: ${text}`);
         }

@@ -268,6 +268,10 @@ describe('workers', () => {
     expect(answer('read-only', 'execute')).toEqual({ outcome: 'selected', optionId: 'no' });
     expect(answer('allow', 'edit')).toEqual({ outcome: 'selected', optionId: 'yes' });
     expect(answer('reject', 'read')).toEqual({ outcome: 'selected', optionId: 'no' });
+    // No option of the kind wanted: an error, not a made-up cancel.
+    const { h, a } = started({ permissions: 'allow' });
+    a.recv({ ...ask('edit'), params: { ...ask('edit').params, options: [{ optionId: 'no', name: 'Reject', kind: 'reject_once' }] } });
+    expect(h.ios[0].sent.find((m) => m.id === 77 && m.error)).toBeTruthy();
   });
 
   it('refuses client methods it did not offer', () => {
@@ -278,21 +282,65 @@ describe('workers', () => {
 
   it('sends a message to a running worker as another prompt, and finishes on the latest one', () => {
     const { h, a } = started();
+    a.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Today is' } });
     h.send(1000, 'workers', { type: 'worker.send', workerId: 'w1', message: 'Tomorrow, not today.' });
+    // The agent finishes the sentence it was on before it takes the message in.
+    a.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' sunny.' } });
     const prompts = h.ios[0].sent.filter((m) => m.method === 'session/prompt');
     expect(prompts).toHaveLength(2);
     expect(JSON.stringify(prompts[1].params)).toContain('Message from the voice assistant: Tomorrow, not today.');
     // The first prompt returns when the agent takes in the second: not done yet.
     a.recv({ jsonrpc: '2.0', id: prompts[0].id!, result: { stopReason: 'end_turn' } });
     expect(h.of('worker.done')).toHaveLength(0);
-    a.update({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Tomorrow' } });
     a.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Tomorrow: rain.' } });
     a.recv({ jsonrpc: '2.0', id: prompts[1].id!, result: { stopReason: 'end_turn' } });
     expect(h.of('worker.done')).toMatchObject([{ text: 'Tomorrow: rain.' }]);
     // A follow-up on a finished worker: same session, running again.
     h.send(2000, 'workers', { type: 'worker.send', workerId: 'w1', message: 'And the day after?' });
     expect(h.of('worker.steer')).toMatchObject([{ followUp: false }, { followUp: true }]);
-    expect(h.ios[0].sent.filter((m) => m.method === 'session/prompt')).toHaveLength(3);
+    const third = h.ios[0].sent.filter((m) => m.method === 'session/prompt');
+    expect(third).toHaveLength(3);
+    a.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Thursday: clear.' } });
+    a.recv({ jsonrpc: '2.0', id: third[2].id!, result: { stopReason: 'end_turn' } });
+    expect(h.of('worker.done')).toMatchObject([{ text: 'Tomorrow: rain.' }, { text: 'Thursday: clear.' }]);
+  });
+
+  it('keeps a finished result when its agent exits, and says so if messaged afterwards', () => {
+    const { h, a } = started();
+    a.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Done.' } });
+    a.ok('session/prompt', { stopReason: 'end_turn' });
+    h.ios[0].h.onClose?.({ code: 1011, error: 'agent exited (1)' });
+    expect(h.of('worker.error')).toHaveLength(0);
+    h.send(100, 'workers', { type: 'worker.send', workerId: 'w1', message: 'more' });
+    expect(h.of('worker.error')).toMatchObject([{ text: expect.stringContaining('session has ended') }]);
+  });
+
+  it('keeps at most maxWorkers finished agents around, closing the oldest', () => {
+    const h = harness(workersNode, { maxWorkers: 1, model: '', effort: '' });
+    for (const id of ['w1', 'w2']) {
+      h.send(0, 'workers', { type: 'worker.start', workerId: id, task: id });
+      const io = h.ios[h.ios.length - 1];
+      const a = agent(io);
+      a.ok('initialize', {});
+      a.ok('session/new', { sessionId: id });
+    }
+    for (const io of h.ios) agent(io).ok('session/prompt', { stopReason: 'end_turn' });
+    expect(h.ios.map((io) => io.closed)).toEqual([true, false]);
+  });
+
+  it('fails on a prompt error or a refusal, and stops cleanly while starting', () => {
+    const { h, a } = started();
+    a.recv({ jsonrpc: '2.0', id: a.req('session/prompt').id!, error: { code: -32603, message: 'Internal error' } });
+    expect(h.of('worker.error')).toMatchObject([{ text: 'Internal error' }]);
+    const r = started();
+    r.a.ok('session/prompt', { stopReason: 'refusal' });
+    expect(r.h.of('worker.error')).toMatchObject([{ text: 'the agent declined the task' }]);
+    const s = harness(workersNode);
+    s.send(0, 'workers', { type: 'worker.start', workerId: 'w1', task: 'x' });
+    s.send(5, 'workers', { type: 'worker.stop', workerId: 'w1' });
+    agent(s.ios[0]).ok('initialize', {});
+    expect(s.ios[0].sent.map((m) => m.method)).toEqual(['initialize']);
+    expect(s.of('worker.stopped')).toHaveLength(1);
   });
 
   it('holds messages that come before the session is ready', () => {

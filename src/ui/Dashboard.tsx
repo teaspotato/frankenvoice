@@ -37,7 +37,7 @@ const LEGEND: Record<string, string> = {
   opener:
     'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
   workers:
-    'Workers the LLM started, each an agent session; workers that overlap get their own row. Bar: the worker from start to its result (green), error (red) or stop (grey); a dark tick where its session was ready, grey ticks where it started reasoning; darker blocks are its tool calls (red: failed). Dots: plan updates (amber), its in-between text (blue), refused permissions (red); diamonds: messages from the LLM. On the LLM lane, a purple diamond is a worker tool call, and a reply labelled "worker news" is one the LLM gave on its own to a result.',
+    'Workers the LLM started, each an agent session; workers that overlap get their own row. Bar: the worker from start to its result (green), error (red) or stop (grey); a dark tick where its session was ready, grey ticks where it started reasoning; darker blocks are its tool calls (red: failed). Dots: plan updates (amber), its in-between text (blue), refused permissions (red); diamonds: messages from the LLM. On the LLM lane, a purple diamond is a worker tool call (red: refused), and a reply labelled "worker news" is one the LLM gave on its own to a result.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
   speaker:
     'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged. Accent boxes: backchannels said while the user talked; small grey dots near the bottom: backchannels held back (hover for why).',
@@ -772,7 +772,7 @@ export function Dashboard({
         if (l.workers) label('worker news', x(l.t0) + 1, x(ft), ly0 + h * 0.23, col.muted);
         hits.push({ lane: 'llm', x0: x(l.t0), x1: x(end), text: `${l.workers ? `on its own, for worker ${l.workers.join(', ')} · ` : ''}${stats}\n${l.text}`, seqs: l.seqs });
         for (const tl of l.tools) {
-          mark('llm', tl.t, col.llm, 0.23, 'diamond', 4);
+          mark('llm', tl.t, tl.error ? col.danger : col.llm, 0.23, 'diamond', 4);
           hits.push({ lane: 'llm', x0: x(tl.t) - 5, x1: x(tl.t) + 5, y0: ly0, y1: ly0 + h * 0.44, text: tl.text, seqs: [tl.seq] });
         }
         let so = '';
@@ -806,7 +806,7 @@ export function Dashboard({
       // Workers: one bar per worker, packed into rows; its tool calls inside, notes as marks
       {
         const [ly0, ly1] = laneY.workers;
-        const rows = Math.max(2, ...m.workers.map((w) => w.row + 1));
+        const rows = Math.max(2, ...m.workers.filter((w) => (w.t1 ?? head) >= t0 && w.t0 <= t1).map((w) => w.row + 1));
         const rh = (ly1 - ly0) / rows;
         for (const w of m.workers) {
           const end = w.t1 ?? head;
@@ -844,7 +844,7 @@ export function Dashboard({
             x1,
             y0,
             y1: y0 + rh,
-            text: `worker ${w.id}, ${w.status}, ${secs} s${ready}: ${w.text}${w.result ? `\n→ ${w.result}` : ''}${steps ? `\n   ${steps}` : ''}`,
+            text: `worker ${w.id}, ${w.status}, ${secs} s${ready}: ${w.text}${w.result && w.status !== 'running' ? `\n→ ${w.result}` : ''}${steps ? `\n   ${steps}` : ''}`,
             seqs: w.seqs,
           });
           for (const st of w.steps) {

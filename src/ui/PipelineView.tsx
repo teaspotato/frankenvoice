@@ -114,8 +114,8 @@ export function PipelineView({
     const [rx, ry] = [POS.llm[0] + W, POS.llm[1] + H / 2];
     const [wx, wy] = POS.workers;
     const gap = (POS.opener[0] - rx) / 2;
-    edges.push({ src: 'llm.workers', d: `M${rx},${ry - 8} L${rx + gap + 8},${ry - 8} L${rx + gap + 8},${wy + H * 0.35} L${wx - 2},${wy + H * 0.35}`, label: 'tasks', lx: rx + gap + 30, ly: wy - 60 });
-    edges.push({ src: 'workers.updates', d: `M${wx},${wy + H * 0.7} L${rx + gap - 8},${wy + H * 0.7} L${rx + gap - 8},${ry + 8} L${rx + 2},${ry + 8}`, label: 'results', lx: rx + gap - 44, ly: wy - 60 });
+    edges.push({ src: 'llm.workers', d: `M${rx},${ry - 8} L${rx + gap + 8},${ry - 8} L${rx + gap + 8},${wy + H * 0.35} L${wx - 2},${wy + H * 0.35}`, label: 'tasks', lx: rx + gap + 30, ly: wy - 40 });
+    edges.push({ src: 'workers.updates', d: `M${wx},${wy + H * 0.7} L${rx + gap - 8},${wy + H * 0.7} L${rx + gap - 8},${ry + 8} L${rx + 2},${ry + 8}`, label: 'results', lx: rx + gap - 44, ly: wy + H * 0.7 - 6 });
   }
   // Playback feedback: up from the output stage, back over the row, down into turn-taking.
   const [ox, oy] = [POS[out][0] + W / 2, POS[out][1]];
