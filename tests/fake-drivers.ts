@@ -187,9 +187,43 @@ const rnnoise: LiveDriver = (_req, sink) => {
   };
 };
 
+/**
+ * Turn model stand-in: ready after a moment, then K = 2 frames per two blocks
+ * (plus frame 0 first), scores from each channel's energy, after a random delay.
+ * End of turn fires when the user goes quiet; take-the-floor stays below threshold.
+ */
+const turnModel: LiveDriver = (req, sink) => {
+  const { frames } = req as { frames: number };
+  let closed = false;
+  let blocks = 0;
+  let t = 1;
+  let pending: { u: number; a: number }[] = [];
+  later(jitter(2, 3), () => !closed && sink.recv({ type: 'ready', ep: 'fake', frames }));
+  const rms = (x: Float32Array) => Math.sqrt(x.reduce((s, v) => s + v * v, 0) / x.length);
+  return {
+    send(_data, bin) {
+      if (!bin || closed) return;
+      const x = new Float32Array(bin.slice().buffer);
+      pending.push({ u: rms(x.subarray(0, x.length / 2)), a: rms(x.subarray(x.length / 2)) });
+      const outs: Json[] = blocks++ === 0 ? [{ t: 0, eot: [0, 0], int: [0, 0], silent: [1, 1], post: [] }] : [];
+      if (pending.length < frames) {
+        if (outs.length) later(jitter(0, 2), () => !closed && sink.recv({ type: 'frames', outs, ms: 1, backlog: 0 }));
+        return;
+      }
+      for (const { u, a } of pending) {
+        const talk = Math.min(1, u * 5);
+        outs.push({ t: t++, eot: [Math.round((1 - talk) * 1000) / 1000, 0.1], int: [Math.round(talk * 150) / 1000, Math.min(1, a * 5)], silent: [1 - talk, 1], post: [] });
+      }
+      pending = [];
+      later(jitter(0, 2), () => !closed && sink.recv({ type: 'frames', outs, ms: 1, backlog: 0 }));
+    },
+    close: () => void (closed = true),
+  };
+};
+
 const speaker: LiveDriver = (_req, sink) => {
   later(1, () => sink.recv({ type: 'ready', outputLatency: 0.02 }));
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker };
+export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel };
