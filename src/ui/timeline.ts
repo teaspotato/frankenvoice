@@ -46,7 +46,7 @@ export interface Draft extends Span {
   why?: string;
 }
 
-/** The fast model's few words of acknowledgement for a reply: spoken first, skipped or cancelled. */
+/** A canned opener picked for the user's words: picked, spoken (said first in a reply) or none. */
 export interface Opener extends Span {
   rid: string;
   status?: string;
@@ -346,19 +346,17 @@ export class TimelineModel {
         this.drafts.push({ rid: d.rid, t0: e.t, text: d.text ?? '', seqs: [e.seq] });
         break;
       case 'llm.opener':
-        this.openers.push({ rid: d.rid, t0: e.t, text: '', seqs: [e.seq] });
+        // The canned line picked for the user's words (or none), and how close the nearest example was.
+        this.openers.push({
+          rid: '',
+          t0: e.t - (d.ms ?? 0),
+          t1: e.t,
+          text: d.line ?? '',
+          status: d.line ? 'picked' : 'none',
+          why: `similarity ${d.score} to "${d.example}" · user: ${d.text}`,
+          seqs: [e.seq],
+        });
         break;
-      case 'llm.opener_end': {
-        const o = this.openers.find((x) => x.rid === d.rid && x.t1 === undefined);
-        if (o) {
-          o.t1 = e.t;
-          o.status = d.status;
-          o.why = d.why;
-          o.text = d.text ?? '';
-          o.seqs.push(e.seq);
-        }
-        break;
-      }
       case 'llm.draft_end': {
         const r = this.drafts.find((x) => x.rid === d.rid);
         if (r) {
@@ -370,6 +368,15 @@ export class TimelineModel {
         break;
       }
       case 'llm.delta': {
+        if (d.opener) {
+          const said = String(d.text ?? '').trim();
+          const o = [...this.openers].reverse().find((x) => x.text === said);
+          if (o) {
+            o.status = 'spoken';
+            o.rid = d.rid;
+            o.seqs.push(e.seq);
+          }
+        }
         const l = this.llm.find((x) => x.rid === d.rid);
         if (l) {
           l.firstToken ??= e.t;

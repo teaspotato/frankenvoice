@@ -31,7 +31,7 @@ const LEGEND: Record<string, string> = {
   asr:
     'Bar: a final transcript, over the audio it covers. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the audio to when its result arrived: the ASR latency.',
   turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), grey dot = backchannel or noise, ignored.',
-  llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a thin bar under a reply is its opener (orange when spoken). Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
+  llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a thin mark under a reply is the canned opener picked for what the user said (orange when spoken). Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
   speaker:
     'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries.',
@@ -707,7 +707,7 @@ export function Dashboard({
         });
       }
 
-      // Openers: the fast model's few words, a thin bar under the reply (solid when spoken)
+      // Openers: a canned line picked for the user's words, a thin mark under the reply (orange when spoken)
       m.openers.forEach((o, i) => {
         const end = o.t1 ?? head;
         if (end < t0 || o.t0 > t1) return;
@@ -728,7 +728,7 @@ export function Dashboard({
           x1,
           y0: ly0 + h * 0.4,
           y1: ly0 + h * 0.5,
-          text: `opener ${o.status ?? 'running…'}${o.why ? ` (${o.why})` : ''} after ${(end - o.t0).toFixed(0)} ms${o.text ? `: ${o.text}` : ''}`,
+          text: `opener ${o.status ?? 'picking…'}${o.text ? `: "${o.text}"` : ''}, picked in ${(end - o.t0).toFixed(0)} ms${o.why ? `\n${o.why}` : ''}`,
           seqs: o.seqs,
         });
       });

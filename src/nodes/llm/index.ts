@@ -3,6 +3,7 @@ import type { Json, JsonObject, Msg } from '../../core/types';
 import { anthropicAdapter } from './anthropic';
 import { openaiCompatAdapter } from './openai';
 import type { ChatTurn, LlmAdapter, LlmStreamParser } from './types';
+import { DEFAULT_OPENER_LINES, parseOpenerLines, pickOpener, type OpenerPick } from './opener';
 
 export const llmAdapters: Record<string, LlmAdapter> = {
   [anthropicAdapter.provider]: anthropicAdapter,
@@ -11,11 +12,6 @@ export const llmAdapters: Record<string, LlmAdapter> = {
 
 const DEFAULT_SYSTEM =
   'You are a voice assistant in a live spoken conversation. Your words are converted to speech, so answer in short, natural spoken sentences. No markdown, lists, or emoji.';
-
-const OPENER_SYSTEM =
-  'You speak the first words of a voice assistant\'s reply in a live spoken conversation, while the full answer is still being worked out. Say only a very short, natural acknowledgement of what the user just said, 2 to 6 words, such as "Yeah, let me see." or "Hmm, good question." Never answer, never state facts, never ask anything. If the message needs no thought (a greeting, thanks, a plain yes or no), output nothing.';
-const OPENER_NOTE =
-  'Your reply may be preceded by a short spoken acknowledgement such as "Hmm, let me see." that you did not write. Do not open with an acknowledgement or filler; start with the substance.';
 
 const anthropic = { provider: ['anthropic'] };
 const openai = { provider: ['openai-compatible'] };
@@ -34,13 +30,12 @@ const openai = { provider: ['openai-compatible'] };
  * ordinary reply (llm.start with `draft`, then its deltas) and the rest
  * streams as usual. Any other turn, a new draft or a drop discards it.
  *
- * With `opener` on, every reply (draft or not) also sends a second, small
- * request to a fast model for a few words of acknowledgement ("Yeah, let me
- * see."). If the opener is complete before the reply's first token, it is
- * emitted first as the reply's opening deltas (flagged `opener`, so TTS speaks
- * it at once) and the reply continues after it; otherwise it is skipped. The
- * main request is told an acknowledgement may precede it, so it doesn't start
- * with one. Both requests are recorded io, so replay is exact.
+ * With the opener on, each reply first gets a canned line ("Hmm, let me
+ * think.") picked locally: the user's words are embedded by a small sentence
+ * encoder (channel `embed`, recorded like any io) and matched against example
+ * turns for each line. The request goes out once the pick is known (a few ms)
+ * and tells the model what was already said; when the reply goes live, the
+ * line is emitted first as `llm.delta` with `opener`, before any token.
  */
 export const llmNode: NodeDef = {
   type: 'llm',
@@ -86,82 +81,136 @@ export const llmNode: NodeDef = {
     { key: 'system', label: 'System prompt', type: 'text', default: DEFAULT_SYSTEM },
     {
       key: 'opener',
-      label: 'Opener while the reply is slow',
-      type: 'boolean',
-      default: true,
-      description: 'A fast model says a few words ("Yeah, let me see.") if they are ready before the reply\'s first token.',
+      label: 'Opener',
+      type: 'select',
+      options: ['canned', 'off'],
+      default: 'canned',
+      description: 'Say a canned line the moment the turn commits, picked locally from the user\'s words; the model is told it was said.',
     },
-    { key: 'openerModel', label: 'Opener model', type: 'string', default: 'claude-haiku-5-5', description: 'Same provider as the reply.' },
-    { key: 'openerSystem', label: 'Opener prompt', type: 'text', default: OPENER_SYSTEM },
+    {
+      key: 'openerLines',
+      label: 'Opener lines',
+      type: 'text',
+      default: DEFAULT_OPENER_LINES,
+      when: { opener: ['canned'] },
+      description: 'line = example | example | … ("-" says nothing). The nearest example by meaning picks the line.',
+    },
+    { key: 'openerMinScore', label: 'Opener min similarity', type: 'number', default: 0.3, when: { opener: ['canned'] } },
+    {
+      key: 'embedModel',
+      label: 'Opener encoder',
+      type: 'string',
+      default: 'Xenova/all-MiniLM-L6-v2',
+      when: { opener: ['canned'] },
+      description: 'Hugging Face repo with onnx/model_quantized.onnx and vocab.txt (BERT-style, mean pooling). Runs in the browser.',
+    },
   ],
   channels: [
     { name: 'anthropic', description: 'Messages API stream (raw SDK stream events)' },
     { name: 'openai', description: 'Chat Completions SSE (parsed data lines)' },
+    { name: 'embed', description: 'Sentence encoder in the browser: texts out, unit vectors back' },
   ],
   requires: (p) => (p.provider === 'openai-compatible' ? [`openai/${String(p.endpoint)}`] : [String(p.provider)]),
   create(ctx) {
     const p = ctx.params as JsonObject;
     const adapter = llmAdapters[p.provider as string];
-    const useOpener = !!p.opener && !!p.openerModel;
-    const reqParams: JsonObject = {
-      ...p,
-      model: (p.model as string) || adapter?.defaultModel || '',
-      ...(useOpener ? { system: `${String(p.system ?? '')}\n\n${OPENER_NOTE}`.trim() } : {}),
-    };
-    const openerParams: JsonObject = {
-      ...p,
-      model: p.openerModel as string,
-      system: p.openerSystem as string,
-      maxTokens: 32,
-      effort: 'low',
-      thinking: 'off',
-      fallbacks: false,
-    };
+    const reqParams: JsonObject = { ...p, model: (p.model as string) || adapter?.defaultModel || '' };
     const history: ChatTurn[] = [];
     let n = 0;
+    type Io = ReturnType<typeof ctx.io.open>;
     type Events = ReturnType<LlmStreamParser['recv']>;
-    let active:
-      | {
-          io: ReturnType<typeof ctx.io.open>;
-          rid: string;
-          turnId?: string;
-          parser: LlmStreamParser;
-          text: string;
-          stopReason: string | null;
-          /** The opener was spoken as the start of this reply. */
-          opened?: boolean;
-        }
-      | undefined;
-    /** The opener request for reply `rid` (a draft's or the active one's). */
-    let opener: { rid: string; io: ReturnType<typeof ctx.io.open>; parser: LlmStreamParser; text: string; done: boolean; t0: number } | undefined;
-    /** A reply started on a draft: its request, and what came back so far, held until the turn is committed. */
-    let draft:
-      | { id: string; rid: string; io: ReturnType<typeof ctx.io.open>; parser: LlmStreamParser; user: ChatTurn; replaces?: string; held: Events; t0: number }
-      | undefined;
+    /**
+     * One reply: started on a draft (not live: its stream is held back) or on a
+     * committed turn (live). The request goes out once the opener is picked.
+     */
+    interface Reply {
+      rid: string;
+      user: ChatTurn;
+      replaces?: string;
+      draftId?: string;
+      turnId?: string;
+      t0: number;
+      live: boolean;
+      io?: Io;
+      parser?: LlmStreamParser;
+      /** undefined until picked; null: no opener. */
+      pick?: OpenerPick | null;
+      held: Events;
+      text: string;
+      stopReason: string | null;
+      /** The opener was said as the start of this reply. */
+      opened?: boolean;
+    }
+    let active: Reply | undefined;
+    let draft: Reply | undefined;
+
+    // Opener: example turns are embedded once at start; each user text once.
+    const useOpener = p.opener === 'canned';
+    const examples = useOpener ? parseOpenerLines(String(p.openerLines ?? '')) : [];
+    let exampleVecs: number[][] | undefined;
+    const picks = new Map<string, OpenerPick | null>();
+    const waiting = new Map<string, ((pick: OpenerPick | null) => void)[]>();
+    const embed = (texts: string[], done: (vecs: number[][] | null) => void) => {
+      let got = false;
+      ctx.io.open(
+        'embed',
+        { model: p.embedModel as string, texts },
+        {
+          onRecv(data) {
+            const v = (data as { vectors?: number[][] } | null)?.vectors;
+            if (got || !v) return;
+            got = true;
+            done(v);
+          },
+          onClose(data) {
+            if (got) return;
+            got = true;
+            if (data && (data as { error?: unknown }).error) ctx.log('warn', 'opener encoder failed', data);
+            done(null);
+          },
+        },
+      );
+    };
+    /** Calls back with the opener for `text`: at once if it is known or can't be known, else when the encoder answers. */
+    const whenPicked = (text: string, go: (pick: OpenerPick | null) => void) => {
+      if (!useOpener || !exampleVecs) return go(null);
+      if (picks.has(text)) return go(picks.get(text)!);
+      const w = waiting.get(text);
+      if (w) return void w.push(go);
+      waiting.set(text, [go]);
+      const t0 = ctx.now();
+      embed([text], (vecs) => {
+        const pick = vecs?.[0] ? pickOpener(vecs[0], examples, exampleVecs!, Number(p.openerMinScore)) : null;
+        picks.set(text, pick);
+        ctx.emit('text', { type: 'llm.opener', text, ...(pick ?? { line: null }), ms: Math.round(ctx.now() - t0) });
+        const cbs = waiting.get(text) ?? [];
+        waiting.delete(text);
+        for (const cb of cbs) cb(pick);
+      });
+    };
+
+    const isCurrent = (r: Reply) => r === active || r === draft;
 
     const finish = (status: 'done' | 'cancelled' | 'error', error?: Json) => {
       if (!active) return;
       const a = active;
       active = undefined;
-      if (!a.io.closed) a.io.close({ status });
+      if (a.io && !a.io.closed) a.io.close({ status });
       // Keep whatever the model produced, so the next request continues from it.
-      // The opener's words aren't in the model's own content blocks, so a reply that began with one is kept as plain text.
-      const native = a.opened ? null : a.parser.native();
+      // The opener isn't in the model's own content blocks, so a reply that began with one is kept as plain text.
+      const native = a.opened || !a.parser ? null : a.parser.native();
       if (a.text || native)
         history.push({ role: 'assistant', text: a.text, turnId: a.turnId, ...(native ? { native: { provider: adapter.provider, content: native } } : {}) });
-      if (opener?.rid === a.rid) endOpener(status === 'done' ? 'skipped' : status);
       ctx.emit('text', { type: 'llm.end', rid: a.rid, status, stopReason: a.stopReason, text: a.text, ...(error ? { error } : {}) });
       ctx.setState('status', status === 'error' ? 'error' : 'idle');
       ctx.setState('turns', history.length);
       if (error) ctx.log('error', 'LLM request failed', error);
     };
 
-    const handle = (events: ReturnType<LlmStreamParser['recv']>) => {
+    const handle = (events: Events) => {
       for (const ev of events) {
         if (!active) return;
         if (ev.type === 'delta') {
-          // The reply is talking: too late for the opener.
-          if (opener?.rid === active.rid) endOpener('skipped', 'reply was first');
           active.text += ev.text;
           ctx.emit('text', { type: 'llm.delta', rid: active.rid, text: ev.text });
         } else if (ev.type === 'end') {
@@ -171,110 +220,92 @@ export const llmNode: NodeDef = {
       }
     };
 
+    /** Say the reply's opener, if it has one: before anything the model wrote. */
+    const speakOpener = (r: Reply) => {
+      const line = r.pick?.line;
+      if (!line || r.opened || r.text) return;
+      r.opened = true;
+      r.text = `${line} `;
+      ctx.emit('text', { type: 'llm.delta', rid: r.rid, text: `${line} `, opener: true });
+    };
+
     /** The history a request for `user` sees: up to the turn it replaces, if any. */
     const historyFor = (user: ChatTurn, replaces?: unknown) => {
       const i = replaces ? history.findIndex((t) => t.role === 'user' && t.turnId === replaces) : -1;
       return [...(i >= 0 ? history.slice(0, i) : history), user];
     };
-    const open = (request: Json) => {
-      const parser = adapter.parser();
-      const io = ctx.io.open(adapter.channel, request, {
-        onRecv(data) {
-          route(io, parser.recv(data));
-        },
-        onClose(data) {
-          route(io, parser.close(data));
-        },
-      });
-      return { io, parser };
-    };
-    const endOpener = (status: string, why?: string) => {
-      if (!opener) return;
-      const o = opener;
-      opener = undefined;
-      if (!o.io.closed) o.io.close({ status: status === 'spoken' ? 'done' : 'cancelled' });
-      ctx.emit('text', { type: 'llm.opener_end', rid: o.rid, status, text: o.text.trim(), ms: Math.round(ctx.now() - o.t0), ...(why ? { why } : {}) });
-    };
-    const startOpener = (rid: string, turns: ChatTurn[]) => {
-      endOpener('cancelled');
-      if (!useOpener) return;
-      let request: Json;
-      try {
-        request = adapter.buildRequest(turns, openerParams);
-      } catch (e) {
-        ctx.log('error', `could not build opener request: ${String(e)}`);
-        return;
-      }
-      const parser = adapter.parser();
-      ctx.emit('text', { type: 'llm.opener', rid });
-      const io = ctx.io.open(adapter.channel, request, {
-        onRecv(data) {
-          openerEvents(io, parser.recv(data));
-        },
-        onClose(data) {
-          openerEvents(io, parser.close(data));
-        },
-      });
-      opener = { rid, io, parser, text: '', done: false, t0: ctx.now() };
-    };
-    const openerEvents = (io: ReturnType<typeof ctx.io.open>, events: Events) => {
-      const o = opener;
-      if (o?.io !== io || o.done) return;
-      for (const ev of events) {
-        if (ev.type === 'delta') o.text += ev.text;
-        else if (ev.type === 'error') return endOpener('error');
-        else {
-          o.done = true;
-          return speakOpener();
+
+    /** Pick the opener, then send the request (told what was already said). */
+    const launch = (r: Reply, turns: ChatTurn[]) => {
+      whenPicked(r.user.text, (pick) => {
+        if (!isCurrent(r) || r.io) return;
+        r.pick = pick;
+        const line = pick?.line;
+        const params = line
+          ? { ...reqParams, system: `${String(reqParams.system ?? '')}\n\nYou have already said aloud: "${line}" Continue your reply from there, without repeating it or opening with another acknowledgement.`.trim() }
+          : reqParams;
+        let request: Json;
+        try {
+          request = adapter.buildRequest(turns, params);
+        } catch (e) {
+          ctx.log('error', `could not build request: ${String(e)}`);
+          if (r === draft) draft = undefined;
+          else if (r === active) finish('error', String(e));
+          return;
         }
-      }
+        const parser = adapter.parser();
+        const io = ctx.io.open(adapter.channel, request, {
+          onRecv(data) {
+            route(r, parser.recv(data));
+          },
+          onClose(data) {
+            route(r, parser.close(data));
+          },
+        });
+        r.io = io;
+        r.parser = parser;
+        if (r.live) speakOpener(r);
+      });
     };
-    /** Say the opener now if it is ready and its reply is live and hasn't said anything yet. */
-    const speakOpener = () => {
-      const o = opener;
-      if (!o?.done || active?.rid !== o.rid) return;
-      const text = o.text.trim();
-      if (!text) return endOpener('skipped', 'nothing to say');
-      if (active.text) return endOpener('skipped', 'reply was first');
-      active.text = `${text} `;
-      active.opened = true;
-      ctx.emit('text', { type: 'llm.delta', rid: active.rid, text: `${text} `, opener: true });
-      endOpener('spoken');
-    };
-    const route = (io: ReturnType<typeof ctx.io.open>, events: Events) => {
-      if (active?.io === io) handle(events);
-      else if (draft?.io === io) draft.held.push(...events);
+    const route = (r: Reply, events: Events) => {
+      if (r === active) handle(events);
+      else if (r === draft) r.held.push(...events);
     };
     const dropDraft = (why: string) => {
       if (!draft) return;
       const d = draft;
       draft = undefined;
-      if (!d.io.closed) d.io.close({ status: 'cancelled' });
-      if (opener?.rid === d.rid) endOpener('cancelled', 'draft dropped');
+      if (d.io && !d.io.closed) d.io.close({ status: 'cancelled' });
       const tokens = d.held.filter((e) => e.type === 'delta').length;
-      ctx.emit('text', { type: 'llm.draft_end', rid: d.rid, draftId: d.id, status: 'dropped', why, chunks: tokens });
-      ctx.log('debug', 'draft dropped', { draftId: d.id, why, chunks: tokens });
+      ctx.emit('text', { type: 'llm.draft_end', rid: d.rid, draftId: d.draftId!, status: 'dropped', why, chunks: tokens });
+      ctx.log('debug', 'draft dropped', { draftId: d.draftId!, why, chunks: tokens });
     };
+    const reply = (user: ChatTurn, extra: Partial<Reply>): Reply => ({ rid: `${ctx.id}-r${n++}`, user, t0: ctx.now(), live: false, held: [], text: '', stopReason: null, ...extra });
     const startDraft = (msg: Msg) => {
       dropDraft('redrafted');
       const user: ChatTurn = { role: 'user', text: msg.text as string };
-      let request: Json;
-      try {
-        request = adapter.buildRequest(historyFor(user, msg.replaces), reqParams);
-      } catch (e) {
-        ctx.log('error', `could not build request: ${String(e)}`);
-        return;
-      }
-      const rid = `${ctx.id}-r${n++}`;
-      ctx.emit('text', { type: 'llm.draft', rid, draftId: msg.draftId as string, text: user.text });
-      draft = { id: msg.draftId as string, rid, ...open(request), user, ...(msg.replaces ? { replaces: msg.replaces as string } : {}), held: [], t0: ctx.now() };
-      startOpener(rid, historyFor(user, msg.replaces));
+      const d = reply(user, { draftId: msg.draftId as string, ...(msg.replaces ? { replaces: msg.replaces as string } : {}) });
+      ctx.emit('text', { type: 'llm.draft', rid: d.rid, draftId: d.draftId!, text: user.text });
+      draft = d;
+      launch(d, historyFor(user, msg.replaces));
     };
 
     if (!adapter) ctx.log('error', `unknown LLM provider "${String(p.provider)}"`);
     ctx.setState('provider', p.provider);
 
     return {
+      start() {
+        if (!useOpener || !examples.length) return;
+        // Tell TTS the lines, so it can have them ready.
+        ctx.emit('text', { type: 'llm.opener_lines', lines: [...new Set(examples.map((e) => e.line).filter((l): l is string => !!l))] });
+        embed(
+          examples.map((e) => e.text),
+          (vecs) => {
+            if (vecs && vecs.length === examples.length) exampleVecs = vecs;
+            ctx.setState('opener', exampleVecs ? 'ready' : 'unavailable');
+          },
+        );
+      },
       onInput(port, msg) {
         if (port === 'control') {
           if (msg.type === 'cancel') {
@@ -288,7 +319,7 @@ export const llmNode: NodeDef = {
           return;
         }
         if (msg.type === 'turn.draft_drop') {
-          if (draft?.id === msg.draftId) dropDraft((msg.why as string) ?? 'dropped');
+          if (draft?.draftId === msg.draftId) dropDraft((msg.why as string) ?? 'dropped');
           return;
         }
         if (msg.type === 'turn.heard') {
@@ -308,40 +339,37 @@ export const llmNode: NodeDef = {
           return;
         }
         finish('cancelled');
-        const kept = msg.draft && draft?.id === msg.draft ? draft : undefined;
+        const kept = msg.draft && draft?.draftId === msg.draft ? draft : undefined;
         if (!kept) dropDraft('turn committed without it');
         if (msg.replaces) {
           // The user wasn't done: this turn replaces an earlier one and whatever followed it.
           const i = history.findIndex((t) => t.role === 'user' && t.turnId === msg.replaces);
           if (i >= 0) history.splice(i);
         }
+        const turnId = msg.turnId as string;
         if (kept) {
           // The draft's words stand: keep its reply. The history records what the request said.
           draft = undefined;
-          history.push({ ...kept.user, turnId: msg.turnId as string });
+          history.push({ ...kept.user, turnId });
           const held = kept.held;
-          ctx.emit('text', { type: 'llm.draft_end', rid: kept.rid, draftId: kept.id, status: 'kept', chunks: held.filter((e) => e.type === 'delta').length });
-          ctx.emit('text', { type: 'llm.start', rid: kept.rid, turnId: (msg.turnId as string) ?? null, draft: kept.id, headStartMs: Math.round(ctx.now() - kept.t0) });
+          kept.held = [];
+          ctx.emit('text', { type: 'llm.draft_end', rid: kept.rid, draftId: kept.draftId!, status: 'kept', chunks: held.filter((e) => e.type === 'delta').length });
+          ctx.emit('text', { type: 'llm.start', rid: kept.rid, turnId: turnId ?? null, draft: kept.draftId!, headStartMs: Math.round(ctx.now() - kept.t0) });
           ctx.setState('status', 'generating');
-          active = { io: kept.io, rid: kept.rid, turnId: msg.turnId as string, parser: kept.parser, text: '', stopReason: null };
+          kept.live = true;
+          kept.turnId = turnId;
+          active = kept;
+          if (kept.io) speakOpener(kept);
           handle(held);
-          speakOpener();
           return;
         }
-        history.push({ role: 'user', text: msg.text as string, turnId: msg.turnId as string });
-
-        const rid = `${ctx.id}-r${n++}`;
-        let request: Json;
-        try {
-          request = adapter.buildRequest(history, reqParams);
-        } catch (e) {
-          ctx.log('error', `could not build request: ${String(e)}`);
-          return;
-        }
-        ctx.emit('text', { type: 'llm.start', rid, turnId: (msg.turnId as string) ?? null });
+        const user: ChatTurn = { role: 'user', text: msg.text as string, turnId };
+        history.push(user);
+        const r = reply(user, { live: true, turnId });
+        ctx.emit('text', { type: 'llm.start', rid: r.rid, turnId: turnId ?? null });
         ctx.setState('status', 'generating');
-        active = { ...open(request), rid, turnId: msg.turnId as string, text: '', stopReason: null };
-        startOpener(rid, [...history]);
+        active = r;
+        launch(r, [...history]);
       },
       stop() {
         dropDraft('stopped');

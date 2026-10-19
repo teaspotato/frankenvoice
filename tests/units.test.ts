@@ -78,7 +78,7 @@ describe('migrateGraph', () => {
     const g = migrateGraph(old);
     expect(g.nodes.map((n) => n.type)).toEqual(['asr', 'llm', 'tts']);
     expect(g.nodes[0].params).toEqual({ provider: 'deepgram', 'deepgram.model': 'nova-2' });
-    expect(g.nodes[1].params).toEqual({ provider: 'anthropic', effort: 'high', model: 'claude-opus-5-5', opener: false, thinking: 'model default' });
+    expect(g.nodes[1].params).toEqual({ provider: 'anthropic', effort: 'high', model: 'claude-opus-5-5', opener: 'off', thinking: 'model default' });
     expect(g.nodes[2].params).toEqual({ provider: 'cartesia', 'cartesia.model': 'sonic-x', minSegmentChars: 5 });
     for (const n of g.nodes) expect(registry[n.type]).toBeDefined();
   });

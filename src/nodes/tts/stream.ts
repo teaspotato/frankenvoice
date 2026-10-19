@@ -76,6 +76,55 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
     let reply: Reply | undefined;
     /** When recent flushes went out, for Deepgram's per-minute limit. */
     let flushes: number[] = [];
+    /** The LLM's canned opener lines, synthesized ahead so they play at once. */
+    const canned = new Map<string, Float32Array[]>();
+
+    const decoder = () => {
+      let rest = new Uint8Array();
+      return (bin: Uint8Array) => {
+        const all = new Uint8Array(rest.length + bin.length);
+        all.set(rest);
+        all.set(bin, rest.length);
+        const usable = all.length - (all.length % 2);
+        rest = all.slice(usable);
+        const view = new DataView(all.buffer, all.byteOffset, usable);
+        const out = new Float32Array(usable / 2);
+        for (let i = 0; i < out.length; i++) out[i] = view.getInt16(i * 2, true) / 0x8000;
+        return out;
+      };
+    };
+
+    /** Synthesize each line once on its own socket; the audio is kept for when the line is said. */
+    const prerender = (lines: string[]) => {
+      const todo = lines.filter((l) => !canned.has(l));
+      if (!todo.length) return;
+      const queue = [...todo];
+      let chunks: Float32Array[] = [];
+      const decode = decoder();
+      const io = ctx.io.open(
+        'deepgram-tts-ws',
+        { path: '/v1/speak', query: { model: p.model, encoding: 'linear16', sample_rate: p.sampleRate } },
+        {
+          onRecv(data: Json, bin) {
+            if (bin) return void chunks.push(decode(bin));
+            if ((data as JsonObject | null)?.type !== 'Flushed') return;
+            const line = queue.shift();
+            if (line) canned.set(line, chunks);
+            chunks = [];
+            if (!queue.length && !io.closed) {
+              io.send({ type: 'Close' });
+              io.close();
+              ctx.setState('canned', canned.size);
+            }
+          },
+        },
+      );
+      for (const line of todo) {
+        flushes.push(ctx.now());
+        io.send({ type: 'Speak', text: line });
+        io.send({ type: 'Flush' });
+      }
+    };
 
     const emitAudio = (r: Reply, s: Seg, samples: Float32Array) => {
       if (!s.started) {
@@ -122,6 +171,17 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
       r.io.send({ type: 'Speak', text });
       r.io.send({ type: 'Flush' });
       ctx.setState('status', 'synthesizing');
+    };
+
+    /** Play a canned line's audio as the reply's next segment, without a request. */
+    const playCanned = (r: Reply, text: string) => {
+      const audio = canned.get(text);
+      if (!audio || r.segs.length) return false;
+      const s: Seg = { seg: r.segNo++, text, started: false };
+      emitAudio(r, s, new Float32Array());
+      for (const a of audio) emitAudio(r, s, a);
+      ctx.emit('audio', { type: 'tts.segment_end', rid: r.rid, seg: s.seg, canned: true });
+      return true;
     };
 
     const start = (rid: string) => {
@@ -191,8 +251,12 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
             cancel();
             start(msg.rid as string);
             break;
+          case 'llm.opener_lines':
+            prerender(msg.lines as string[]);
+            break;
           case 'llm.delta':
             if (!r || r.rid !== msg.rid) return;
+            if (msg.opener && !r.buf && playCanned(r, (msg.text as string).trim())) return;
             r.buf += msg.text as string;
             // An opener is said as soon as it arrives, whatever its punctuation.
             send(r, !!msg.opener);

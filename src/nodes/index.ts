@@ -27,7 +27,11 @@ export const registry: NodeRegistry = Object.fromEntries(
  */
 export function migrateGraph(g: GraphSpec): GraphSpec {
   if (g.formatVersion >= GRAPH_FORMAT_VERSION) return g;
-  const older = (n: NodeSpec) => (g.formatVersion < 3 ? noDrafts(noOpener(n)) : noOpener(n));
+  const older = (n: NodeSpec) => {
+    if (g.formatVersion < 3) n = noDrafts(n);
+    if (g.formatVersion < 4) n = noThinking(n);
+    return noOpener(n);
+  };
   if (g.formatVersion >= 2) return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: g.nodes.map(older) };
   const prefix = (provider: string, params: Record<string, Json>, rename: Record<string, string> = {}) => ({
     provider,
@@ -54,13 +58,14 @@ export function migrateGraph(g: GraphSpec): GraphSpec {
   return { ...g, formatVersion: GRAPH_FORMAT_VERSION, nodes: nodes.map(older) };
 }
 
-/** Before format 4 the LLM had no opener, sent no thinking setting and defaulted to Opus. */
-const noOpener = (n: NodeSpec): NodeSpec => {
+/** Before format 4 the LLM sent no thinking setting and defaulted to Opus. */
+const noThinking = (n: NodeSpec): NodeSpec => {
   if (n.type !== 'llm') return n;
   const p = { ...n.params };
-  p.opener ??= false;
   p.thinking ??= 'model default';
   if ((p.provider ?? 'anthropic') === 'anthropic' && !p.model) p.model = 'claude-opus-5-5';
   return { ...n, params: p };
 };
+/** Before format 5 there was no canned opener (format 4's opener asked an LLM, and is gone). */
+const noOpener = (n: NodeSpec): NodeSpec => (n.type === 'llm' ? { ...n, params: { ...n.params, opener: 'off' } } : n);
 const noDrafts = (n: NodeSpec): NodeSpec => (n.type === 'turn.duplex' && n.params.speculate === undefined ? { ...n, params: { ...n.params, speculate: false } } : n);
