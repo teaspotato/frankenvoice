@@ -44,6 +44,7 @@ let llmPort = 0;
 let livePort = 0;
 const seen = { asr: 0, tts: 0, llm: 0, auth: [] as string[], ttsQueries: [] as string[] };
 const sessions = mkdtempSync(join(tmpdir(), 'fv-sessions-'));
+let cap = 4;
 
 beforeAll(async () => {
   const gpubox = createServer((req, res) => {
@@ -84,6 +85,7 @@ beforeAll(async () => {
           : { headers: {}, missing: 'TYPESAFE_API_KEY is not set' },
     sessionsDir: () => sessions,
     modelsDir: join(sessions, 'models'),
+    maxSessions: () => cap,
     log: () => {},
   });
   const server = createServer();
@@ -168,6 +170,70 @@ describe('the pipeline in the server', () => {
     const { runtime, sim } = prepareReplay(traj, { registry });
     sim.runFast();
     expect(compareTrajectories(traj, runtime.trajectory).identical).toBe(true);
+  }, 20_000);
+
+  it('runs a session per page, up to the cap, and tells every page who is on', async () => {
+    cap = 2;
+    const c = defaultConfig();
+    c.vad.variant = 'energy';
+    c.backchannel.variant = 'off';
+    const start = JSON.stringify({ type: 'start', graph: buildGraph(c) as unknown as Json, env: {}, autosave: true, title: '' });
+    const open = async () => {
+      const ws = new WebSocket(`ws://127.0.0.1:${livePort}/api/live`);
+      const got = { users: [] as Json[], session: 0, full: '', saved: '', plays: 0 };
+      let micTimer: ReturnType<typeof setInterval> | undefined;
+      const saved = new Promise<void>((resolve) =>
+        ws.on('message', (data: Buffer, binary) => {
+          if (binary) {
+            const { header: h } = unframe(new Uint8Array(data));
+            if (h.k === 'speaker' && h.cmd === 'play') got.plays++;
+            return;
+          }
+          const m = JSON.parse(data.toString()) as { type: string; [k: string]: Json };
+          if (m.type === 'users') got.users.push(m);
+          if (m.type === 'session') got.session++;
+          if (m.type === 'full') got.full = m.text as string;
+          if (m.type === 'saved') (got.saved = m.path as string), resolve();
+          if (m.type === 'mic.open') {
+            const { frameSamples } = m.request as { frameSamples: number };
+            ws.send(JSON.stringify({ type: 'mic.ready', label: 'fake', contextSampleRate: 16000, settings: {} }));
+            let n = 0;
+            micTimer = setInterval(() => {
+              const s = new Float32Array(frameSamples);
+              const loud = n % 40 >= 8 && n % 40 < 24;
+              for (let i = 0; i < s.length; i++) s[i] = (Math.random() - 0.5) * (loud ? 0.6 : 0.001);
+              ws.send(frame({ k: 'mic', frame: n++, ctxTime: n * 0.032 }, new Uint8Array(s.buffer)));
+            }, 4);
+          }
+          if (m.type === 'mic.close') clearInterval(micTimer);
+        }),
+      );
+      await new Promise((r) => ws.once('open', r));
+      return { ws, got, saved };
+    };
+    const pages = [await open(), await open(), await open()];
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    pages[0].ws.send(start);
+    pages[1].ws.send(start);
+    await wait(300);
+    pages[2].ws.send(start);
+    await wait(2200);
+    expect(pages.map((p) => p.got.session)).toEqual([1, 1, 0]);
+    expect(pages[2].got.full).toMatch(/full: 2 of 2/);
+    expect(pages[0].got.plays).toBeGreaterThan(0);
+    expect(pages[1].got.plays).toBeGreaterThan(0);
+    for (const p of pages) expect(p.got.users.at(-1)).toEqual({ type: 'users', pages: 3, sessions: 2, max: 2 });
+    pages[0].ws.send(JSON.stringify({ type: 'stop' }));
+    pages[1].ws.send(JSON.stringify({ type: 'stop' }));
+    await Promise.all([pages[0].saved, pages[1].saved]);
+    expect(pages[0].got.saved).not.toBe(pages[1].got.saved);
+    await wait(50);
+    expect(pages[2].got.users.at(-1)).toEqual({ type: 'users', pages: 3, sessions: 0, max: 2 });
+    pages[0].ws.close();
+    await wait(100);
+    expect(pages[2].got.users.at(-1)).toEqual({ type: 'users', pages: 2, sessions: 0, max: 2 });
+    for (const p of pages) p.ws.close();
+    cap = 4;
   }, 20_000);
 
   it('renders a canned line once on the box, in the background, then serves it from the cache', async () => {

@@ -191,6 +191,9 @@ export function App() {
   const nowRef = useRef<() => number>(() => 0);
   const simRef = useRef<SimScheduler | null>(null);
   const clientRef = useRef<LiveClient | null>(null);
+  /** Who else is on the server (from its live socket, opened at load). */
+  const [users, setUsers] = useState<{ pages: number; sessions: number; max: number } | null>(null);
+  const reconnectRef = useRef<() => void>(() => {});
   /** The server run in progress: the session it replays, whether its result is kept, where it stopped. */
   const serverRun = useRef<{ origin?: Session; keep: boolean; stoppedAt?: number } | null>(null);
 
@@ -340,7 +343,14 @@ export function App() {
       setServerSessions((l) => l.map((x) => (x === from ? to : x)));
     },
     notice: (text) => setNotice(text),
+    users: (u) => setUsers(u),
+    full(text) {
+      serverRun.current = null;
+      setNotice(text);
+    },
     closed(reason) {
+      setUsers(null);
+      reconnectRef.current();
       if (!serverRun.current) return;
       serverRun.current = null;
       setRunning(null);
@@ -360,9 +370,33 @@ export function App() {
       saved: (id, p) => h.current.saved(id, p),
       renamed: (f, t, p) => h.current.renamed(f, t, p),
       notice: (t) => h.current.notice(t),
+      users: (u) => h.current.users(u),
+      full: (t) => h.current.full(t),
       closed: (r) => h.current.closed(r),
     }));
   };
+
+  // Connect at load to show who else is on the server; after losing it, try again now and then.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let alive = true;
+    const tryConnect = () =>
+      client()
+        .connect()
+        .catch(() => {
+          if (alive) timer = setTimeout(tryConnect, 5000);
+        });
+    reconnectRef.current = () => {
+      clearTimeout(timer);
+      if (alive) timer = setTimeout(tryConnect, 5000);
+    };
+    tryConnect();
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /** Start a run on the server; `send` asks for it once connected. */
   const runOnServer = async (run: { origin?: Session; keep: boolean }, send: (c: LiveClient) => void) => {
@@ -686,6 +720,14 @@ export function App() {
           </button>
         ) : (
           <span className="ok">server ok</span>
+        )}
+        {users && (
+          <span
+            className={users.sessions >= users.max ? 'warn' : 'muted'}
+            title={`${users.pages} page${users.pages === 1 ? '' : 's'} connected; ${users.sessions} of ${users.max} sessions running on the GPU box`}
+          >
+            {users.pages} user{users.pages === 1 ? '' : 's'} · {users.sessions}/{users.max} live{users.sessions >= users.max ? ' (full)' : ''}
+          </span>
         )}
         <button onClick={() => setShowSettings(true)}>Settings</button>
         <button

@@ -59,6 +59,13 @@ const SETTINGS: SettingDef[] = [
   { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'API key', secret: true },
   { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
   { name: 'FV_SESSIONS_DIR', group: 'Storage', label: 'Sessions folder', default: 'sessions', hint: 'Relative to where the proxy runs' },
+  {
+    name: 'FV_MAX_SESSIONS',
+    group: 'Users',
+    label: 'Live sessions at once',
+    default: '4',
+    hint: 'Pages beyond this are told the box is full. One L4 serves about 4 (Kyutai batches up to KYUTAI_MAX_BATCH replies)',
+  },
 ];
 const SETTING_NAMES = new Set(SETTINGS.map((d) => d.name));
 const SETTINGS_FILE = resolve(process.env.FV_SETTINGS_FILE ?? '.frankenvoice/settings.json');
@@ -302,7 +309,7 @@ const server = createServer((req, res) => {
 });
 
 // The page's socket: mic in, agent audio and the run's trajectory out.
-const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR });
+const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR, maxSessions: () => Number(setting('FV_MAX_SESSIONS')) || 4 });
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');

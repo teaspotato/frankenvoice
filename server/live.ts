@@ -1,6 +1,7 @@
 // The pipeline runs here. A page connects one socket (/api/live, see src/live-protocol.ts): it
 // sends mic frames and controls, and gets the agent's audio to play plus the run's trajectory to
-// show. One page at a time: a page that connects takes over, and a run of the previous page stops.
+// show. Each page has its own run (session, recording, autosave); up to `maxSessions` run at once,
+// and every page is told how many pages are connected and how many sessions run.
 
 import { mkdir, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -23,6 +24,8 @@ export interface LiveOptions {
   modelsDir: string;
   /** Canned lines' audio, rendered once per box (default: tts-cache in modelsDir's folder). */
   cannedDir?: string;
+  /** How many sessions (live or replay) may run at once; more are refused with a `full` message. Default 4. */
+  maxSessions?: () => number;
   log?: (msg: string) => void;
 }
 
@@ -49,14 +52,60 @@ function titleToName(title: string): string {
     .trim();
 }
 
+/** A connected page: its mic and speakers, and the run it started (at most one). */
 class Page {
-  constructor(readonly ws: WebSocket) {}
+  run: Run | null = null;
+  micSink: Delivery | undefined;
+  speakers = new Map<number, Delivery>();
+  private speakerSeq = 0;
+  /** The server's drivers plus this page's mic and speaker. */
+  readonly drivers: DriverRegistry;
+
+  constructor(
+    readonly ws: WebSocket,
+    base: DriverRegistry,
+  ) {
+    this.drivers = { ...base, mic: this.mic, speaker: this.speaker };
+  }
   send(m: Json) {
     if (this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify(m));
   }
   sendBin(h: Header, payload?: Uint8Array) {
     if (this.ws.readyState === this.ws.OPEN) this.ws.send(frame(h, payload), { binary: true });
   }
+  get open() {
+    return this.ws.readyState === this.ws.OPEN;
+  }
+
+  private mic: LiveDriver = (req, sink) => {
+    if (!this.open) {
+      setTimeout(() => sink.close({ error: 'no page connected' }), 0);
+      return { send() {}, close() {} };
+    }
+    this.micSink = sink;
+    this.send({ type: 'mic.open', request: req });
+    return {
+      send() {},
+      close: () => {
+        if (this.micSink === sink) this.micSink = undefined;
+        this.send({ type: 'mic.close' });
+      },
+    };
+  };
+
+  /** Renders the speaker's schedule in the page; each command carries the session clock when sent. */
+  private speaker: LiveDriver = (_req, sink, env) => {
+    const id = ++this.speakerSeq;
+    this.speakers.set(id, sink);
+    setTimeout(() => sink.recv({ type: 'ready' }), 0);
+    return {
+      send: (data, bin) => this.sendBin({ k: 'speaker', id, ...(data as Record<string, Json>), now: env.now(), s: performance.now() }, bin),
+      close: () => {
+        this.speakers.delete(id);
+        this.send({ type: 'speaker.close', id });
+      },
+    };
+  };
 }
 
 interface Run {
@@ -65,39 +114,53 @@ interface Run {
   now(): number;
   autosave: boolean;
   title: string;
+  /** Uses the GPU box (a live session, or a replay with live channels): counts against the cap. */
+  box: boolean;
   /** Stops the run; resolves once it is finished and handed over. */
   stop(): Promise<void>;
   detach(): void;
 }
 
 export class LiveHub {
-  private page: Page | null = null;
-  private run: Run | null = null;
-  private micSink: Delivery | undefined;
-  private speakers = new Map<number, Delivery>();
-  private speakerSeq = 0;
+  private pages = new Set<Page>();
   private drivers: DriverRegistry;
+  private lastUsers = '';
 
   constructor(private o: LiveOptions) {
-    this.drivers = { ...serverDrivers(o.upstreams, { modelsDir: o.modelsDir, cannedDir: o.cannedDir ?? join(o.modelsDir, '..', 'fv-tts-cache') }), mic: this.mic, speaker: this.speaker };
+    this.drivers = serverDrivers(o.upstreams, { modelsDir: o.modelsDir, cannedDir: o.cannedDir ?? join(o.modelsDir, '..', 'fv-tts-cache') });
   }
 
   private log(m: string) {
     (this.o.log ?? console.log)(`[live] ${m}`);
   }
 
-  /** A page connected. */
+  private get maxSessions() {
+    return Math.max(1, Math.floor(this.o.maxSessions?.() ?? 4));
+  }
+
+  /** Runs in progress that use the GPU box (live sessions, replays with live channels). */
+  get sessions() {
+    let n = 0;
+    for (const p of this.pages) if (p.run?.box) n++;
+    return n;
+  }
+
+  /** Who is here, for every page: connected pages, running sessions, and the cap. Sent when it changes (and to `to`). */
+  private broadcastUsers(to?: Page) {
+    const m = { type: 'users', pages: this.pages.size, sessions: this.sessions, max: this.maxSessions };
+    const key = JSON.stringify(m);
+    if (key !== this.lastUsers) {
+      this.lastUsers = key;
+      for (const p of this.pages) p.send(m);
+    } else to?.send(m);
+  }
+
+  /** A page connected. Each page runs its own sessions; pages don't take over each other. */
   handle(ws: WebSocket) {
-    const prev = this.page;
-    const page = new Page(ws);
-    this.page = page;
-    if (prev) {
-      this.log('a new page took over');
-      prev.ws.close(4000, 'another page took over');
-    }
-    void this.run?.stop();
+    const page = new Page(ws, this.drivers);
+    this.pages.add(page);
+    this.broadcastUsers(page);
     ws.on('message', (data: Buffer, binary) => {
-      if (this.page !== page) return;
       try {
         if (binary) this.onBinary(page, unframe(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)));
         else this.onMessage(page, JSON.parse(data.toString('utf8')) as { type: string; [k: string]: Json });
@@ -106,10 +169,10 @@ export class LiveHub {
       }
     });
     ws.on('close', () => {
-      if (this.page !== page) return;
-      this.page = null;
-      // Its mic and speaker are gone: a run can't go on.
-      void this.run?.stop();
+      this.pages.delete(page);
+      // Its mic and speaker are gone: its run can't go on.
+      void page.run?.stop();
+      this.broadcastUsers();
     });
   }
 
@@ -120,60 +183,43 @@ export class LiveHub {
       case 'start':
         return this.startLive(page, m as unknown as { graph: GraphSpec; env?: Record<string, Json>; autosave?: boolean; title?: string });
       case 'stop':
-        return void this.run?.stop();
+        return void page.run?.stop();
       case 'pause':
-        return this.run?.sim?.pause();
+        return page.run?.sim?.pause();
       case 'resume':
-        return this.run?.sim?.resume();
+        return page.run?.sim?.resume();
       case 'mic.ready':
-        return this.micSink?.recv({ type: 'ready', label: m.label ?? null, contextSampleRate: m.contextSampleRate ?? null, settings: m.settings ?? null });
+        return page.micSink?.recv({ type: 'ready', label: m.label ?? null, contextSampleRate: m.contextSampleRate ?? null, settings: m.settings ?? null });
       case 'mic.error':
-        return this.micSink?.close({ error: m.error ?? 'microphone failed' });
+        return page.micSink?.close({ error: m.error ?? 'microphone failed' });
       case 'speaker.late':
-        return this.speakers.get(m.id as number)?.recv({ type: 'late', at: m.at, ms: m.ms });
+        return page.speakers.get(m.id as number)?.recv({ type: 'late', at: m.at, ms: m.ms });
       case 'speaker.gate':
-        return this.speakers.get(m.id as number)?.recv({ type: 'gate', at: m.at, pos: m.pos ?? null, stop: m.stop ?? null, silent: m.silent ?? null });
+        return page.speakers.get(m.id as number)?.recv({ type: 'gate', at: m.at, pos: m.pos ?? null, stop: m.stop ?? null, silent: m.silent ?? null });
     }
   }
 
   private onBinary(page: Page, { header, payload }: { header: Header; payload: Uint8Array }) {
-    if (header.k === 'mic') this.micSink?.recv({ frame: header.frame, ctxTime: header.ctxTime }, payload.slice());
+    if (header.k === 'mic') page.micSink?.recv({ frame: header.frame, ctxTime: header.ctxTime }, payload.slice());
     else if (header.k === 'replay') this.startReplay(page, header, payload);
   }
 
-  // ---- the page's devices -------------------------------------------------------
-
-  private mic: LiveDriver = (req, sink) => {
-    const page = this.page;
-    if (!page) {
-      setTimeout(() => sink.close({ error: 'no page connected' }), 0);
-      return { send() {}, close() {} };
+  /** Whether `page` may start a run; if not, it is told why. */
+  private admit(page: Page, box: boolean): boolean {
+    if (page.run) {
+      page.send({ type: 'notice', text: 'a session is already running' });
+      return false;
     }
-    this.micSink = sink;
-    page.send({ type: 'mic.open', request: req });
-    return {
-      send() {},
-      close: () => {
-        if (this.micSink === sink) this.micSink = undefined;
-        page.send({ type: 'mic.close' });
-      },
-    };
-  };
-
-  /** Renders the speaker's schedule in the page; each command carries the session clock when sent. */
-  private speaker: LiveDriver = (_req, sink, env) => {
-    const id = ++this.speakerSeq;
-    const page = this.page;
-    this.speakers.set(id, sink);
-    setTimeout(() => sink.recv({ type: 'ready' }), 0);
-    return {
-      send: (data, bin) => page?.sendBin({ k: 'speaker', id, ...(data as Record<string, Json>), now: env.now(), s: performance.now() }, bin),
-      close: () => {
-        this.speakers.delete(id);
-        page?.send({ type: 'speaker.close', id });
-      },
-    };
-  };
+    if (!box) return true;
+    const n = this.sessions;
+    const max = this.maxSessions;
+    if (n >= max) {
+      page.send({ type: 'full', sessions: n, max, text: `The GPU box is full: ${n} of ${max} sessions are running. Try again when one ends.` });
+      this.log(`refused a session: ${n} of ${max} running`);
+      return false;
+    }
+    return true;
+  }
 
   // ---- runs -------------------------------------------------------------------
 
@@ -227,7 +273,7 @@ export class LiveHub {
   }
 
   private startLive(page: Page, m: { graph: GraphSpec; env?: Record<string, Json>; autosave?: boolean; title?: string }) {
-    if (this.run) return page.send({ type: 'notice', text: 'a session is already running' });
+    if (!this.admit(page, true)) return;
     let graph: GraphSpec;
     try {
       graph = checkGraph(m.graph);
@@ -239,7 +285,7 @@ export class LiveHub {
       graph,
       registry,
       scheduler,
-      world: new LiveWorld(this.drivers, scheduler),
+      world: new LiveWorld(page.drivers, scheduler),
       mode: 'live',
       env: { ...m.env, server: `node ${process.version}` },
     });
@@ -250,6 +296,7 @@ export class LiveHub {
       now: () => scheduler.now(),
       autosave: m.autosave !== false,
       title: m.title ?? '',
+      box: true,
       detach: s.detach,
       stop: () =>
         (stopping ??= (async () => {
@@ -257,13 +304,15 @@ export class LiveHub {
           await this.finish(page, run);
         })()),
     };
-    this.run = run;
+    page.run = run;
+    this.broadcastUsers();
     this.log(`live session ${rt.trajectory.meta.id} started`);
     rt.start();
   }
 
   private startReplay(page: Page, h: Header, bundle: Uint8Array) {
-    if (this.run) return page.send({ type: 'notice', text: 'a session is already running' });
+    const liveChannels = (h.liveChannels as string[]) ?? [];
+    if (!this.admit(page, liveChannels.length > 0)) return;
     let source: Trajectory;
     try {
       source = decodeBundle(bundle);
@@ -274,8 +323,8 @@ export class LiveHub {
     const { runtime: rt, sim } = prepareReplay(source, {
       registry,
       graph: h.graph ? checkGraph(h.graph as unknown as GraphSpec) : source.meta.graph,
-      drivers: this.drivers,
-      liveChannels: (h.liveChannels as string[]) ?? [],
+      drivers: page.drivers,
+      liveChannels,
       monitorChannels: h.audible ? outputChannels : [],
     });
     const s = this.stream(page, rt, () => sim.now(), () => sim.isPaused);
@@ -291,21 +340,24 @@ export class LiveHub {
       now: () => sim.now(),
       autosave: false,
       title: '',
+      box: liveChannels.length > 0,
       detach: s.detach,
       stop: () => {
         sim.stop();
         return done;
       },
     };
-    this.run = run;
-    this.log(`replay of ${source.meta.id} started (live: ${((h.liveChannels as string[]) ?? []).join(',') || 'none'})`);
+    page.run = run;
+    this.broadcastUsers();
+    this.log(`replay of ${source.meta.id} started (live: ${liveChannels.join(',') || 'none'})`);
   }
 
   /** Hand a stopped run to the page (its full bundle), then save and name it. */
   private async finish(page: Page, run: Run, stoppedAt?: number) {
     run.detach();
-    if (this.run === run) this.run = null;
-    this.micSink = undefined;
+    if (page.run === run) page.run = null;
+    page.micSink = undefined;
+    this.broadcastUsers();
     const traj = run.rt.trajectory;
     const bytes = encodeBundle(traj);
     page.send({ type: 'ended', id: traj.meta.id, ...(stoppedAt !== undefined ? { stoppedAt } : {}) });

@@ -27,6 +27,10 @@
 //   {type:'ended', id, stoppedAt?}             the run stopped; its full bundle follows
 //   bin {k:'bundle'} + session bundle
 //   {type:'saved', id, path} {type:'renamed', from, to, path} {type:'notice', text}
+//   {type:'users', pages, sessions, max}       pages connected, sessions using the GPU box, the cap; on connect and on change
+//   {type:'full', sessions, max, text}         a start (or a replay with live channels) refused: the box runs `max` sessions
+//
+// Each page has its own run; pages don't take over each other.
 
 import type { Json } from './core/types';
 
