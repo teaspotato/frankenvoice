@@ -14,6 +14,8 @@ is in [PROTOCOL.md](PROTOCOL.md); the LLM is plain OpenAI `POST /v1/chat/complet
 | `tts` | `v-tts` (moshi 0.2.13) | 127.0.0.1:8102 | `kyutai_tts.py`: Kyutai streaming generation, one reply at a time |
 | `gateway` | `v-gw` (qwen-asr 0.0.6, FastAPI) | 0.0.0.0:8000 | `server.py`: auth, ASR segmenting/partials/finals, Qwen3-ForcedAligner-0.6B, relays `/v1/tts`, passes `/v1/chat/completions` and `/v1/models` through to `llm` |
 | `tunnel` | none | none | `cloudflared tunnel --url http://localhost:8000` (quick tunnel, random `*.trycloudflare.com`) |
+| `ui` | Node 22 (`$ROOT/node`) | 127.0.0.1:8787 | The Frankenvoice proxy (`server/index.ts`) in hosted mode: serves the built UI from `$ROOT/frankenvoice/dist` behind the gpubox token, and talks to the gateway and llama.cpp over localhost |
+| `ui-tunnel` | none | none | `cloudflared tunnel --url http://localhost:8787` (a second quick tunnel, printed as `UI_URL`) |
 
 Moshi and qwen-asr need different torch/transformers versions, so TTS runs in its own venv and process.
 
@@ -41,15 +43,16 @@ bash gpubox/setup.sh            # install (about 3 min) + start (about 3 min the
 bash gpubox/setup.sh status     # prints GPUBOX_URL and GPUBOX_TOKEN
 ```
 
-Other commands: `setup.sh install | start | stop | restart | status`. `start` only starts what isn't already
+Other commands: `setup.sh install | start | stop | restart | status | ui` (see [Hosted UI](#hosted-ui)). `start` only starts what isn't already
 running. To restart just one process, kill its process group (`kill -- -$(cat $ROOT/tts.pid)`) and run `start` again.
 The tunnel keeps its URL as long as the `tunnel` process lives.
 
 Environment variables: `GPUBOX_ROOT` (venvs, logs, pid files; default `/content` if it exists, else `~/gpubox`),
 `GPUBOX_TOKEN` (default: random, saved in `$ROOT/gpubox.token`), `ASR_MODEL` (`Qwen/Qwen3-ASR-1.7B`, or
 `Qwen/Qwen3-ASR-0.6B`), `ASR_MEM` (0.15), `NO_LLM=1`, `LLM_CTX` (32768, shared by the slots), `LLM_SLOTS` (4),
-`LLM_MTP` (1), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30).
-Logs are in `$ROOT/logs/{asr,llm,tts,gateway,tunnel}.log`. Model files for the LLM are in `$ROOT/models`, llama.cpp
+`LLM_MTP` (1), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
+`NO_UI=1`, `FV_APP` (app archive, default `$ROOT/frankenvoice.tar.gz`).
+Logs are in `$ROOT/logs/{asr,llm,tts,gateway,tunnel,ui,ui-tunnel}.log`. Model files for the LLM are in `$ROOT/models`, llama.cpp
 in `$ROOT/llama.cpp`.
 
 ### Colab
@@ -67,6 +70,37 @@ the driver's `libcuda` through Colab's `LD_LIBRARY_PATH` (`/usr/lib64-nvidia`), 
 `ControlMaster`) is more reliable for long jobs. Don't use `pkill -f`
 there, because it can match your own shell; kill by pid. The VM (and so the tunnel URL) goes away when the
 runtime is recycled.
+
+## Hosted UI
+
+`setup.sh` can also serve the Frankenvoice web UI from the box, so the whole thing is one https URL and the
+proxy reaches ASR, TTS and the LLM over localhost (no keys or tunnels on your laptop).
+
+1. Upload the app (the repo is private, so the box can't clone it):
+   `git archive --format=tar.gz -o frankenvoice.tar.gz HEAD`, then
+   `colab --auth=oauth2 upload -s gpubox frankenvoice.tar.gz /content/frankenvoice.tar.gz` (or `scp` over the
+   `colab ssh` connection). A `dist/` inside the archive is used as is; otherwise the box builds it.
+2. `bash /content/gpubox/setup.sh ui` installs Node 22 and pnpm if missing (into `$ROOT/node`), unpacks the archive
+   to `$ROOT/frankenvoice` (keeping `node_modules`), runs `pnpm install` and `pnpm build`, and starts only `ui` and
+   `ui-tunnel` (about 15 s). A full `setup.sh` / `start` does the same when the archive is there, and `stop` stops
+   them too. To pick up a new archive, kill `ui` (`kill -- -$(cat $ROOT/ui.pid)`) and run `setup.sh ui` again;
+   `ui-tunnel` and its URL stay.
+3. `setup.sh status` prints `UI_URL`. Open **`UI_URL/?token=<GPUBOX_TOKEN>`** once: the proxy sets an HttpOnly cookie
+   (30 days) and redirects to `UI_URL/`. Without it every page and API call gets 403. Anyone with the token can
+   change settings, including the worker command, so treat it like a password.
+
+Preset from the environment (shown as `env` in Settings):
+
+| Setting | Value |
+|---|---|
+| `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` | `ws://127.0.0.1:8000` and the gpubox token: the GPU box ASR/TTS stages work as is |
+| `OPENAI_COMPAT_BASE_URL` | `http://127.0.0.1:8103/v1` (llama.cpp directly; it needs no key): pick the custom OpenAI-compatible provider with model `gemma-4-12b-it` |
+| `FV_SESSIONS_DIR` | `$ROOT/fv-sessions` |
+
+Other keys (Anthropic, TypeSafe, Deepgram, Cartesia, ...) are entered in the UI's Settings on the box and saved in
+`$ROOT/fv-settings.json` (mode 600), which overrides the environment. The token itself is never written to the
+app folder or the settings file; `setup.sh` reads it from `$ROOT/gpubox.token` and passes it in the environment.
+`NO_UI=1` skips all of this. Log: `$ROOT/logs/ui.log`, install log `$ROOT/logs/install-ui.log`.
 
 ## Point Frankenvoice at it
 

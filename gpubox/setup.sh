@@ -3,7 +3,8 @@
 # + a chat LLM (Gemma 4 12B QAT Q4_0 on llama.cpp) behind one authenticated gateway on :8000,
 # exposed through a cloudflared quick tunnel.
 #
-# usage: bash setup.sh [all|install|start|stop|status]     (default: all = install + start)
+# usage: bash setup.sh [all|install|start|stop|restart|status|ui]   (default: all = install + start)
+#        ui = (re)install the app from FV_APP and start only the ui + ui-tunnel processes
 # Run from the directory holding server.py / kyutai_tts.py, or set GPUBOX_SRC.
 # Tested on a Colab L4 (Ubuntu 22.04, CUDA 12/13 driver). Needs ~22 GB GPU memory (~13 GB with NO_LLM=1).
 #
@@ -16,6 +17,9 @@
 #   NO_LLM=1      skip the LLM;  LLM_CTX (32768 tokens, shared by the slots), LLM_SLOTS (4), LLM_MTP (1 = MTP
 #                 speculative decoding on)
 #   NO_TUNNEL=1   skip cloudflared
+#   NO_UI=1       skip the hosted Frankenvoice UI (proxy on :8787 + its own tunnel). The app comes from
+#                 FV_APP (default $ROOT/frankenvoice.tar.gz, a `git archive` of the repo, optionally with a
+#                 built dist/), unpacked to $ROOT/frankenvoice.
 set -u
 SRC=${GPUBOX_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 if [ -z "${GPUBOX_ROOT:-}" ]; then [ -d /content ] && GPUBOX_ROOT=/content || GPUBOX_ROOT=$HOME/gpubox; fi
@@ -25,7 +29,10 @@ export HF_HUB_DISABLE_PROGRESS_BARS=1
 ASR_MODEL=${ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}
 ALIGN_MODEL=Qwen/Qwen3-ForcedAligner-0.6B
 TTS_REPO=kyutai/tts-1.6b-en_fr
-ASR_PORT=8101; TTS_PORT=8102; LLM_PORT=8103; GW_PORT=8000
+ASR_PORT=8101; TTS_PORT=8102; LLM_PORT=8103; GW_PORT=8000; UI_PORT=8787
+NODE_VERSION=v22.22.0
+FV_APP=${FV_APP:-$ROOT/frankenvoice.tar.gz}
+APP=$ROOT/frankenvoice
 ASR_MEM=${ASR_MEM:-0.15}
 LLAMA_CPP=b11753                                   # llama.cpp release (prebuilt CUDA binaries)
 LLM_REPO=google/gemma-4-12B-it-qat-q4_0-gguf       # official QAT Q4_0 GGUF, with the audio/vision projector
@@ -52,6 +59,7 @@ install() {
     chmod +x "$ROOT/cloudflared"
   fi
   install_llama
+  install_ui || return 1
   log "installing venvs (asr: sglang-omni, gw: gateway + forced aligner, tts: moshi) in parallel"
   venv asr --prerelease=allow sglang-omni==0.1.8 > "$ROOT/logs/install-asr.log" 2>&1 &
   local a=$!
@@ -91,6 +99,41 @@ install_llama() {  # prebuilt llama.cpp (server + CUDA runtime libs); a few seco
   log "llama.cpp $LLAMA_CPP (CUDA $cu) in $d"
 }
 
+install_ui() {  # Node 22 + pnpm, then the app from $FV_APP: pnpm install, and pnpm build unless dist/ came with it
+  [ -n "${NO_UI:-}" ] && return 0
+  [ -f "$FV_APP" ] || { log "no $FV_APP: skipping the UI (upload a git archive of the repo there)"; return 0; }
+  export PATH=$ROOT/node/bin:$PATH
+  if ! node -v 2>/dev/null | grep -q '^v2[2-9]'; then
+    mkdir -p "$ROOT/node"
+    curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-x64.tar.xz" | tar xJ -C "$ROOT/node" --strip-components=1
+    log "node $(node -v) in $ROOT/node"
+  fi
+  command -v pnpm >/dev/null || npm install -g --silent pnpm@10.28.0 > "$ROOT/logs/install-ui.log" 2>&1
+  mkdir -p "$APP"; rm -rf "$APP/dist"         # keep node_modules; dist is rebuilt or comes from the archive
+  tar xzf "$FV_APP" -C "$APP"
+  log "installing the UI in $APP"
+  (cd "$APP" && CI=1 pnpm install --frozen-lockfile && { [ -f dist/index.html ] || pnpm build; }) >> "$ROOT/logs/install-ui.log" 2>&1 \
+    || { log "ui install failed"; tail -20 "$ROOT/logs/install-ui.log"; return 1; }
+  log "ui installed"
+}
+
+start_ui() {  # the Frankenvoice proxy, serving the built UI behind the gpubox token, plus its own quick tunnel
+  [ -n "${NO_UI:-}" ] && return 0
+  [ -f "$APP/dist/index.html" ] || { log "no $APP/dist: run install (or ui) first"; return 0; }
+  local TOKEN; TOKEN=$(cat "$ROOT/gpubox.token")
+  local llm=; [ -z "${NO_LLM:-}" ] && llm=http://127.0.0.1:$LLM_PORT/v1
+  # Settings preset from the environment; anything entered in the UI's Settings wins and is saved to fv-settings.json.
+  alive ui || (cd "$APP" && PATH=$ROOT/node/bin:$PATH FV_PROXY_PORT=$UI_PORT FV_STATIC_DIR=dist FV_HOST_TOKEN=$TOKEN \
+      FV_SETTINGS_FILE=$ROOT/fv-settings.json FV_SESSIONS_DIR=$ROOT/fv-sessions \
+      GPUBOX_BASE_URL=ws://127.0.0.1:$GW_PORT GPUBOX_TOKEN=$TOKEN OPENAI_COMPAT_BASE_URL=$llm \
+      spawn ui node_modules/.bin/tsx server/index.ts)
+  wait_http ui "http://127.0.0.1:$UI_PORT/index.html?token=$TOKEN" 60 || return 1
+  if [ -z "${NO_TUNNEL:-}" ] && ! alive ui-tunnel; then
+    spawn ui-tunnel "$ROOT/cloudflared" tunnel --no-autoupdate --url http://localhost:$UI_PORT
+    for _ in $(seq 1 60); do grep -qo 'https://[a-z0-9-]*\.trycloudflare\.com' "$ROOT/logs/ui-tunnel.log" && break; sleep 1; done
+  fi
+}
+
 spawn() {  # spawn NAME cmd... : detached, own session, pid in $ROOT/NAME.pid
   local n=$1; shift
   setsid nohup "$@" > "$ROOT/logs/$n.log" 2>&1 < /dev/null &
@@ -110,7 +153,7 @@ wait_http() {  # wait_http NAME URL TIMEOUT_S
 }
 
 stop() {
-  for n in tunnel gateway tts llm asr; do
+  for n in ui-tunnel ui tunnel gateway tts llm asr; do
     if alive $n; then
       local p; p=$(cat "$ROOT/$n.pid")
       kill -TERM -- "-$p" 2>/dev/null || kill "$p"   # whole process group (setsid)
@@ -150,15 +193,20 @@ start() {
     spawn tunnel "$ROOT/cloudflared" tunnel --no-autoupdate --url http://localhost:$GW_PORT
     for _ in $(seq 1 60); do grep -qo 'https://[a-z0-9-]*\.trycloudflare\.com' "$ROOT/logs/tunnel.log" && break; sleep 1; done
   fi
+  start_ui
   status
 }
 
 status() {
-  for n in asr llm tts gateway tunnel; do alive $n && echo "$n: up (pid $(cat "$ROOT/$n.pid"))" || echo "$n: down"; done
+  for n in asr llm tts gateway tunnel ui ui-tunnel; do alive $n && echo "$n: up (pid $(cat "$ROOT/$n.pid"))" || echo "$n: down"; done
   local url; url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$ROOT/logs/tunnel.log" 2>/dev/null | head -1)
   echo "GPUBOX_URL=${url:-http://localhost:$GW_PORT}"
   echo "GPUBOX_TOKEN=$(cat "$ROOT/gpubox.token" 2>/dev/null)"
   [ -n "$url" ] && echo "$url" > "$ROOT/gpubox.url"
+  if [ -z "${NO_UI:-}" ]; then
+    local ui; ui=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$ROOT/logs/ui-tunnel.log" 2>/dev/null | head -1)
+    echo "UI_URL=${ui:-http://localhost:$UI_PORT}   (open once as UI_URL/?token=GPUBOX_TOKEN)"
+  fi
 }
 
 case "${1:-all}" in
@@ -167,6 +215,7 @@ case "${1:-all}" in
   stop) stop ;;
   restart) stop; start ;;
   status) status ;;
+  ui) install_ui && start_ui && status ;;
   all) install && start ;;
-  *) echo "usage: $0 [all|install|start|stop|restart|status]"; exit 2 ;;
+  *) echo "usage: $0 [all|install|start|stop|restart|status|ui]"; exit 2 ;;
 esac
