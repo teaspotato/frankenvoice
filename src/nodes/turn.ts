@@ -105,6 +105,9 @@ interface DuplexParams {
   asides: boolean;
   classifyWaitMs: number;
   eotCheck: string;
+  eotSilenceMs: number;
+  eotResumeGapMs: number;
+  eotResumeMs: number;
   eotYield: number;
   eotHoldMs: number;
   eotOptions: string;
@@ -161,6 +164,11 @@ type Candidate = {
   /** The page stopped the agent on its own VAD: waiting for the VAD here to hear the speech too. */
   gate?: TimerHandle;
 };
+
+/** Media samples per ms (16 kHz). */
+const SR_MS = 16;
+/** The VAD's hangover, for speech ends that don't say how long they waited. */
+const VAD_HANGOVER_MS = 320;
 
 /** How long before the VAD's speech end a held end of turn still counts (the VAD's hangover and some). */
 const EOT_HOLD_MS = 600;
@@ -421,10 +429,36 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       key: 'eotCheck',
       label: 'Done or pausing?',
       type: 'select',
-      options: ['typesafe', 'off'],
+      options: ['typesafe', 'vad-rules', 'off'],
       default: 'typesafe',
       description:
-        'Without the turn model, ASR endpointing ends the turn at the first pause. typesafe: TypeSafe Choice reads the words when the user pauses; unless it thinks they are handing the turn over, the commit waits for more silence (a draft still starts, so the reply is ready).',
+        'Without the turn model, ASR endpointing ends the turn at the first pause. typesafe: TypeSafe Choice reads the words when the user pauses; unless it thinks they are handing the turn over, the commit waits for more silence (a draft still starts, so the reply is ready). vad-rules: ignore ASR endpointing and end the turn on the VAD alone, with turn-1-mini’s single-channel rules: a fixed silence, where a short sound (a laugh, a "yeah") doesn’t restart the count.',
+    },
+    {
+      key: 'eotSilenceMs',
+      label: 'Commit after silence (ms)',
+      type: 'number',
+      default: 800,
+      description:
+        'Silence after the user’s speech stops (timed from its real end, before the VAD’s hangover) that ends their turn. turn-1-mini never commits before 600 ms.',
+      when: { eotCheck: ['vad-rules'] },
+    },
+    {
+      key: 'eotResumeGapMs',
+      label: 'Resume gap that continues the turn (ms)',
+      type: 'number',
+      default: 200,
+      description: 'Speech that starts again within this long of stopping cancels the end of turn at once (the VAD’s hangover usually bridges such gaps already).',
+      when: { eotCheck: ['vad-rules'] },
+    },
+    {
+      key: 'eotResumeMs',
+      label: 'Resumed speech that continues the turn (ms)',
+      type: 'number',
+      default: 500,
+      description:
+        'Later speech cancels the end of turn only once it lasts this long; shorter sounds (a laugh, a "yeah") leave it open, and if its silence ran out meanwhile the turn ends when they stop.',
+      when: { eotCheck: ['vad-rules'] },
     },
     {
       key: 'eotYield',
@@ -492,6 +526,34 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     /** TypeSafe's p(done) for the words at a pause, by their key: undefined while it answers, null if it failed. */
     const eotAnswers = new Map<string, number | null | undefined>();
     const eotOpts = p.eotCheck === 'typesafe' ? parseChoiceOptions(String(p.eotOptions)) : [];
+    /**
+     * vad-rules: an end of turn opened when the user's speech stopped (`stop`: its real end, on the session
+     * clock; `at`: in media samples). `resumed`: the user is making a sound that hasn't lasted `eotResumeMs`
+     * yet; `due`: the silence ran out during it, so the turn ends when it stops.
+     */
+    let vadEot: { stop: number; at: number; timer?: TimerHandle; resumed?: TimerHandle; due?: boolean } | null = null;
+    const vadRules = () => p.eotCheck === 'vad-rules' && !useModel();
+    const closeVadEot = (why: string | null) => {
+      const v = vadEot;
+      if (!v) return;
+      v.timer?.clear();
+      v.resumed?.clear();
+      vadEot = null;
+      if (why) ctx.emit('turn', { type: 'turn.eot_rule', event: 'cancel', why });
+    };
+    /** vad-rules: the silence ran out, so the user's turn is over (once ASR has the words). */
+    const vadEotDue = () => {
+      const v = vadEot;
+      if (!v || state !== 'listening') return closeVadEot(null);
+      if (v.resumed) {
+        v.due = true;
+        return;
+      }
+      const ms = Math.round(ctx.now() - v.stop);
+      closeVadEot(null);
+      ctx.emit('turn', { type: 'turn.eot_rule', event: 'commit', silenceMs: ms });
+      endOfTurn(`VAD rules: ${ms} ms of silence`);
+    };
     /** The rules ended the turn but TypeSafe thinks the user is going on: commit after more silence. */
     let eotHold: { why: string; key: string; timer: TimerHandle } | null = null;
     /** The turn model is loaded and scoring. */
@@ -700,6 +762,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     /** Commit the turn. `tail`: its last words are an ASR partial whose final may still come. */
     const commit = (why: string, tail?: Partial_, extra: Record<string, Json> = {}) => {
       heldFinal = false;
+      closeVadEot(null);
       eotWait?.timer.clear();
       eotWait = null;
       eotHold?.timer.clear();
@@ -782,6 +845,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
      * goes out in the pause, so the reply is ready if it does commit.
      */
     const endpoint = (why: string) => {
+      // vad-rules: the VAD's silence ends the turn, not ASR endpointing; the words only refresh the draft.
+      if (vadRules() && !backoff) return maybeDraft(why);
       const text = parts.join(' ').trim();
       if (!eotOn() || !text || state !== 'listening' || backoff) return commit(why);
       const key = draftKey(text);
@@ -1087,6 +1152,16 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         if (msg.type === 'vad.speech_start') {
           ctx.setState('userSpeaking', true);
           speaking = true;
+          if (vadEot) {
+            const v = vadEot;
+            const gap = ((msg.at as number) - v.at) / SR_MS;
+            if (gap <= p.eotResumeGapMs) closeVadEot(`speech again after ${Math.round(gap)} ms`);
+            else {
+              ctx.emit('turn', { type: 'turn.eot_rule', event: 'resume', gapMs: Math.round(gap) });
+              v.resumed?.clear();
+              v.resumed = ctx.setTimer(p.eotResumeMs, () => vadEot === v && closeVadEot(`speech went on for ${p.eotResumeMs} ms`), 'eot-resume');
+            }
+          }
           caughtUp = false;
           eotHeld = null;
           silence?.clear();
@@ -1122,6 +1197,19 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         } else if (msg.type === 'vad.speech_end') {
           ctx.setState('userSpeaking', false);
           speaking = false;
+          if (vadEot?.resumed) {
+            // A short sound in the silence: the end of turn stays open, timed from the first stop.
+            vadEot.resumed.clear();
+            vadEot.resumed = undefined;
+            if (vadEot.due) vadEotDue();
+          } else if (vadRules() && state === 'listening') {
+            closeVadEot(null);
+            const heard = typeof msg.silentMs === 'number' ? msg.silentMs : VAD_HANGOVER_MS;
+            const v: NonNullable<typeof vadEot> = { stop: ctx.now() - heard, at: msg.at as number };
+            vadEot = v;
+            ctx.emit('turn', { type: 'turn.eot_rule', event: 'open', at: v.at });
+            v.timer = ctx.setTimer(Math.max(0, p.eotSilenceMs - heard), vadEotDue, 'eot-silence');
+          }
           // A partial from before the silence usually lacks the last words: wait for ASR to catch up.
           caughtUp = !partial;
           if (state === 'listening') {

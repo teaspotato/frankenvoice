@@ -64,7 +64,8 @@ class Segmenter {
       if (this.silenceFrames >= redemption) {
         this.speaking = false;
         this.ctx.setState('speaking', false);
-        this.ctx.emit('vad', { type: 'vad.speech_end', track, at: this.silenceStart, from: this.candidateStart, p });
+        // silentMs: the silence already heard when this is sent (the hangover), so listeners can time from the speech's real end.
+        this.ctx.emit('vad', { type: 'vad.speech_end', track, at: this.silenceStart, from: this.candidateStart, p, silentMs: this.silenceFrames * this.frameMs });
         this.candidateStart = -1;
         this.speechFrames = 0;
         this.silenceFrames = 0;

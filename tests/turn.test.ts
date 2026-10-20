@@ -605,3 +605,77 @@ describe('TypeSafe done-or-pausing check (rules endpointing)', () => {
     expect(h.last('turn.user')?.text).toBe('For real.');
   });
 });
+
+describe('VAD rules end of turn (turn-1-mini, single channel)', () => {
+  /** Speech from `from` to `stop` (its real end), reported after the VAD's `hang` ms of hangover. */
+  const speech = (h: ReturnType<typeof harness>, from: number, stop: number, hang = 320) => {
+    h.send(from, 'vad', { type: 'vad.speech_start', at: from * h.sr });
+    h.send(stop + hang, 'vad', { type: 'vad.speech_end', at: stop * h.sr, silentMs: hang });
+  };
+  const rules = (params: Record<string, unknown> = {}) => harness({ useModel: false, eotCheck: 'vad-rules', speculate: false, ...params });
+  const events = (h: ReturnType<typeof harness>) => h.out.filter((o) => o.msg.type === 'turn.eot_rule').map((o) => o.msg.event);
+
+  it('ends the turn after the silence, timed from the real end of speech, not on ASR endpointing', () => {
+    const h = rules();
+    speech(h, 1000, 2000);
+    h.user(2400, 'I was thinking about dub.');
+    expect(h.last('turn.user')).toBeUndefined();
+    h.advance(2799);
+    expect(h.last('turn.user')).toBeUndefined();
+    h.advance(2800);
+    expect(h.last('turn.user')?.text).toBe('I was thinking about dub.');
+    expect(h.last('turn.eot_rule')).toMatchObject({ event: 'commit', silenceMs: 800 });
+  });
+
+  it("lets a short sound pass without restarting the count, and commits when it stops if the silence ran out", () => {
+    const h = rules();
+    speech(h, 1000, 2000);
+    h.user(2400, 'Lee Perry, basically.');
+    h.send(2500, 'vad', { type: 'vad.speech_start', at: 2450 * h.sr }); // a laugh, 450 ms after the stop
+    h.advance(2850);
+    expect(h.last('turn.user')).toBeUndefined(); // due at 2800, but they are still making the sound
+    h.send(2900, 'vad', { type: 'vad.speech_end', at: 2880 * h.sr, silentMs: 20 });
+    expect(h.last('turn.user')?.text).toBe('Lee Perry, basically.');
+    expect(events(h)).toEqual(['open', 'resume', 'commit']);
+  });
+
+  it('keeps the turn open when the user goes on for long enough, then times from the next stop', () => {
+    const h = rules();
+    speech(h, 1000, 2000);
+    h.user(2400, 'And the thing is');
+    h.send(2500, 'vad', { type: 'vad.speech_start', at: 2450 * h.sr });
+    h.advance(3000);
+    expect(h.last('turn.eot_rule')).toMatchObject({ event: 'cancel' });
+    h.advance(3500);
+    expect(h.last('turn.user')).toBeUndefined();
+    h.send(4000, 'vad', { type: 'vad.speech_end', at: 3680 * h.sr, silentMs: 320 });
+    h.user(4100, 'he built the studio himself.');
+    h.advance(4479);
+    expect(h.last('turn.user')).toBeUndefined();
+    h.advance(4480);
+    expect(h.last('turn.user')?.text).toBe('And the thing is he built the studio himself.');
+  });
+
+  it('cancels at once on speech within the resume gap', () => {
+    const h = rules();
+    speech(h, 1000, 2000, 100);
+    h.user(2100, 'So');
+    h.send(2150, 'vad', { type: 'vad.speech_start', at: 2150 * h.sr });
+    expect(h.last('turn.eot_rule')).toMatchObject({ event: 'cancel' });
+    h.send(2400, 'vad', { type: 'vad.speech_end', at: 2300 * h.sr, silentMs: 100 });
+    h.advance(3099);
+    expect(h.last('turn.user')).toBeUndefined();
+    h.advance(3100);
+    expect(h.last('turn.user')?.text).toBe('So');
+  });
+
+  it('waits for the ASR final when the silence runs out first', () => {
+    const h = rules();
+    speech(h, 1000, 2000);
+    h.send(2300, 'transcript', { type: 'asr.partial', text: 'Where was', start: 1000 * h.sr, end: 1900 * h.sr });
+    h.advance(2800);
+    expect(h.last('turn.user')).toBeUndefined();
+    h.send(2900, 'transcript', { type: 'asr.final', text: 'Where was it recorded?', start: 1000 * h.sr, end: 2000 * h.sr, speechFinal: true, fromFinalize: true });
+    expect(h.last('turn.user')?.text).toBe('Where was it recorded?');
+  });
+});
