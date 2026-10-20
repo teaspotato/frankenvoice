@@ -142,6 +142,16 @@ describe('speaker pause and resume', () => {
     expect(paused.from).toBe(flush.at + 90);
   });
 
+  it('fades out instead when too little of the sound is left to sustain', () => {
+    const s = speaker();
+    s.play(0, 0, speech());
+    s.control(260, { type: 'pause' }); // 40 ms before the quiet point
+    const flush = s.sent.at(-1) as { cmd: string; at: number; releaseMs: number; sampleRate?: number };
+    expect(flush.sampleRate).toBeUndefined();
+    expect(flush.at).toBeGreaterThanOrEqual(295);
+    expect(flush.releaseMs).toBe(40);
+  });
+
   it('fades out over the release when there is no tail', () => {
     const s = speaker({ tailMs: 0 });
     s.play(0, 0, speech());

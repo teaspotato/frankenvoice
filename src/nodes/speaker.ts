@@ -171,7 +171,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
     const cutPoint = (at: number) => {
       const a = spanOf(queued, at - HISTORY_MS, at + p.maxFinishMs + 50);
       // Nothing sounding at the cut (between words, or out of audio): stop right there.
-      if (!a || level(a, at, at + 10) < 1e-3) return { stop: at, release: 0, from: at };
+      if (!a || level(a, at, at + 10) < 1e-3) return { stop: at, release: 0, from: at, voiced: false };
       const stop = p.cutoff === 'syllable' ? soundEnd(a, at, p.maxFinishMs) : at;
       let from = stop;
       if (p.resumeFrom === 'word') {
@@ -181,7 +181,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
         const est = w && here.pos < w.end + 0.08 * a.sampleRate ? timeOf(here.track, w.start) : undefined;
         if (est !== undefined) from = wordStart(a, at, HISTORY_MS, est);
       }
-      return { stop, release: Math.max(0, p.releaseMs), from: Math.min(from, stop) };
+      return { stop, release: p.cutoff === 'hard' ? 0 : Math.max(0, p.releaseMs), from: Math.min(from, stop), voiced: true };
     };
 
     const send = (c: Chunk) => {
@@ -218,20 +218,23 @@ export const speakerNode: NodeDef<SpeakerParams> = {
      * from just before `stop`, where the tail takes over. Returns when the sound ends, and `echo`,
      * which cuts the echo reference to match.
      */
-    const flushAt = (cut: { stop: number; release: number }) => {
+    const flushAt = (cut: { stop: number; release: number; voiced: boolean }) => {
       const now = ctx.now();
-      const voiced = cut.release > 0;
-      // The tail can only take over from audio that hasn't played yet.
+      // The tail can only take over from audio that hasn't played yet, and needs enough of it: else
+      // it would sustain whatever comes after the quiet point.
       const t0 = Math.max(now + 5, cut.stop - TAIL_SEG_MS);
-      const a = voiced && p.cutoff === 'syllable' && p.tailMs > 0 ? spanOf(queued, t0, Math.max(cut.stop, t0 + MIN_SEG_MS)) : null;
+      const a = cut.voiced && p.cutoff === 'syllable' && p.tailMs > 0 && cut.stop - t0 >= MIN_SEG_MS ? spanOf(queued, t0, cut.stop) : null;
       if (a) {
         const samples = sustain(a.samples, a.sampleRate, p.tailMs);
         const src = posAt(a.at);
-        io?.send({ cmd: 'flush', at: a.at, sampleRate: a.sampleRate }, { bin: bytesFromF32(samples), logBin: false });
+        // `stop` and `releaseMs`: the driver's fallback when it can't play the tail.
+        io?.send({ cmd: 'flush', at: a.at, stop: cut.stop, releaseMs: cut.release, sampleRate: a.sampleRate }, { bin: bytesFromF32(samples), logBin: false });
         const silent = a.at + (samples.length / a.sampleRate) * 1000;
         const echo = () => {
           flushPlayed(a.at);
-          if (src) ctx.emit('played', { type: 'audio', track: src.track, start: src.pos, end: src.pos + samples.length, sampleRate: a.sampleRate, samples, at: a.at });
+          const track = src?.track ?? queued[0]?.track ?? 'audio';
+          const start = src?.pos ?? 0;
+          ctx.emit('played', { type: 'audio', track, start, end: start + samples.length, sampleRate: a.sampleRate, samples, at: a.at });
         };
         return { silent, echo };
       }

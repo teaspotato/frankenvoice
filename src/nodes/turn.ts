@@ -863,8 +863,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           segStarts.push(msg.at as number);
           scheduleAside();
         } else if (msg.type === 'playback.paused') {
-          // The sentences still to come are announced again, with their new times, on resume.
-          segStarts = segStarts.filter((t) => t < (msg.at as number));
+          // The sentences still to come (from where it resumes) are announced again, with their new times, on resume.
+          segStarts = segStarts.filter((t) => t < ((msg.from ?? msg.at) as number));
           if (aside?.timer) {
             aside.timer.clear();
             aside.timer = undefined;
