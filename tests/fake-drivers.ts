@@ -164,6 +164,19 @@ const acp: LiveDriver = (_req, sink) => {
   };
 };
 
+/** TypeSafe Choice: picks the first option that isn't "-", about a millisecond later. */
+const typesafe: LiveDriver = (req, sink) => {
+  const criteria = (req as { body: { questions: { pick: { criteria: Record<string, string> } } } }).body.questions.pick.criteria;
+  const choice = Object.keys(criteria).find((k) => k !== '-') ?? '-';
+  let closed = false;
+  later(jitter(0.5, 1), () => {
+    if (closed) return;
+    sink.recv({ answers: { pick: { type: 'choice', choice, confidence: 0.95, probabilities: { [choice]: 0.95 } } } });
+    sink.close();
+  });
+  return { send() {}, close: () => void (closed = true) };
+};
+
 const openai: LiveDriver = (req, sink) => {
   const r = req as { body: { messages: unknown[] } };
   const tokens = `Compat reply ${r.body.messages.length}. Short and sweet!`.match(/\S+\s*/g)!;
@@ -289,4 +302,4 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp };
+export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp, typesafe };

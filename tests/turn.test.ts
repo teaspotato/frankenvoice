@@ -1,17 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { duplexTurnNode } from '../src/nodes/turn';
 import { heardText } from '../src/nodes/speaker';
-import { resolveParams, type NodeContext } from '../src/core/node';
-import type { Msg } from '../src/core/types';
+import { resolveParams, type IOHandlers, type NodeContext } from '../src/core/node';
+import type { Json, Msg } from '../src/core/types';
 
 /** Drives one node by hand: a manual clock, timers, and a list of what it emitted. */
 function harness(params: Record<string, unknown> = {}) {
   let now = 0;
   const timers: { at: number; fn: () => void; live: boolean }[] = [];
   const out: { port: string; msg: Msg }[] = [];
+  const ios: { request: Json; h: IOHandlers }[] = [];
   const ctx: NodeContext = {
     id: 'turn',
-    params: resolveParams(duplexTurnNode, { overlap: 'legacy', ...params } as never),
+    params: resolveParams(duplexTurnNode, { overlap: 'legacy', eotCheck: 'off', ...params } as never),
     now: () => now,
     cause: undefined,
     emit: (port, msg) => (out.push({ port, msg }), out.length),
@@ -23,8 +24,9 @@ function harness(params: Record<string, unknown> = {}) {
       return { clear: () => void (t.live = false) };
     },
     io: {
-      open: () => {
-        throw new Error('no io');
+      open(_channel, request, h) {
+        ios.push({ request, h });
+        return { xid: String(ios.length), send() {}, close() {}, closed: false };
       },
     },
     media: {
@@ -53,7 +55,7 @@ function harness(params: Record<string, unknown> = {}) {
   /** The last message of a type. */
   const last = (type: string) => out.filter((o) => o.msg.type === type).at(-1)?.msg;
   const states = () => out.filter((o) => o.msg.type === 'turn.transition').map((o) => o.msg.to);
-  return { send, user, advance, out, decisions, last, states, sr };
+  return { send, user, advance, out, decisions, last, states, sr, ios };
 }
 
 describe('full-duplex turn-taking', () => {
@@ -341,28 +343,32 @@ describe('speech over the agent, classified by its words', () => {
     expect(h.decisions()).toEqual(['candidate', 'interrupt']);
   });
 
-  it('holds an aside until the sentence ends, then stops there and answers it', () => {
+  it('stops at once on an aside and answers it, keeping the reply up to where the aside started', () => {
     const h = speaking();
     over(h, 2000, 2700, 'The blue one.');
     expect(h.decisions()).toEqual(['candidate', 'aside']);
-    expect(controls(h)).toEqual(['pause', 'resume']);
-    h.advance(3990);
-    expect(controls(h)).toEqual(['pause', 'resume']); // still mid-sentence
-    h.advance(4000);
-    expect(controls(h)).toEqual(['pause', 'resume', 'cancel']);
-    h.send(4010, 'playback', { type: 'playback.interrupted', heard: 'Tokyo is big.' });
-    expect(h.out.filter((o) => o.msg.type === 'turn.heard').at(-1)?.msg).toEqual({ type: 'turn.heard', turnId: 'turn-u0', text: 'Tokyo is big.' });
+    // No resume: the paused reply is cancelled, cut back to what was heard before the aside.
+    expect(controls(h)).toEqual(['pause', 'cancel']);
+    expect(h.out.filter((o) => o.msg.type === 'cancel').at(-1)?.msg).toEqual({ type: 'cancel', heardAt: 2000 });
+    h.send(2860, 'playback', { type: 'playback.interrupted', heard: 'Tokyo is' });
+    expect(h.out.filter((o) => o.msg.type === 'turn.heard').at(-1)?.msg).toEqual({ type: 'turn.heard', turnId: 'turn-u0', text: 'Tokyo is' });
     expect(h.last('turn.user')).toMatchObject({ text: 'The blue one.', aside: true });
     expect(h.states().slice(-3)).toEqual(['speaking', 'listening', 'thinking']);
   });
 
-  it('answers an aside when the reply ends before the next sentence', () => {
-    const h = speaking();
+  it('answers an aside even when the speaker reports nothing playing', () => {
+    const h = speaking({});
     over(h, 7500, 8000, 'And Kyoto too.');
     expect(h.decisions()).toEqual(['candidate', 'aside']);
-    h.send(9000, 'playback', { type: 'playback.end', rid: 'r0' });
-    expect(controls(h)).toEqual(['pause', 'resume']);
+    expect(controls(h)).toEqual(['cancel']);
+    h.advance(8500);
     expect(h.last('turn.user')).toMatchObject({ text: 'And Kyoto too.', aside: true });
+  });
+
+  it('treats "I hear that" as a backchannel', () => {
+    const h = speaking();
+    over(h, 2000, 2600, 'I hear that.');
+    expect(h.decisions()).toEqual(['candidate', 'backchannel']);
   });
 
   it('takes the floor when the speech goes on, whatever the words', () => {
@@ -397,15 +403,6 @@ describe('speech over the agent, classified by its words', () => {
     expect(h.decisions()).toEqual(['candidate', 'interrupt']);
   });
 
-  it('includes a held aside when the user then takes the floor', () => {
-    const h = speaking();
-    over(h, 2000, 2600, 'The blue one.');
-    over(h, 3000, 3300, 'Actually wait');
-    expect(h.decisions()).toEqual(['candidate', 'aside', 'candidate', 'interrupt']);
-    h.user(4500, 'make it red', true);
-    expect(h.last('turn.user')?.text).toBe('The blue one. Actually wait make it red');
-  });
-
   it('keeps the old rules for speech over the agent while it is still thinking', () => {
     const h = harness({ overlap: 'classify' });
     h.user(1000, 'how about');
@@ -414,18 +411,6 @@ describe('speech over the agent, classified by its words', () => {
     h.advance(1700);
     expect(h.decisions()).toEqual(['candidate', 'continue']);
     expect(controls(h)).toEqual(['cancel']);
-  });
-
-  it('holds the aside for the sentence after a pause, announced with its new time', () => {
-    const h = speaking();
-    over(h, 2000, 2700, 'The blue one.');
-    // The speaker paused at 2000 and resumed at 2850: the sentence at 4000 now starts at 4850.
-    h.send(2850, 'playback', { type: 'playback.paused', rid: 'r0', at: 2000 });
-    h.send(2850, 'playback', { type: 'playback.segment', rid: 'r0', seg: 1, at: 4850 });
-    h.advance(4500);
-    expect(controls(h)).toEqual(['pause', 'resume']);
-    h.advance(4850);
-    expect(controls(h)).toEqual(['pause', 'resume', 'cancel']);
   });
 
   it('ducks instead with onset: duck, and talks on with onset: none', () => {
@@ -510,5 +495,84 @@ describe('backing off after repeated interruptions', () => {
     h.send(7000, 'vad', { type: 'vad.speech_start', at: 7000 * sr });
     h.send(7300, 'transcript', { type: 'asr.partial', text: 'wait', start: 7000 * sr, end: 7300 * sr });
     expect(h.decisions()).not.toContain('backoff');
+  });
+});
+
+describe('TypeSafe done-or-pausing check (rules endpointing)', () => {
+  const answer = (pDone: number) => ({ answers: { pick: { choice: pDone >= 0.5 ? 'yield' : '-', confidence: Math.max(pDone, 1 - pDone), probabilities: { yield: pDone, '-': 1 - pDone } } } });
+  const pause = (h: ReturnType<typeof harness>, from: number, to: number) => {
+    h.send(from, 'vad', { type: 'vad.speech_start', at: from * h.sr });
+    h.send(to, 'vad', { type: 'vad.speech_end', at: to * h.sr });
+  };
+  const why = (h: ReturnType<typeof harness>) => h.out.filter((o) => o.msg.type === 'turn.transition').at(-1)?.msg.why as string;
+
+  it('holds a turn TypeSafe thinks is not done for more silence', () => {
+    const h = harness({ useModel: false, eotCheck: 'typesafe', eotHoldMs: 1500 });
+    pause(h, 1000, 2000);
+    expect(h.ios).toHaveLength(0); // no words yet: nothing to ask
+    h.user(2200, 'Exactly.');
+    expect(h.ios).toHaveLength(1);
+    expect((h.ios[0].request as { body: { state: string } }).body.state).toBe('Exactly.');
+    h.advance(2400);
+    h.ios[0].h.onRecv?.(answer(0.2), undefined);
+    expect(h.last('turn.eot_check')).toMatchObject({ p: 0.2, hold: true });
+    h.advance(3600);
+    expect(h.last('turn.user')).toBeUndefined();
+    h.advance(3700);
+    expect(h.last('turn.user')?.text).toBe('Exactly.');
+    expect(why(h)).toContain('1500 ms more silence');
+  });
+
+  it('lets the user go on, then commits it all', () => {
+    const h = harness({ useModel: false, eotCheck: 'typesafe' });
+    pause(h, 1000, 2000);
+    h.user(2200, 'Exactly.');
+    h.ios[0].h.onRecv?.(answer(0.1), undefined);
+    pause(h, 2800, 4000);
+    h.advance(4100); // the hold ran out while they talked: it was cancelled
+    expect(h.last('turn.user')).toBeUndefined();
+    h.user(4200, 'The dub was the point.');
+    expect(h.ios).toHaveLength(2);
+    h.ios[1].h.onRecv?.(answer(0.9), undefined);
+    expect(h.last('turn.user')?.text).toBe('Exactly. The dub was the point.');
+    expect(why(h)).toContain('p(done)=0.9');
+  });
+
+  it('commits at once when TypeSafe thinks the user is done, or fails', () => {
+    const h = harness({ useModel: false, eotCheck: 'typesafe' });
+    pause(h, 1000, 2000);
+    h.user(2200, 'What do you think about it?');
+    expect(h.last('turn.user')).toBeUndefined();
+    h.ios[0].h.onRecv?.(answer(0.8), undefined);
+    expect(h.last('turn.user')?.text).toBe('What do you think about it?');
+
+    const f = harness({ useModel: false, eotCheck: 'typesafe' });
+    pause(f, 1000, 2000);
+    f.user(2200, 'And then');
+    f.ios[0].h.onClose?.({ error: 'down' });
+    expect(f.last('turn.user')?.text).toBe('And then');
+    expect(f.last('turn.eot_check')).toMatchObject({ failed: true });
+  });
+
+  it('asks ahead at the pause, so the commit needs no new request', () => {
+    const h = harness({ useModel: false, eotCheck: 'typesafe' });
+    h.send(1000, 'vad', { type: 'vad.speech_start', at: 1000 * h.sr });
+    h.send(1800, 'transcript', { type: 'asr.final', text: 'Who produced it?', start: 1000 * h.sr, end: 1800 * h.sr, speechFinal: false });
+    h.send(2000, 'vad', { type: 'vad.speech_end', at: 2000 * h.sr });
+    expect(h.ios).toHaveLength(1);
+    h.ios[0].h.onRecv?.(answer(0.95), undefined);
+    h.send(2300, 'transcript', { type: 'asr.final', text: '', start: 1800 * h.sr, end: 2000 * h.sr, speechFinal: true, fromFinalize: true });
+    expect(h.ios).toHaveLength(1);
+    expect(h.last('turn.user')?.text).toBe('Who produced it?');
+  });
+
+  it('keeps counting from the first endpoint when an utterance end follows', () => {
+    const h = harness({ useModel: false, eotCheck: 'typesafe', eotHoldMs: 1500 });
+    pause(h, 1000, 2000);
+    h.user(2200, 'For real.');
+    h.ios[0].h.onRecv?.(answer(0.3), undefined);
+    h.send(3000, 'transcript', { type: 'asr.utterance_end' });
+    h.advance(3700);
+    expect(h.last('turn.user')?.text).toBe('For real.');
   });
 });

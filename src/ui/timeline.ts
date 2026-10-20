@@ -36,6 +36,8 @@ export interface LlmSpan extends Span {
   chunks: { t: number; text: string; seq: number }[];
   /** The reply was started early on a draft of the user's words, this long before the turn was committed. */
   headStartMs?: number;
+  /** The reply is an early interjection: a check the LLM wanted to cut in on, kept. */
+  interject?: boolean;
   /** When the model's first reasoning arrived. */
   thinkingAt?: number;
   /** A reply the model gave on its own, to the workers' news (these workers). */
@@ -77,6 +79,22 @@ export interface Draft extends Span {
   /** kept (became the reply) or dropped. */
   status?: string;
   why?: string;
+}
+
+/** An "interrupt?" check with the LLM on the user's words so far: from the request to its end. */
+export interface InterjectCheck extends Span {
+  checkId: string;
+  rid: string;
+  verdict?: string;
+  verdictAt?: number;
+  /** What the LLM would cut in with. */
+  say?: string;
+  /** pass, kept, dropped or error. */
+  status?: string;
+  why?: string;
+  /** When the interjection was handed to turn-taking, and whether it took the floor. */
+  takeAt?: number;
+  taken?: boolean;
 }
 
 /** A filler the opener stage said while the model was thinking: from the reply's start to when it was said. */
@@ -143,9 +161,14 @@ export class TimelineModel {
   userTurns: (Marker & { a0?: number; a1?: number; replaces?: string })[] = [];
   /** User speech over the agent and what turn-taking made of it. */
   bargeIns: { t0: number; t1?: number; decision?: string; why?: string; text: string; seqs: number[] }[] = [];
+  /** TypeSafe on whether the user is done at a pause (rules endpointing): p(done), and whether the commit was held. */
+  eotChecks: (Marker & { p?: number; hold?: boolean; failed?: boolean; ms: number })[] = [];
   llm: LlmSpan[] = [];
   drafts: Draft[] = [];
   openers: Opener[] = [];
+  /** TypeSafe's answers on whether the user's words so far end on something complete. */
+  interjectGates: (Marker & { go: boolean; failed?: boolean; confidence?: number; ms: number })[] = [];
+  interjectChecks: InterjectCheck[] = [];
   workers: WorkerSpan[] = [];
   ttsRequests: { t: number; seq: number }[] = [];
   tts: (Span & { rid: string; seg: number })[] = [];
@@ -414,6 +437,7 @@ export class TimelineModel {
           tools: [],
           seqs: [e.seq],
           ...(typeof d.headStartMs === 'number' ? { headStartMs: d.headStartMs } : {}),
+          ...(d.interject ? { interject: true } : {}),
           ...(Array.isArray(d.workers) ? { workers: d.workers } : {}),
         });
         break;
@@ -471,6 +495,34 @@ export class TimelineModel {
           for (const s of w.steps) s.t1 ??= e.t;
           if (d.type === 'worker.stopped') w.marks.push({ t: e.t, kind: 'stop', text: 'stopped', seq: e.seq });
         }
+        break;
+      }
+      case 'turn.eot_check':
+        this.eotChecks.push({ t: e.t, text: d.text ?? '', seq: e.seq, ms: d.ms ?? 0, ...(d.failed ? { failed: true } : { p: d.p, hold: !!d.hold }) });
+        break;
+      case 'interject.gate':
+        this.interjectGates.push({ t: e.t, text: d.text ?? '', seq: e.seq, go: !!d.go, ms: d.ms ?? 0, ...(d.failed ? { failed: true } : { confidence: d.confidence }) });
+        break;
+      case 'llm.check':
+        this.interjectChecks.push({ checkId: d.checkId, rid: d.rid, t0: e.t, text: d.text ?? '', seqs: [e.seq] });
+        break;
+      case 'llm.check_verdict':
+      case 'llm.check_end':
+      case 'interject.take':
+      case 'turn.interject': {
+        const c = [...this.interjectChecks].reverse().find((x) => x.checkId === d.checkId);
+        if (!c) break;
+        c.seqs.push(e.seq);
+        if (d.type === 'llm.check_verdict') {
+          c.verdict = d.verdict;
+          c.verdictAt = e.t;
+          if (d.verdict === 'interject') c.say = d.text;
+        } else if (d.type === 'llm.check_end') {
+          c.t1 = e.t;
+          c.status = d.status;
+          c.why = d.why;
+        } else if (d.type === 'interject.take') c.takeAt = e.t;
+        else c.taken = !!d.taken;
         break;
       }
       case 'llm.draft':

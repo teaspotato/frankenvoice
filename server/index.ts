@@ -48,8 +48,8 @@ const SETTINGS: SettingDef[] = [
   { name: 'CARTESIA_API_KEY', group: 'Cartesia (TTS)', label: 'API key', secret: true },
   { name: 'CARTESIA_BASE_URL', group: 'Cartesia (TTS)', label: 'Base URL', default: 'https://api.cartesia.ai' },
   { name: 'CARTESIA_VERSION', group: 'Cartesia (TTS)', label: 'API version', default: '2025-04-16' },
-  { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener, backchannels)', label: 'API key', secret: true },
-  { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener, backchannels)', label: 'Base URL', default: 'https://api.typesafe.ai' },
+  { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'API key', secret: true },
+  { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
   {
     name: 'FV_ACP_COMMAND',
     group: 'Workers (ACP agent)',

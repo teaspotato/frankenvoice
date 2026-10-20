@@ -353,7 +353,9 @@ export const speakerNode: NodeDef<SpeakerParams> = {
             const flushed = cut ? flushAt(cut) : null;
             const at = flushed ? flushed.silent : Math.max(ctx.now(), silentAt);
             if (cut) silentAt = at;
-            const heard = heardText(segs.get(rid) ?? [], cut ? cut.stop : clock());
+            // `heardAt`: keep the reply only up to then (where the user's aside over it started).
+            const until = cut ? cut.stop : clock();
+            const heard = heardText(segs.get(rid) ?? [], typeof msg.heardAt === 'number' ? Math.min(msg.heardAt, until) : until);
             endTimer?.clear();
             endTimer = undefined;
             playing = false;

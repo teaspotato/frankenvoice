@@ -12,7 +12,7 @@ function harness(def: NodeDef, params: Record<string, unknown> = {}) {
   const ios: { request: Json; h: IOHandlers; closed: boolean; sent: Json[] }[] = [];
   const ctx: NodeContext = {
     id: def.type === 'llm' ? 'llm' : def.type === 'asr' ? 'asr' : 'turn',
-    params: resolveParams(def, params as never),
+    params: resolveParams(def, (def === duplexTurnNode ? { eotCheck: 'off', ...params } : params) as never),
     now: () => now,
     cause: undefined,
     emit: (port, msg) => (out.push({ port, msg }), out.length),

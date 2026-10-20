@@ -125,6 +125,22 @@ describe('record and replay', () => {
     expect(runtime.trajectory.events).toEqual(run.events);
   }, 10_000);
 
+  it('runs early interjection (TypeSafe gate, LLM check, take) and replays it exactly', async () => {
+    const c = defaultConfig();
+    c.interject.variant = 'typesafe';
+    // From the first word, so the gate runs before the fake session's first turn is committed.
+    c.interject.params.typesafe = { minWords: 1 };
+    const run = await recordLive(2500, performance, buildGraph(c));
+    const types = run.events.filter((e) => e.kind === 'msg').map((e) => (e.data as { type: string }).type);
+    // Whether a check gets as far as a take depends on the fake session's timing; the gate always runs.
+    for (const t of ['turn.words', 'interject.gate']) expect(types).toContain(t);
+    expect(count(run, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
+    const { runtime, sim } = prepareReplay(decodeBundle(encodeBundle(run)), { registry });
+    sim.runFast();
+    expect(count(runtime.trajectory, (e) => e.kind === 'io.diverge')).toBe(0);
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 15_000);
+
   it('swaps TTS to Deepgram Aura (16-bit PCM) and replays it exactly', async () => {
     const g = testGraph();
     g.nodes.find((n) => n.id === 'tts')!.params = { provider: 'deepgram' };

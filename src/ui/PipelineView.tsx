@@ -20,6 +20,7 @@ const POS: Record<StageId, [number, number]> = {
   turnmodel: [410, 88],
   asr: [410, 166],
   turn: [610, 88],
+  interject: [610, 206],
   backchannel: [810, 206],
   llm: [810, 88],
   opener: [1010, 88],
@@ -109,6 +110,19 @@ export function PipelineView({
     ...(stages.some((s) => s.id === 'backchannel') ? [link('turn.turn', right('turn'), left('backchannel'), 'floor'), link('backchannel.text', right('backchannel'), left('tts'), 'lines')] : []),
     ...(out === 'speaker' ? [link('tts.audio', right('tts'), left('speaker'), 'audio')] : []),
   ];
+  // Early interjection, under turn-taking: the words so far down to it, the "interrupt?" check up into the LLM, and the take back up.
+  {
+    const [ix, iy] = POS.interject;
+    const ty = POS.turn[1] + H;
+    edges.push({ src: 'turn.turn', d: `M${ix + 30},${ty} L${ix + 30},${iy - 2}`, label: 'words', lx: ix + 30, ly: iy - 30 });
+    if (registry[stageType(config, 'turn')].inputs.some((p) => p.name === 'interject'))
+      edges.push({ src: 'interject.take', d: `M${ix + 70},${iy} L${ix + 70},${ty + 2}`, label: 'take', lx: ix + 86, ly: iy - 30 });
+    // Out of its top right and up into the LLM's bottom left, clear of the backchannel box beside it.
+    if (registry[stageType(config, 'llm')].inputs.some((p) => p.name === 'interject')) {
+      const [sx, lx, ky] = [ix + W - 20, POS.llm[0] + 20, iy - 26];
+      edges.push({ src: 'interject.check', d: `M${sx},${iy} L${sx},${ky + 8} Q${sx},${ky} ${sx + 8},${ky} L${lx - 8},${ky} Q${lx},${ky} ${lx},${ky - 8} L${lx},${POS.llm[1] + H + 2}`, label: 'interrupt?', lx: lx + 34, ly: POS.llm[1] + H + 12 });
+    }
+  }
   // Delegation: tasks out of the LLM's right side, down the gap beside the opener to the workers, and their news back.
   {
     const [rx, ry] = [POS.llm[0] + W, POS.llm[1] + H / 2];

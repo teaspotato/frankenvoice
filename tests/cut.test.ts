@@ -87,6 +87,17 @@ describe('speaker pause and resume', () => {
     expect(s.plays()).toHaveLength(2);
   });
 
+  it('reports what was heard only up to heardAt, where the aside started', () => {
+    const s = speaker();
+    s.segment(0, 0, 'Tokyo is big.');
+    s.play(0);
+    s.segment(0, 1, 'It has trains.');
+    s.play(0, 1);
+    s.control(150, { type: 'pause' });
+    s.control(900, { type: 'cancel', heardAt: 30 });
+    expect(s.of('playback.interrupted')).toEqual([{ type: 'playback.interrupted', rid: 'r0', at: 900, heard: 'Tokyo' }]);
+  });
+
   it('leaves the pause out when working out how much of a sentence was heard', () => {
     const segs = [{ seg: 0, text: 'one two three four', start: 0, end: 1400, gaps: [{ at: 200, ms: 1000 }] }];
     // 400 ms of audio, paused from 200 (half way) to 1200; three quarters played by 1300.

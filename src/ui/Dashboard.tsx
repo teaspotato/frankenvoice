@@ -16,6 +16,7 @@ export const LANES: Lane[] = [
   { id: 'turnmodel', label: 'Turn model', height: 64 },
   { id: 'asr', label: 'ASR', height: 46 },
   { id: 'turn', label: 'Turn', height: 52 },
+  { id: 'interject', label: 'Interject', height: 32 },
   { id: 'llm', label: 'LLM', height: 60 },
   { id: 'opener', label: 'Opener', height: 28 },
   { id: 'workers', label: 'Workers', height: 52 },
@@ -32,7 +33,9 @@ const LEGEND: Record<string, string> = {
     'Turn model scores per 80 ms frame, placed on the audio they had heard: end of turn (blue) and take the floor (orange). Solid: the user; faint: the agent. Green: the backchannel head (the agent could say mm-hmm), green circles where it fired. Dashed: the thresholds.\nDiamonds: events the model committed for the user (top: end of turn, bottom: take the floor); hollow dots: the same for the agent.',
   asr:
     'Bar: a final transcript, from its first word to its last. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the last word to when its result arrived: the ASR latency.',
-  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.',
+  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM. Dots: TypeSafe at a pause in the user\'s speech (green: done, committed; amber: going on, the commit waits for more silence; red: failed).\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.',
+  interject:
+    'Early interjection. Dots: TypeSafe judging the user\'s words so far (grey: still going; green: they just completed something). Outlined bar: an "interrupt?" check with the LLM on those words, until it decided (grey: let them go on) or was dropped. Accent diamond: the LLM wanted to cut in (its line next to it); a line from there to where it was taken at the user\'s pause (accent tick: it took the floor and played; red tick: turn-taking refused it; grey tick: taken, but the LLM could not keep it).',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   opener:
     'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
@@ -669,6 +672,21 @@ export function Dashboard({
           audio: u.a0 === undefined ? undefined : [u.a0, u.a1!],
         });
       }
+      // TypeSafe at the user's pauses: done (commit now) or going on (hold for more silence)
+      for (const q of m.eotChecks) {
+        if (q.t < t0 || q.t > t1) continue;
+        mark('turn', q.t, q.failed ? col.danger : q.hold ? col.warn : col.ok, 0.34, 'dot', 2.5);
+        const [ly0, ly1] = laneY.turn;
+        hits.push({
+          lane: 'turn',
+          x0: x(q.t) - 3,
+          x1: x(q.t) + 3,
+          y0: ly0 + (ly1 - ly0) * 0.2,
+          y1: ly0 + (ly1 - ly0) * 0.5,
+          text: `TypeSafe at a pause: ${q.failed ? 'request failed, committing as ASR said' : q.hold ? `going on, p(done)=${q.p}: commit held for more silence` : `done, p(done)=${q.p}`} after ${q.ms} ms\n${q.text}`,
+          seqs: [q.seq],
+        });
+      }
       // Barge-in: user speech while the agent had the floor, and the decision on it
       const verdict: Record<string, [string, string]> = {
         interrupt: [col.danger, 'interrupted the agent'],
@@ -728,6 +746,58 @@ export function Dashboard({
         });
       }
 
+      // Early interjection: TypeSafe's gate on the words so far, the LLM's checks, and interjections taken
+      for (const q of m.interjectGates) {
+        if (q.t < t0 || q.t > t1) continue;
+        mark('interject', q.t, q.failed ? col.danger : q.go ? col.ok : col.muted, 0.18, 'dot', 2.5);
+        const [ly0, ly1] = laneY.interject;
+        hits.push({
+          lane: 'interject',
+          x0: x(q.t) - 3,
+          x1: x(q.t) + 3,
+          y0: ly0,
+          y1: ly0 + (ly1 - ly0) * 0.36,
+          text: `TypeSafe: ${q.failed ? 'request failed' : q.go ? `complete (${q.confidence}), the LLM is asked` : `not yet (${q.confidence})`} after ${q.ms} ms\n${q.text}`,
+          seqs: [q.seq],
+        });
+      }
+      m.interjectChecks.forEach((c, i) => {
+        const end = c.verdictAt ?? c.t1 ?? head;
+        const last = Math.max(end, c.takeAt ?? 0, c.t1 ?? 0);
+        if (last < t0 || c.t0 > t1) return;
+        const [ly0, ly1] = laneY.interject;
+        const h = ly1 - ly0;
+        const x0 = x(c.t0);
+        const x1 = Math.max(x(end), x0 + 2);
+        const cut = c.verdict === 'interject';
+        g.strokeStyle = cut ? col.accent : col.muted;
+        g.setLineDash([3, 2]);
+        g.strokeRect(x0 + 0.5, ly0 + h * 0.42 + 0.5, x1 - x0 - 1, h * 0.42);
+        g.setLineDash([]);
+        if (cut) {
+          mark('interject', end, col.accent, 0.63, 'diamond', 4);
+          if (c.takeAt !== undefined) {
+            const xt = x(c.takeAt);
+            g.strokeStyle = col.accent;
+            g.beginPath();
+            g.moveTo(x1, ly0 + h * 0.63 + 0.5);
+            g.lineTo(xt, ly0 + h * 0.63 + 0.5);
+            g.stroke();
+            if (c.taken !== undefined) vline('interject', c.takeAt, c.taken === false ? col.danger : c.status === 'kept' ? col.accent : col.muted, 0.4, 0.9);
+          }
+          const next = m.interjectChecks[i + 1];
+          const lx = Math.max(x1, c.takeAt !== undefined ? x(c.takeAt) : x1) + 6;
+          label(`"${c.say ?? ''}"`, lx, Math.min(lx + 260, next ? x(next.t0) - 3 : Infinity), ly0 + h * 0.63, col.accent);
+        }
+        const ms = (end - c.t0).toFixed(0);
+        const outcome = cut
+          ? `the LLM cuts in after ${ms} ms: "${c.say ?? ''}"${c.takeAt !== undefined ? `\nhanded to turn-taking ${(c.takeAt - end).toFixed(0)} ms later, ${c.taken === false ? 'refused' : c.status === 'kept' ? 'took the floor' : (c.status ?? '…')}` : c.status ? `\n${c.status}${c.why ? ` (${c.why})` : ''}` : '\nwaiting for a pause'}`
+          : c.verdict === 'pass'
+            ? `the LLM lets them go on (${ms} ms)`
+            : `${c.status ?? 'asking…'}${c.why ? ` (${c.why})` : ''} after ${ms} ms`;
+        hits.push({ lane: 'interject', x0, x1: Math.max(x1 + 4, c.takeAt !== undefined ? x(c.takeAt) + 3 : 0), y0: ly0 + h * 0.36, y1: ly1, text: `interrupt? check: ${outcome}\non: ${c.text}`, seqs: c.seqs });
+      });
+
       // Opener: the wait a filler was said after, and a diamond when it was said
       m.openers.forEach((o, i) => {
         const end = o.t1 ?? head;
@@ -761,7 +831,7 @@ export function Dashboard({
         const h = ly1 - ly0;
         const ft = l.firstToken ?? end;
         const dur = (end - ft) / 1000;
-        const head0 = l.headStartMs !== undefined ? `draft kept, started ${l.headStartMs.toFixed(0)} ms early · ` : '';
+        const head0 = l.headStartMs !== undefined ? `${l.interject ? 'interjection' : 'draft kept'}, started ${l.headStartMs.toFixed(0)} ms early · ` : '';
         const think = l.thinkingAt !== undefined ? ` · thinking at +${(l.thinkingAt - l.t0).toFixed(0)} ms` : '';
         const stats = `${head0}${l.firstToken ? `TTFT ${(l.firstToken - l.t0).toFixed(0)} ms` : 'waiting…'}${think} · ${l.chunks.length} chunks${dur > 0.05 ? ` · ${(l.text.length / dur).toFixed(0)} ch/s` : ''}${l.status ? ` · ${l.status}` : ''}`;
         span('llm', l.t0, ft, col.llm, 0.15, '', 0.06, 0.4);

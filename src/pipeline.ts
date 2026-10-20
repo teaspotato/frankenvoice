@@ -9,7 +9,7 @@ import type { Json } from './core/types';
 import { registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'backchannel' | 'llm' | 'opener' | 'workers' | 'tts' | 'speaker';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'interject' | 'backchannel' | 'llm' | 'opener' | 'workers' | 'tts' | 'speaker';
 
 export interface StageDef {
   id: StageId;
@@ -36,6 +36,7 @@ export const STAGES: StageDef[] = [
   { id: 'turnmodel', label: 'Turn model', variants: { ssl_turn: 'turnmodel.ssl', off: 'turnmodel.off' } },
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
+  { id: 'interject', label: 'Interjection', variants: { off: 'interject.off', typesafe: 'interject' } },
   { id: 'backchannel', label: 'Backchannels', variants: { on: 'backchannel', off: 'backchannel.off' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' }, managed: ['delegate'], managedNote: 'Delegation (the worker tools) is set by the Workers stage.' },
   { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', typesafe: 'opener.choice', off: 'opener.off' } },
@@ -91,6 +92,7 @@ const COLUMN: Record<StageId, [number, number]> = {
   turnmodel: [420, 110],
   asr: [420, 200],
   turn: [630, 110],
+  interject: [630, 200],
   backchannel: [840, 20],
   llm: [840, 110],
   opener: [840, 200],
@@ -138,6 +140,11 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('vad', 'vad', 'asr', 'vad'),
     e('asr', 'transcript', 'turn', 'transcript'),
     e('turn', 'turn', 'llm', 'turn'),
+    // Early interjection: TypeSafe gates the words so far, the LLM is asked whether to cut in, turn-taking commits at the next pause.
+    e('turn', 'turn', 'interject', 'turn'),
+    e('vad', 'vad', 'interject', 'vad'),
+    ...(registry[stageType(c, 'llm')].inputs.some((p) => p.name === 'interject') ? [e('interject', 'check', 'llm', 'interject'), e('llm', 'text', 'interject', 'text')] : []),
+    ...(registry[stageType(c, 'turn')].inputs.some((p) => p.name === 'interject') ? [e('interject', 'take', 'turn', 'interject')] : []),
     // Backchannels: when, from the user's speech and the floor; their lines are rendered and played by TTS.
     e('vad', 'vad', 'backchannel', 'vad'),
     e('turnmodel', 'scores', 'backchannel', 'scores'),
