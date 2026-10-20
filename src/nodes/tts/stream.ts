@@ -177,6 +177,8 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
       if (!samples.length) return;
       const ref = ctx.media.append('audio', samples, p.sampleRate);
       ctx.emit('audio', { type: 'audio', ...ref, sampleRate: p.sampleRate, samples, rid: r.rid, seg: s.seg });
+      // Opened with the reply's first audio: Deepgram closes a socket that gets none for 10 s.
+      if (p.alignWords && !r.align) r.align = align(r.rid);
       const a = r.align;
       if (a && !a.io.closed) {
         a.pieces.push({ a: a.sent, m: ref.start, n: samples.length });
@@ -203,6 +205,9 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
             const alt = ((m.channel as JsonObject | undefined)?.alternatives as JsonObject[] | undefined)?.[0];
             const words = ((alt?.words ?? []) as { word: string; start: number; end: number }[]).map((w) => ({ word: w.word, start: toMedia(w.start), end: toMedia(w.end) }));
             if (words.length) ctx.emit('audio', { type: 'tts.words', rid, words: words as unknown as Json });
+          },
+          onClose(data) {
+            if (data && (data as { error?: unknown }).error) ctx.log('warn', 'word timings unavailable: Deepgram ASR on the reply failed', data);
           },
         },
       );
@@ -321,7 +326,7 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
           },
         },
       );
-      r = { rid, io, buf: '', segs: [], segNo: 0, remainder: new Uint8Array(), llmDone: false, ...(p.alignWords ? { align: align(rid) } : {}) };
+      r = { rid, io, buf: '', segs: [], segNo: 0, remainder: new Uint8Array(), llmDone: false };
       reply = r;
     };
 

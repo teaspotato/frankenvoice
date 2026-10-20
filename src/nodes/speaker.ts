@@ -208,6 +208,8 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       }
     };
 
+    /** When the last cut's tail or release has faded out; nothing new plays before. */
+    let silentAt = -Infinity;
     /** The last sound before `stop` that a tail sustains: up to 90 ms, and at least 65 (WSOLA needs that much). */
     const TAIL_SEG_MS = 90;
     const MIN_SEG_MS = 65;
@@ -261,8 +263,6 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       echo();
       ctx.emit('playback', { type: 'playback.paused', rid, at: silent, ...(from !== silent ? { from } : {}) });
     };
-    /** When the last cut's release has faded out; nothing new plays before. */
-    let silentAt = -Infinity;
     const resume = () => {
       const from = paused!;
       const at = Math.max(ctx.now(), silentAt);
@@ -348,7 +348,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
             // Paused, the sound already stopped and the user heard up to the pause.
             const cut = wasPaused ? null : cutPoint(ctx.now());
             const flushed = cut ? flushAt(cut) : null;
-            const at = flushed ? flushed.silent : ctx.now();
+            const at = flushed ? flushed.silent : Math.max(ctx.now(), silentAt);
             if (cut) silentAt = at;
             const heard = heardText(segs.get(rid) ?? [], cut ? cut.stop : clock());
             endTimer?.clear();
@@ -403,9 +403,9 @@ export const speakerNode: NodeDef<SpeakerParams> = {
         }
         const r = (msg.rid as string) ?? null;
         if (playing && r !== rid && paused !== null) {
-          // A new reply while paused: the held one is dropped, and the new one starts now.
+          // A new reply while paused: the held one is dropped, and the new one starts once the cut has faded.
           end();
-          endAt = ctx.now();
+          endAt = Math.max(ctx.now(), silentAt);
         }
         const at = Math.max(clock(), endAt);
         const dur = (msg.samples.length / msg.sampleRate) * 1000;

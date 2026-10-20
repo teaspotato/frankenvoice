@@ -599,8 +599,10 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
   // Ducking, ahead of the mute switch; kept across a context change.
   let level = 1;
   let duck: GainNode | null = null;
-  /** Fades the reply out at a cut; back to 1 once the cut sources have stopped. */
+  /** The sources' fade-out at a cut; each cut gets a fresh one, so its ramp never reaches later audio. */
   let fade: GainNode | null = null;
+  /** When each source plays: context time, and session time when it was given one. */
+  const when = new WeakMap<AudioBufferSourceNode, { t: number; at?: number; dur: number }>();
   /** Timed chunks that arrived while a replay was skipping ahead (needs `clock`). */
   let held: { samples: Float32Array<ArrayBuffer>; sampleRate: number; at: number }[] = [];
   const release = () => {
@@ -618,26 +620,33 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
    * out over `releaseMs`, or with `tail` taking over at `at` (sample-exact, in the same context).
    */
   const stop = (at?: number, now?: number, releaseMs = 0, tail?: { samples: Float32Array<ArrayBuffer>; sampleRate: number }) => {
-    if (o && duck && tail && at !== undefined && now !== undefined && o.ctx.sampleRate === tail.sampleRate) {
-      const t = o.ctx.currentTime + Math.max(0, (at - now) / 1000);
-      for (const src of playing) src.stop(t);
-      const buf = o.ctx.createBuffer(1, tail.samples.length, tail.sampleRate);
-      buf.copyToChannel(tail.samples, 0);
-      const src = o.ctx.createBufferSource();
-      src.buffer = buf;
-      // Past the fade node: a later cut doesn't touch it.
-      src.connect(duck);
-      src.onended = () => playingSources.delete(src);
-      playingSources.add(src);
-      src.start(t);
-    } else if (o && fade && at !== undefined && now !== undefined) {
-      const t = o.ctx.currentTime + Math.max(0, (at - now) / 1000);
-      const r = Math.max(0.001, releaseMs / 1000);
-      fade.gain.cancelScheduledValues(o.ctx.currentTime);
-      fade.gain.setValueAtTime(1, t);
-      fade.gain.linearRampToValueAtTime(0, t + r);
-      fade.gain.setValueAtTime(1, t + r + 0.002);
-      for (const src of playing) src.stop(t + r);
+    // While a replay skips ahead nothing is heard: no fade, no tail.
+    if (o && duck && fade && at !== undefined && now !== undefined && !outputSuppressed) {
+      // The context time of `at`, from the source playing then, so the cut lands on its samples.
+      let t = o.ctx.currentTime + Math.max(0, (at - now) / 1000);
+      for (const src of playing) {
+        const w = when.get(src);
+        if (w?.at !== undefined && w.at <= at && at < w.at + w.dur * 1000) t = Math.max(o.ctx.currentTime, w.t + (at - w.at) / 1000);
+      }
+      if (tail && o.ctx.sampleRate === tail.sampleRate) {
+        for (const src of playing) src.stop(t);
+        const buf = o.ctx.createBuffer(1, tail.samples.length, tail.sampleRate);
+        buf.copyToChannel(tail.samples, 0);
+        const src = o.ctx.createBufferSource();
+        src.buffer = buf;
+        // Past the fade node: a later cut doesn't touch it.
+        src.connect(duck);
+        src.onended = () => playingSources.delete(src);
+        playingSources.add(src);
+        src.start(t);
+      } else {
+        const r = Math.max(0.001, releaseMs / 1000);
+        fade.gain.setValueAtTime(1, t);
+        fade.gain.linearRampToValueAtTime(0, t + r);
+        for (const src of playing) src.stop(t + r);
+        fade = o.ctx.createGain();
+        fade.connect(duck);
+      }
     } else for (const src of playing) src.stop();
     playing.clear();
     nextAt = NaN;
@@ -681,6 +690,7 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
     else if (live && Math.abs(at - nextAt) < 2) t = next;
     else t = Math.max(ctx.currentTime, ctx.currentTime + (at - now!) / 1000);
     src.start(t);
+    when.set(src, { t, at, dur: buf.duration });
     next = t + buf.duration;
     nextAt = at === undefined ? NaN : at + buf.duration * 1000;
   }
