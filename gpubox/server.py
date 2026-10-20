@@ -269,10 +269,10 @@ class AsrSession:
         t_req = time.perf_counter()
         gen = self.seg_gen
         self.seg_gen += 1             # any in-flight partial is now stale
-        if self.inflight is not None and not self.inflight.done():
-            # its result would be dropped anyway: don't make the final wait for it (it cost up to ~250 ms)
-            self.inflight.cancel()
-            self.inflight = None
+        # Don't wait for an in-flight partial (it cost up to ~250 ms): its result is dropped (stale gen). Don't cancel it
+        # either: closing its request aborts it in sglang-omni, which can crash the server (release_kv_cache assertion,
+        # with several streams running). It finishes alongside the final's decode in the same batch.
+        self.inflight = None
         pcm, seg_start = self.seg, self.seg_start
         seg_end = seg_start + len(pcm)
         had_speech = self.speech_started
@@ -364,8 +364,7 @@ async def asr_ws(ws: WebSocket):
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
-        if s.inflight and not s.inflight.done():
-            s.inflight.cancel()
+        s.seg_gen += 1  # an in-flight partial finishes and is dropped (aborting it can crash sglang-omni, see final())
 
 
 # ---------------------------------------------------------------- TTS relay

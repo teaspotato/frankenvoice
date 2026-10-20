@@ -45,9 +45,12 @@ Server to client (times are seconds from the first sample received on this conne
 One connection per reply. Query: `voice` (Kyutai voice path, optional), `cfg` (optional),
 `priority` (optional: `background` for audio rendered ahead, such as canned lines).
 
-The box renders one utterance at a time. A `background` connection only renders while no other
-connection is waiting: when one arrives, the background render stops at its next model step
-(80 ms of audio) and starts over once the box is free again. Its messages and audio are held
+The box renders up to `KYUTAI_MAX_BATCH` (default 4) utterances at once, stepping them together as
+one batch, 80 ms of audio per utterance per step; each connection's messages are exactly as if it
+were alone (only the step takes longer as the batch grows). Connections beyond that wait for a free
+place, in order. A `background` connection only takes a place no other connection is waiting for:
+when a connection finds every place taken and one of them is a background render, that render stops
+at its next model step and starts over once a place is free again. Its messages and audio are held
 until it is done, so the client sees one uninterrupted render, only later.
 
 Client to server:

@@ -4,15 +4,20 @@ Runs in its own venv (moshi's deps conflict with qwen-asr) and listens on localh
 The gateway (server.py) authenticates clients and relays `/v1/tts` WebSockets here.
 Protocol: see PROTOCOL.md ("TTS: WS /v1/tts").
 
-Generation runs on one worker thread, one reply at a time. A cancelled reply (socket closed)
-stops at its next model step, so the next connection never waits behind it. Background jobs
-(`?priority=background`, canned lines rendered ahead) run only when no reply is queued: a reply
-that arrives preempts one at its next model step, and the line is rendered again from the start
-afterwards. A background job's output is held until it is done, so a restart is invisible.
+Continuous batching: one worker thread steps every active reply as one batch of up to
+KYUTAI_MAX_BATCH rows (default 4), one model step (80 ms of audio) per row per batch step.
+Replies join and leave at step boundaries: a new one takes a free row (its rows of the model,
+codec and conditioning state are reset), a finished or cancelled one frees it. The CUDA graphs
+are captured once at the full batch size, so a step costs the same with 1 or 4 rows busy; rows
+that are idle or waiting for text are masked out (moshi's exec_mask), so their state stands still.
+Background jobs (`?priority=background`, canned lines rendered ahead) take a row only when one is
+free and no reply is waiting for it; a reply that finds no free row preempts one at the next step,
+and the line is rendered again from the start afterwards. A background job's output is held until
+it is done, so a restart is invisible.
 
 Adapted from the streaming loop in delayed-streams-modeling/scripts/tts_pytorch_streaming.py
 (via open-tts/scripts/kyutai.py): words are fed only when the model's lookahead needs them,
-and the model is not stepped while it could ask for a word that has not arrived yet.
+and a row is not stepped while it could ask for a word that has not arrived yet.
 """
 import argparse
 import asyncio
@@ -33,6 +38,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from moshi.models.loaders import CheckpointInfo
 from moshi.models.lm import LMGen
 from moshi.models.tts import DEFAULT_DSM_TTS_REPO, Entry, TTSModel
+from moshi.modules.transformer import StreamingMultiheadAttention
 
 log = logging.getLogger("kyutai")
 
@@ -44,6 +50,7 @@ FRAME = 1920  # samples per Mimi frame (12.5 Hz)
 # had median -0.08 s, mean -0.04 s (the aligner's resolution is 80 ms), so we shift by -0.04 s.
 WORD_OFFSET_S = float(os.environ.get("KYUTAI_WORD_OFFSET_S", "-0.04"))
 IDLE_CLOSE_S = float(os.environ.get("KYUTAI_IDLE_CLOSE_S", "30"))
+MAX_BATCH = int(os.environ.get("KYUTAI_MAX_BATCH", "4"))
 
 
 @dataclass
@@ -60,77 +67,314 @@ class Job:
     replay: list = field(default_factory=list)
     held: list = field(default_factory=list)      # a background job's output, sent when it is done
     preempted: int = 0
+    finished: bool = False
 
 
-class Preempted(Exception):
-    pass
+def _send(job: Job, item):
+    if job.background:
+        job.held.append(item)
+    elif not job.cancelled and job.out is not None:
+        job.loop.call_soon_threadsafe(job.out.put_nowait, item)
+
+
+class Run:
+    """One job's generation state: text taken so far, its row's step count, what has been sent."""
+
+    def __init__(self, eng: "Engine", job: Job):
+        self.eng = eng
+        self.job = job
+        self.frame_s = 1.0 / eng.m.mimi.frame_rate
+        self.reset()
+
+    def reset(self):
+        self.buf = ""            # partial word not yet terminated by whitespace
+        self.pending: list[Entry] = []
+        self.words: list[str] = []   # every word queued so far (== transcript order)
+        self.marks: list[int] = []   # word count at each Flush
+        self.n_flushed = 0
+        self.closed = False
+        self.frames_sent = 0
+        self.first_pcm_offset = None
+        self.words_sent = 0
+        self.reported = (0, 0)
+        self.t_gen = 0.0
+        self.steps: list[float] = []        # seconds per batch step this row took part in
+        self.audio_steps: list[float] = []  # the steps that produced audio
+        self.batch_sizes: list[int] = []    # rows stepped together, per step
+        self.t_first_audio = None
+        self.state = None        # the TTS state machine (moshi.models.tts.State) once it has a row
+        self.offset = 0          # this row's model step
+        self.end_at = None
+        self.last_ev = time.perf_counter()
+
+    # ---- text in -------------------------------------------------------------------------
+    def take_words(self, text: str, final: bool):
+        buf = self.buf + text
+        buf = buf.replace("’", "'").replace(":", " ").replace("(", "").replace(")", "")
+        if final:
+            parts, self.buf = buf.split(), ""
+        else:
+            cut = max(buf.rfind(" "), buf.rfind("\n"), buf.rfind("\t"))
+            if cut < 0:
+                self.buf = buf
+                return
+            parts, self.buf = buf[:cut].split(), buf[cut + 1:]
+        ents = self.eng.make_entries(parts, first=not self.words)
+        self.pending.extend(ents)
+        self.words.extend(e.text for e in ents)
+
+    def handle(self, ev):
+        job = self.job
+        job.history.append(ev)
+        self.last_ev = time.perf_counter()
+        kind, val = ev
+        if kind == "text":
+            if job.t_first_speak is None:
+                job.t_first_speak = time.perf_counter()
+            self.take_words(val, False)
+        elif kind == "flush":
+            self.take_words("", True)
+            self.marks.append(len(self.words))
+        elif kind == "close":
+            self.take_words("", True)
+            self.closed = True
+
+    def pull(self):
+        """Take every event that has arrived; a reply that stops sending text without Close
+        would hold its row forever, so IDLE_CLOSE_S of silence counts as Close."""
+        job = self.job
+        while True:
+            if job.replay:
+                ev = job.replay.pop(0)
+            else:
+                try:
+                    ev = job.events.get_nowait()
+                except queue.Empty:
+                    break
+            self.handle(ev)
+        if not self.closed and time.perf_counter() - self.last_ev > IDLE_CLOSE_S:
+            log.warning("no text for %.0f s: treating as Close", IDLE_CLOSE_S)
+            self.take_words("", True)
+            self.closed = True
+
+    def ready(self) -> bool:
+        """Feed entries up to the lookahead; can this row take a model step now?"""
+        st, ssa = self.state, self.eng.ssa
+        while self.pending and len(st.entries) <= ssa:
+            st.entries.append(self.pending.pop(0))
+        if not self.closed:
+            # Could the model ask for a word at this step? Then it must see the full lookahead.
+            can_ask = not st.queued and st.forced_padding <= 0
+            if can_ask and len(st.entries) <= ssa:
+                return False
+        return True
+
+    def done(self) -> bool:
+        st, m = self.state, self.eng.m
+        if st.end_step is not None:
+            if self.end_at is None:
+                self.end_at = st.end_step + m.delay_steps + self.eng.max_delay + 8
+            if self.offset >= self.end_at:
+                return True
+        return self.offset > 30000
+
+    # ---- out -----------------------------------------------------------------------------
+    def word_frame(self, step: int) -> float:
+        # pcm index (fractional, in frames) at which text consumed at `step` is heard
+        return step + self.eng.m.delay_steps + self.eng.max_delay + 1 - self.first_pcm_offset + WORD_OFFSET_S / self.frame_s
+
+    def word_end(self, i: int):
+        tr = self.state.transcript
+        if i + 1 < len(tr):
+            return self.word_frame(tr[i + 1][1])
+        if self.state.end_step is not None and i < len(tr):
+            return self.word_frame(self.state.end_step)
+        return None
+
+    def emit_progress(self, final: bool):
+        if self.first_pcm_offset is None and not final:
+            return
+        frame_s = self.frame_s
+        tr = self.state.transcript if self.state else []
+        batch = []
+        while self.words_sent < len(tr):
+            w, s = tr[self.words_sent]
+            st = self.word_frame(s) if self.first_pcm_offset is not None else 0.0
+            en = self.word_end(self.words_sent)
+            if en is None and final:
+                en = self.frames_sent
+            if en is None or (self.frames_sent < st and not final):
+                break
+            en = min(en, self.frames_sent) if final else en
+            batch.append({"word": w, "start": round(max(0.0, st) * frame_s, 3), "end": round(max(st, en) * frame_s, 3)})
+            self.words_sent += 1
+        if batch:
+            _send(self.job, {"type": "Words", "words": batch})
+        while self.n_flushed < len(self.marks):
+            n = self.marks[self.n_flushed]
+            if not final and n > 0:
+                en = self.word_end(n - 1) if self.first_pcm_offset is not None else None
+                if en is None or self.frames_sent < en:
+                    break
+            _send(self.job, {"type": "Flushed"})
+            self.n_flushed += 1
+
+    def after_step(self, dt: float, pcm, n_rows: int):
+        self.offset += 1
+        self.steps.append(dt)
+        self.batch_sizes.append(n_rows)
+        self.t_gen += dt
+        if pcm is not None:
+            self.audio_steps.append(dt)
+            if self.first_pcm_offset is None:
+                self.first_pcm_offset = self.offset
+                self.t_first_audio = time.perf_counter()
+            _send(self.job, (pcm * 32767).astype("<i2").tobytes())
+            self.frames_sent += 1
+        self.emit_progress(False)
+        q = (len(self.state.transcript), len(self.words) - len(self.state.transcript))
+        if q != self.reported:
+            self.reported = q
+            _send(self.job, {"type": "Consumed", "words": q[0], "queued": q[1]})
+
+    def finish(self):
+        job, frame_s = self.job, self.frame_s
+        self.emit_progress(True)
+        audio_s = self.frames_sent * frame_s
+        head = self.audio_steps[:int(3 / frame_s)]  # the first 3 s of audio, while the reply's text is still being written
+        srt = sorted(self.steps)
+        stats = {"audio_s": round(audio_s, 3), "gen_s": round(self.t_gen, 3), "rtf": round(self.t_gen / audio_s, 3) if audio_s else None,
+                 "rtf_3s": round(sum(head) / (len(head) * frame_s), 3) if head else None,
+                 "step_ms_p50": round(srt[len(srt) // 2] * 1000, 1) if srt else None,
+                 "step_ms_p90": round(srt[int(0.9 * (len(srt) - 1))] * 1000, 1) if srt else None,
+                 "step_ms_max": round(srt[-1] * 1000, 1) if srt else None,
+                 "batch_mean": round(sum(self.batch_sizes) / len(self.batch_sizes), 2) if self.batch_sizes else None,
+                 "batch_max": max(self.batch_sizes) if self.batch_sizes else None,
+                 "ttfa_ms": round((self.t_first_audio - job.t_first_speak) * 1000) if self.t_first_audio and job.t_first_speak else None,
+                 "words": len(self.words)}
+        if job.background:
+            stats["background"] = True
+            stats["preempted"] = job.preempted
+        log.info("tts done %s", stats)
+        _send(job, {"type": "Done", "stats": stats})
+        _send(job, None)
+        self.release()
+
+    def fail(self, msg: str):
+        _send(self.job, {"type": "Error", "message": msg})
+        _send(self.job, None)
+        self.release()
+
+    def release(self):
+        job = self.job
+        job.finished = True
+        if job.background:
+            held, job.background = job.held, False
+            for item in held:
+                _send(job, item)
 
 
 class Engine:
-    def __init__(self, n_q: int, temp: float, device: str = "cuda"):
+    def __init__(self, n_q: int, temp: float, voice: str, cfg: float, max_batch: int = MAX_BATCH, device: str = "cuda"):
         ci = CheckpointInfo.from_hf_repo(DEFAULT_DSM_TTS_REPO)
         self.m = TTSModel.from_checkpoint_info(ci, n_q=n_q, temp=temp, device=device)
         m = self.m
         m.lm.dep_q = m.n_q
+        self.B = B = max(1, max_batch)
         self.ssa = m.machine.second_stream_ahead
         self.max_delay = max(m.lm.delays)
         self.device = device
-        log.info("loaded: n_q=%d delay_steps=%d max_delay=%d second_stream_ahead=%d valid_cfg=%s",
-                 m.n_q, m.delay_steps, self.max_delay, self.ssa, sorted(m.valid_cfg_conditionings))
-        m.mimi.streaming_forever(1)
-        self.gen_key = None
-        self.lm_gen = None
-        self.gen_stack = None
-        # per-reply state, read by the hooks
-        self.offset = 0
-        self.state = None
+        log.info("loaded: n_q=%d delay_steps=%d max_delay=%d second_stream_ahead=%d valid_cfg=%s max_batch=%d",
+                 m.n_q, m.delay_steps, self.max_delay, self.ssa, sorted(m.valid_cfg_conditionings), B)
+        self.audio_delays = [m.lm.delays[q + m.lm.audio_offset] + m.delay_steps for q in range(m.lm.dep_q)]
+        self.zero = m.machine.token_ids.zero
+        self.missing = torch.full((B, m.lm.n_q - m.lm.dep_q, 1), self.zero, dtype=torch.long, device=device)
+        self.no_depformer = torch.full((B, m.lm.dep_q, 1), self.zero, dtype=torch.long, device=device)
+        self.conds: dict = {}
+        ct = m.lm.condition_provider(m.lm.condition_provider.prepare([self._cond_attrs(voice, cfg)] * B))
+        # support_out_of_sync: rows start at different times, so the per-row offsets decide which
+        # outputs are not generated yet (-1), not the global step count
+        self.lm_gen = LMGen(m.lm, temp=m.temp, temp_text=m.temp, cfg_coef=m.cfg_coef, condition_tensors=ct,
+                            on_text_hook=self._on_text, on_audio_hook=self._on_audio,
+                            cfg_is_masked_until=None, cfg_is_no_text=True, support_out_of_sync=True)
+        self.lm_gen.streaming_forever(B)
+        m.mimi.streaming_forever(B)
+        self.row_cond = [(voice, cfg)] * B
+        self.exec_mask: list[bool] | None = None
+        self.slots: list[Run | None] = [None] * B
+        self.stepping: list[int] = []
         self.fg: collections.deque = collections.deque()
         self.bg: collections.deque = collections.deque()
-        self.cv = threading.Condition()
-        self.missing = torch.full((1, m.lm.n_q - m.lm.dep_q, 1), m.machine.token_ids.zero, dtype=torch.long, device=device)
-        self.no_depformer = torch.full((1, m.lm.dep_q, 1), m.machine.token_ids.zero, dtype=torch.long, device=device)
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+
+    # ---- conditioning per row --------------------------------------------------------------
+    def _cond_attrs(self, voice: str, cfg: float):
+        return self.m.make_condition_attributes([self.m.get_voice_path(voice)], cfg_coef=cfg)
+
+    def _set_row_cond(self, i: int, voice: str, cfg: float):
+        key = (voice, cfg)
+        if self.row_cond[i] == key:
+            return
+        m = self.m
+        if key not in self.conds:
+            ct = m.lm.condition_provider(m.lm.condition_provider.prepare([self._cond_attrs(voice, cfg)]))
+            self.conds[key] = (m.lm.fuser.get_sum(ct), m.lm.fuser.get_cross(ct))
+        s, c = self.conds[key]
+        st = self.lm_gen._streaming_state
+        if s is not None:
+            st.condition_sum[i:i + 1].copy_(s.to(st.condition_sum.dtype))
+        if c is not None:
+            st.condition_cross[i:i + 1].copy_(c.to(st.condition_cross.dtype))  # raises if the voice's length differs
+            # cross-attention keys/values are cached per streaming state (and baked into the CUDA graph's inputs)
+            for mod in m.lm.modules():
+                if isinstance(mod, StreamingMultiheadAttention) and mod.cross_attention and mod._streaming_state is not None \
+                        and mod._streaming_state.k_cross is not None:
+                    mod.update_streaming_cross_attention_src(st.condition_cross)
+        self.row_cond[i] = key
 
     # ---- model plumbing -------------------------------------------------------------------
     def _on_text(self, t):
-        out = [self.m.machine.process(self.offset, self.state, tok)[0] for tok in t.tolist()]
-        t[:] = torch.tensor(out, dtype=torch.long, device=t.device)
+        toks = t.tolist()
+        for i in self.stepping:
+            r = self.slots[i]
+            toks[i] = self.m.machine.process(r.offset, r.state, toks[i])[0]
+        t[:] = torch.tensor(toks, dtype=torch.long, device=t.device)
 
     def _on_audio(self, a):
-        m = self.m
-        for q in range(a.shape[1]):
-            d = m.lm.delays[q + m.lm.audio_offset]
-            if self.offset < d + m.delay_steps:
-                a[:, q] = m.machine.token_ids.zero
+        for i in self.stepping:
+            off = self.slots[i].offset
+            qs = [q for q, d in enumerate(self.audio_delays) if off < d]
+            if qs:
+                a[i, qs] = self.zero
 
-    def _gen_for(self, voice: str, cfg: float):
-        """One LMGen per (voice, cfg), kept streaming forever so its CUDA graphs are reused."""
-        key = (voice, cfg)
-        if self.gen_key != key:
-            m = self.m
-            if self.gen_stack is not None:
-                self.gen_stack.close()
-            path = m.get_voice_path(voice)
-            cond = m.make_condition_attributes([path], cfg_coef=cfg)
-            ct = m.lm.condition_provider(m.lm.condition_provider.prepare([cond]))
-            self.lm_gen = LMGen(m.lm, temp=m.temp, temp_text=m.temp, cfg_coef=m.cfg_coef, condition_tensors=ct,
-                                on_text_hook=self._on_text, on_audio_hook=self._on_audio,
-                                cfg_is_masked_until=None, cfg_is_no_text=True)
-            self.gen_stack = self.lm_gen.streaming(1)
-            self.gen_key = key
-        else:
-            self.lm_gen.reset_streaming()
-        self.m.mimi.reset_streaming()
-        return self.lm_gen
-
-    def _step(self, g):
-        """One model step (80 ms of audio). Returns float32 pcm or None."""
-        m = self.m
-        rep = self.no_depformer if self.offset < m.delay_steps else None
-        f = g.step(self.missing, depformer_replace_tokens=rep)
-        self.offset += 1
-        if f is not None and (f != -1).all():
-            return np.clip(m.mimi.decode(f[:, 1:, :]).float().cpu().numpy()[0, 0], -1, 1)
-        return None
+    def _step(self, rows: list[int]):
+        """One batch step: 80 ms of audio for each row in `rows`. Returns {row: float32 pcm}."""
+        B = self.B
+        mask = [False] * B
+        for i in rows:
+            mask[i] = True
+        if mask != self.exec_mask:
+            self.lm_gen.set_exec_mask(torch.tensor(mask, device=self.device))
+            self.exec_mask = mask
+        self.stepping = rows
+        rep = self.no_depformer if all(self.slots[i].offset < self.m.delay_steps for i in rows) else None
+        try:
+            f = self.lm_gen.step(self.missing, depformer_replace_tokens=rep)
+        finally:
+            self.stepping = []
+        # -2: not generated yet (the row's first max_delay steps); -1: zeroed audio (the first delay_steps)
+        valid = (f >= 0).all(dim=2).all(dim=1).tolist()
+        out_rows = [i for i in rows if valid[i]]
+        if not out_rows:
+            return {}
+        first = [i for i in out_rows if self.slots[i].first_pcm_offset is None]
+        if first:
+            reset = torch.zeros(B, dtype=torch.bool)
+            reset[first] = True
+            self.m.mimi.reset_streaming(reset)
+        pcm = self.m.mimi.decode(f[:, 1:, :].clamp(min=0)).float().cpu().numpy()
+        return {i: np.clip(pcm[i, 0], -1, 1) for i in out_rows}
 
     # ---- text -> entries -----------------------------------------------------------------
     def make_entries(self, words: list[str], first: bool) -> list[Entry]:
@@ -146,250 +390,133 @@ class Engine:
             out.append(Entry(tokens=toks, text=w, padding=max(0, 1 + len(toks) - 1)))  # padding_between=1
         return out
 
-    # ---- worker ------------------------------------------------------------------------------
+    # ---- scheduling ---------------------------------------------------------------------------
     def submit(self, job: Job):
-        with self.cv:
-            (self.bg if job.background else self.fg).append(job)
-            self.cv.notify()
+        r = Run(self, job)
+        with self.lock:
+            (self.bg if job.background else self.fg).append(r)
+        self.wake.set()
 
-    def _next(self) -> Job:
-        with self.cv:
-            while True:
-                for q in (self.fg, self.bg):
-                    while q:
-                        job = q.popleft()
-                        if not job.cancelled:
-                            return job
-                self.cv.wait()
+    def active(self) -> int:
+        return sum(1 for r in self.slots if r is not None)
 
-    def _check_preempt(self, job: Job):
-        if job.background:
-            with self.cv:
-                if any(not j.cancelled for j in self.fg):
-                    raise Preempted()
+    def _admit(self, i: int, r: Run):
+        self._set_row_cond(i, r.job.voice, r.job.cfg)
+        reset = torch.zeros(self.B, dtype=torch.bool)
+        reset[i] = True
+        self.lm_gen.reset_streaming(reset)
+        self.exec_mask = None  # reset sets the row's exec mask
+        r.state = self.m.machine.new_state([])
+        r.offset = 0
+        self.slots[i] = r
+
+    def _preempt(self, i: int):
+        """Give a background job's row back; it starts over later. The caller holds the lock."""
+        r = self.slots[i]
+        self.slots[i] = None
+        job = r.job
+        job.preempted += 1
+        job.replay = job.history + job.replay
+        job.history = []
+        job.held = []
+        r.reset()
+        log.info("background job preempted by a reply (%d)", job.preempted)
+        self.bg.appendleft(r)
+
+    def _schedule(self):
+        """Drop cancelled jobs, take new events, give free rows to waiting jobs (replies first)."""
+        for i, r in enumerate(self.slots):
+            if r is not None and r.job.cancelled:
+                log.info("tts cancelled after %d frames", r.frames_sent)
+                self.slots[i] = None
+        with self.lock:
+            for q in (self.fg, self.bg):
+                live = [r for r in q if not r.job.cancelled]
+                q.clear()
+                q.extend(live)
+            fg, bg = list(self.fg), list(self.bg)
+        for r in fg + bg:
+            r.pull()
+        # a job needs its first word (or Close) before it takes a row
+        for r in fg + bg:
+            if r.closed and not r.pending:  # closed with no words: nothing to say
+                with self.lock:
+                    (self.bg if r.job.background else self.fg).remove(r)
+                r.finish()
+        free = [i for i, r in enumerate(self.slots) if r is None]
+        with self.lock:
+            for r in [r for r in self.fg if r.pending]:
+                if not free:
+                    bgs = [i for i, s in enumerate(self.slots) if s is not None and s.job.background]
+                    if not bgs:
+                        break
+                    self._preempt(bgs[-1])
+                    free.append(bgs[-1])
+                self.fg.remove(r)
+                self._admit(free.pop(0), r)
+            # a background job only takes a row no reply is waiting for
+            spare = len(free) - len(self.fg)
+            for r in [r for r in self.bg if r.pending]:
+                if spare <= 0:
+                    break
+                self.bg.remove(r)
+                self._admit(free.pop(0), r)
+                spare -= 1
+
+    def _tick(self) -> bool:
+        """One scheduling round and at most one batch step. False when nothing could step."""
+        self.wake.clear()
+        self._schedule()
+        rows = []
+        for i, r in enumerate(self.slots):
+            if r is None:
+                continue
+            r.pull()
+            if not r.ready():
+                continue
+            if r.done():
+                self.slots[i] = None
+                r.finish()
+                continue
+            rows.append(i)
+        if not rows:
+            return False
+        t0 = time.perf_counter()
+        try:
+            pcm = self._step(rows)
+        except Exception as e:  # noqa: BLE001
+            log.exception("tts batch step failed")
+            for i in rows:
+                r, self.slots[i] = self.slots[i], None
+                r.fail(f"tts failed: {e}")
+            return True
+        dt = time.perf_counter() - t0
+        for i in rows:
+            self.slots[i].after_step(dt, pcm.get(i), len(rows))
+        return True
 
     def run_forever(self):
         while True:
-            job = self._next()
             try:
                 with torch.no_grad():
-                    self._run(job)
-            except Preempted:
-                job.preempted += 1
-                job.replay = job.history + job.replay
-                job.history = []
-                job.held = []
-                log.info("background job preempted by a reply (%d)", job.preempted)
-                with self.cv:
-                    self.bg.appendleft(job)
-                continue
-            except Exception as e:  # noqa: BLE001
-                log.exception("tts job failed")
-                self._send(job, {"type": "Error", "message": f"tts failed: {e}"})
-                self._send(job, None)
-            if job.background:
-                held, job.background = job.held, False
-                for item in held:
-                    self._send(job, item)
+                    stepped = self._tick()
+            except Exception:  # noqa: BLE001
+                log.exception("tts scheduler failed")
+                stepped = False
+            if not stepped:
+                self.wake.wait(0.05)
 
-    def _send(self, job: Job, item):
-        if job.background:
-            job.held.append(item)
-        elif not job.cancelled and job.out is not None:
-            job.loop.call_soon_threadsafe(job.out.put_nowait, item)
-
-    @staticmethod
-    def _event(job: Job, timeout: float | None = None):
-        if job.replay:
-            return job.replay.pop(0)
-        return job.events.get_nowait() if timeout is None else job.events.get(timeout=timeout)
-
-    def _run(self, job: Job):
-        m = self.m
-        frame_s = 1.0 / m.mimi.frame_rate
-        buf = ""            # partial word not yet terminated by whitespace
-        pending: list[Entry] = []
-        words: list[str] = []   # every word queued so far (== transcript order)
-        marks: list[int] = []   # word count at each Flush
-        n_flushed = 0
-        closed = False
-        frames_sent = 0
-        first_pcm_offset = None
-        words_sent = 0
-        reported = [(0, 0)]
-        g = None
-        t_gen = 0.0
-        steps: list[float] = []  # seconds per model step, in order
-        audio_steps: list[float] = []  # the steps that produced audio
-        t_first_audio = None
-        self.state = None
-
-        def take_words(text: str, final: bool):
-            nonlocal buf
-            buf += text
-            buf = buf.replace("’", "'").replace(":", " ").replace("(", "").replace(")", "")
-            if final:
-                parts, buf = buf.split(), ""
-            else:
-                cut = max(buf.rfind(" "), buf.rfind("\n"), buf.rfind("\t"))
-                if cut < 0:
-                    return
-                parts, buf = buf[:cut].split(), buf[cut + 1:]
-            ents = self.make_entries(parts, first=not words)
-            pending.extend(ents)
-            words.extend(e.text for e in ents)
-
-        last_ev = [time.perf_counter()]
-
-        def idle_check():
-            # a reply that stops sending text without Close would hold the worker forever
-            nonlocal closed
-            if not closed and time.perf_counter() - last_ev[0] > IDLE_CLOSE_S:
-                log.warning("no text for %.0f s: treating as Close", IDLE_CLOSE_S)
-                take_words("", True)
-                closed = True
-
-        def handle(ev):
-            nonlocal closed
-            job.history.append(ev)
-            last_ev[0] = time.perf_counter()
-            kind, val = ev
-            if kind == "text":
-                if job.t_first_speak is None:
-                    job.t_first_speak = time.perf_counter()
-                take_words(val, False)
-            elif kind == "flush":
-                take_words("", True)
-                marks.append(len(words))
-            elif kind == "close":
-                take_words("", True)
-                closed = True
-
-        def word_frame(step: int) -> float:
-            # pcm index (fractional, in frames) at which text consumed at `step` is heard
-            return step + m.delay_steps + self.max_delay + 1 - first_pcm_offset + WORD_OFFSET_S / frame_s
-
-        def word_end(i: int):
-            tr = self.state.transcript
-            if i + 1 < len(tr):
-                return word_frame(tr[i + 1][1])
-            if self.state.end_step is not None and i < len(tr):
-                return word_frame(self.state.end_step)
-            return None
-
-        def emit_progress(final: bool):
-            nonlocal words_sent, n_flushed
-            if first_pcm_offset is None and not final:
-                return
-            tr = self.state.transcript if self.state else []
-            batch = []
-            while words_sent < len(tr):
-                w, s = tr[words_sent]
-                st = word_frame(s) if first_pcm_offset is not None else 0.0
-                en = word_end(words_sent)
-                if en is None and final:
-                    en = frames_sent
-                if en is None or (frames_sent < st and not final):
-                    break
-                en = min(en, frames_sent) if final else en
-                batch.append({"word": w, "start": round(max(0.0, st) * frame_s, 3), "end": round(max(st, en) * frame_s, 3)})
-                words_sent += 1
-            if batch:
-                self._send(job, {"type": "Words", "words": batch})
-            while n_flushed < len(marks):
-                n = marks[n_flushed]
-                if not final and n > 0:
-                    en = word_end(n - 1) if first_pcm_offset is not None else None
-                    if en is None or frames_sent < en:
-                        break
-                self._send(job, {"type": "Flushed"})
-                n_flushed += 1
-
-        # wait for the first word (or Close) before touching the model
-        while not job.cancelled and not pending and not closed:
-            self._check_preempt(job)
-            try:
-                handle(self._event(job, 0.1))
-            except queue.Empty:
-                idle_check()
-        if job.cancelled:
-            return
-        if pending:
-            g = self._gen_for(job.voice, job.cfg)
-            self.offset = 0
-            self.state = m.machine.new_state([])
-            end_at = None
-            while not job.cancelled:
-                self._check_preempt(job)
-                while True:
-                    try:
-                        handle(self._event(job))
-                    except queue.Empty:
-                        break
-                st = self.state
-                while pending and len(st.entries) <= self.ssa:
-                    st.entries.append(pending.pop(0))
-                if not closed:
-                    # Could the model ask for a word at this step? Then it must see the full lookahead.
-                    can_ask = not st.queued and st.forced_padding <= 0
-                    if can_ask and len(st.entries) <= self.ssa:
-                        try:
-                            handle(self._event(job, 0.05))
-                        except queue.Empty:
-                            idle_check()
-                        continue
-                if st.end_step is not None:
-                    if end_at is None:
-                        end_at = st.end_step + m.delay_steps + self.max_delay + 8
-                    if self.offset >= end_at:
-                        break
-                if self.offset > 30000:
-                    break
-                t0 = time.perf_counter()
-                pcm = self._step(g)
-                steps.append(time.perf_counter() - t0)
-                t_gen += steps[-1]
-                if pcm is not None:
-                    audio_steps.append(steps[-1])
-                    if first_pcm_offset is None:
-                        first_pcm_offset = self.offset
-                        t_first_audio = time.perf_counter()
-                    pcm16 = (pcm * 32767).astype("<i2").tobytes()
-                    self._send(job, pcm16)
-                    frames_sent += 1
-                emit_progress(False)
-                q = (len(self.state.transcript), len(words) - len(self.state.transcript))
-                if q != reported[0]:
-                    reported[0] = q
-                    self._send(job, {"type": "Consumed", "words": q[0], "queued": q[1]})
-        if job.cancelled:
-            log.info("tts cancelled after %d frames", frames_sent)
-            return
-        emit_progress(True)
-        audio_s = frames_sent * frame_s
-        head = audio_steps[:int(3 / frame_s)]  # the first 3 s of audio, while the reply's text is still being written
-        srt = sorted(steps)
-        stats = {"audio_s": round(audio_s, 3), "gen_s": round(t_gen, 3), "rtf": round(t_gen / audio_s, 3) if audio_s else None,
-                 "rtf_3s": round(sum(head) / (len(head) * frame_s), 3) if head else None,
-                 "step_ms_p90": round(srt[int(0.9 * (len(srt) - 1))] * 1000, 1) if srt else None,
-                 "step_ms_max": round(srt[-1] * 1000, 1) if srt else None,
-                 "ttfa_ms": round((t_first_audio - job.t_first_speak) * 1000) if t_first_audio and job.t_first_speak else None,
-                 "words": len(words)}
-        if job.background:
-            stats["background"] = True
-            stats["preempted"] = job.preempted
-        log.info("tts done %s", stats)
-        self._send(job, {"type": "Done", "stats": stats})
-        self._send(job, None)
-
-    def warmup(self):
-        job = Job(voice=DEFAULT_VOICE, cfg=2.0, loop=_NullLoop(), out=None)
-        for ev in [("text", "Hello there, this is a short warm up sentence to capture the graphs."), ("close", None)]:
-            job.events.put(ev)
+    def warmup(self, n: int):
+        jobs = [Job(voice=self.row_cond[0][0], cfg=self.row_cond[0][1], loop=_NullLoop(), out=None) for _ in range(n)]
+        for job in jobs:
+            for ev in [("text", "Hello there, this is a short warm up sentence to capture the graphs."), ("close", None)]:
+                job.events.put(ev)
+            self.submit(job)
         t = time.perf_counter()
         with torch.no_grad():
-            self._run(job)
-        log.info("warmup %.2fs", time.perf_counter() - t)
+            while not all(j.finished for j in jobs):
+                self._tick()
+        log.info("warmup x%d %.2fs", n, time.perf_counter() - t)
 
 
 class _NullLoop:
@@ -402,7 +529,7 @@ def build_app(engine: Engine, default_voice: str, default_cfg: float) -> FastAPI
 
     @app.get("/health")
     def health():
-        return {"ok": True, "tts": DEFAULT_DSM_TTS_REPO, "n_q": engine.m.n_q}
+        return {"ok": True, "tts": DEFAULT_DSM_TTS_REPO, "n_q": engine.m.n_q, "max_batch": engine.B, "active": engine.active()}
 
     @app.get("/config")
     def config():
@@ -457,6 +584,9 @@ def build_app(engine: Engine, default_voice: str, default_cfg: float) -> FastAPI
                     job.events.put(("flush", None))
                 elif t == "Close":
                     job.events.put(("close", None))
+                else:
+                    continue
+                engine.wake.set()
 
         out_task = asyncio.create_task(pump_out())
         in_task = asyncio.create_task(pump_in())
@@ -469,6 +599,7 @@ def build_app(engine: Engine, default_voice: str, default_cfg: float) -> FastAPI
         finally:
             if not out_task.done():
                 job.cancelled = True
+                engine.wake.set()
             for t in (out_task, in_task):
                 t.cancel()
 
@@ -483,11 +614,13 @@ def main():
     ap.add_argument("--temp", type=float, default=0.6)
     ap.add_argument("--voice", default=DEFAULT_VOICE)
     ap.add_argument("--cfg", type=float, default=2.0)
+    ap.add_argument("--max-batch", type=int, default=MAX_BATCH)
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    engine = Engine(n_q=a.n_q, temp=a.temp)
-    engine.warmup()
-    engine.warmup()
+    engine = Engine(n_q=a.n_q, temp=a.temp, voice=a.voice, cfg=a.cfg, max_batch=a.max_batch)
+    engine.warmup(engine.B)
+    engine.warmup(1)
+    engine.warmup(engine.B)
     threading.Thread(target=engine.run_forever, daemon=True).start()
     uvicorn.run(build_app(engine, a.voice, a.cfg), host=a.host, port=a.port, log_level="warning", ws_max_size=2**24)
 

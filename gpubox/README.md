@@ -11,7 +11,7 @@ is in [PROTOCOL.md](PROTOCOL.md); the LLM is plain OpenAI `POST /v1/chat/complet
 |---|---|---|---|
 | `asr` | `v-asr` (sglang-omni 0.1.8) | 127.0.0.1:8101 | `sgl-omni serve` Qwen3-ASR-1.7B (or `ASR_MODEL`) with FP8 weights, `mem_fraction_static 0.15`, `max_running_requests 8` |
 | `llm` | none (prebuilt llama.cpp `b11753`, CUDA) | 127.0.0.1:8103 | `llama-server`: `google/gemma-4-12B-it-qat-q4_0-gguf` (official QAT Q4_0) + MTP draft head from `ggml-org/gemma-4-12B-it-GGUF`, 2 slots x 4k context, q8_0 KV cache with a full-size sliding-window cache (`--swa-full`, so a diverging prompt reuses its prefix), thinking off |
-| `tts` | `v-tts` (moshi 0.2.13) | 127.0.0.1:8102 | `kyutai_tts.py`: Kyutai streaming generation, one reply at a time; background renders (canned lines) only when no reply waits, preempted by one |
+| `tts` | `v-tts` (moshi 0.2.13) | 127.0.0.1:8102 | `kyutai_tts.py`: Kyutai streaming generation, continuous batching of up to `KYUTAI_MAX_BATCH` replies; background renders (canned lines) only take a place no reply waits for, preempted by one |
 | `gateway` | `v-gw` (qwen-asr 0.0.6, FastAPI) | 0.0.0.0:8000 | `server.py`: auth, ASR segmenting/partials/finals, Qwen3-ForcedAligner-0.6B, relays `/v1/tts`, passes `/v1/chat/completions` and `/v1/models` through to `llm` |
 | `tunnel` | none | none | `cloudflared tunnel --protocol http2 --url http://localhost:8000` (quick tunnel; over the default QUIC it moved only ~110 KB/s, random `*.trycloudflare.com`) |
 | `ui` | Node 22 (`$ROOT/node`) | 127.0.0.1:8787 | The Frankenvoice server (`server/index.ts`) in hosted mode: runs the pipeline (VAD and the turn model on its CPU) against the gateway and llama.cpp over localhost, and serves the built UI from `$ROOT/frankenvoice/dist` behind the gpubox token; the page only sends the mic and plays the agent |
@@ -51,7 +51,7 @@ Environment variables: `GPUBOX_ROOT` (venvs, logs, pid files; default `/content`
 `GPUBOX_TOKEN` (default: random, saved in `$ROOT/gpubox.token`), `ASR_MODEL` (`Qwen/Qwen3-ASR-1.7B`, or
 `Qwen/Qwen3-ASR-0.6B`), `ASR_MEM` (0.15), `NO_LLM=1`, `LLM_CTX` (8192, shared by the slots), `LLM_SLOTS` (2), `LLM_SWA_FULL` (1; at 32k it needs 5.4 GB),
 `LLM_MTP` (1), `CUDA_MPS` (1: GPU services share the GPU through a CUDA MPS daemon), `LLM_MPS_PRIO` (1: Gemma is a below-normal MPS client, so Kyutai and ASR kernels go first), `LLM_MPS_PCT` (unset: optional cap on Gemma's SMs), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
-`NO_UI=1`, `FV_APP` (app archive, default `$ROOT/frankenvoice.tar.gz`).
+`KYUTAI_MAX_BATCH` (4: replies rendered at once), `NO_UI=1`, `FV_APP` (app archive, default `$ROOT/frankenvoice.tar.gz`).
 Logs are in `$ROOT/logs/{asr,llm,tts,gateway,tunnel,ui,ui-tunnel}.log`. Model files for the LLM are in `$ROOT/models`, llama.cpp
 in `$ROOT/llama.cpp`.
 `setup.sh restart-gpu` restarts only the GPU services (and MPS), keeping the tunnels' URLs.
@@ -59,6 +59,31 @@ in `$ROOT/llama.cpp`.
 With Gemma decoding on one stream (`degrade.py`, 2026-10-20): no MPS, Kyutai RTF 1.05, first audio 617 ms, ASR final 582 ms,
 Gemma 20 tok/s. MPS uncapped: RTF 1.53, 916 ms, 561 ms, 53 tok/s (Gemma takes the SMs). MPS with Gemma at 40%: RTF 0.94,
 553 ms, 338 ms, 30 tok/s. MPS with Gemma at below-normal priority, no cap (the default): RTF 0.84, 479 ms, 289 ms, 30 tok/s. Idle: RTF 0.63, 374 ms, 248 ms.
+
+### Several users (2026-10-20, `mu_bench.py`, L4)
+
+Kyutai batches up to `KYUTAI_MAX_BATCH` replies (CUDA graphs captured once at that size, so a step costs the same
+with 1 or 4 busy rows; `KYUTAI_MAX_BATCH=1` gives back the old single-reply step). N replies speaking at once, the
+text fed at about 40 words/s:
+
+| N | step p50 / p90 (ms) | RTF | first audio p50 / p90 (ms) | with Gemma decoding 1 stream: step p90, RTF, first audio p50 / p90 |
+|---|---|---|---|---|
+| before (one at a time), 1 | 37.8 | 0.49 | 306 | 48.2, 0.61, 359 |
+| before, 4 | 37.4 | 0.48 | queued: 13.9 s / 26.4 s | 48.7, 0.62, queued: 17.9 s / 34.6 s |
+| 1 | 41.5 / 41.8 | 0.54 | 351 / 351 | 61.4, 0.77, 468 / 469 |
+| 2 | 41.6 / 42.0 | 0.55 | 419 / 483 | 61.7, 0.79, 543 / 615 |
+| 3 | 41.6 / 41.9 | 0.55 | 489 / 573 | 61.7, 0.79, 623 / 721 |
+| 4 | 41.6 / 41.9 | 0.56 | 536 / 664 | 61.8, 0.80, 691 / 844 |
+
+No playback gaps in any run; ASR of the batch-4 renders matches the text (WER 0). First audio grows with N because a
+reply that starts alone skips the depth transformer for its first 16 steps (they are silent), which it can't do
+while other rows need it. Kyutai's memory grows from 4.5 to 5.0 GB at batch 4.
+
+ASR (sglang batches; 8 s clips streamed in real time through the gateway): final after Finalize p50 / p90 201 / 316 ms
+with 1 stream, 287 / 368 with 2, 318 / 488 with 4; partial decode p50 94, 121, 144 ms.
+
+LLM (llama.cpp, 2 slots, cached system prompt, 200-token answers): 1 stream TTFT 82 ms at 49 tok/s; 2 streams 134 ms,
+31 tok/s each; 3 or 4 streams queue for a slot: TTFT p50 0.15 / 3.1 s, p90 6.4 / 7.6 s (a whole answer).
 
 ### Colab
 
@@ -129,7 +154,7 @@ Set the local server's GPU box URL to the `GPUBOX_URL` and its token to `GPUBOX_
 
 - **ASR partials** re-decode the whole segment about every `partial_ms` of new audio. A partial runs only when no
   decode is in flight and new voiced audio has arrived since the last one.
-- **ASR finals**: the server cancels any in-flight partial (its result would be stale), decodes the segment, then
+- **ASR finals**: the server drops any in-flight partial (its result would be stale; it is not aborted, because an abort can crash sglang-omni with several streams running), decodes the segment at once, then
   times its words with the forced aligner. The final carries an extra `align_ms` field. A Finalize on a segment with no voiced audio returns
   an empty final right away, without decoding.
 - **Energy gate**: 20 ms frames; a frame is voiced if it is more than 12 dB above the 10th-percentile level of the
