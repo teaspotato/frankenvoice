@@ -148,3 +148,15 @@ describe('streaming TTS (Deepgram WebSocket)', () => {
     expect(asr.sent.at(-1)).toEqual({ type: 'CloseStream' });
   });
 });
+
+describe('word timings in the pipeline', () => {
+  it('are only asked for when the speaker resumes from a word', async () => {
+    const { buildGraph, defaultConfig } = await import('../src/pipeline');
+    const c = defaultConfig();
+    c.tts.variant = 'deepgram-stream';
+    const tts = (g: ReturnType<typeof buildGraph>) => g.nodes.find((n) => n.id === 'tts')!.params as Record<string, unknown>;
+    expect(tts(buildGraph(c)).alignWords).toBeUndefined();
+    c.speaker.params.speaker = { resumeFrom: 'cut' };
+    expect(tts(buildGraph(c)).alignWords).toBe(false);
+  });
+});
