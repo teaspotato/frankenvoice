@@ -31,6 +31,13 @@ export interface LiveOptions {
   maxSessionMs?: () => number;
   /** How often the server pings each page (ms); a page that misses two pongs is dropped. */
   heartbeatMs?: number;
+  /**
+   * Public demo: what a visitor's live session runs (the graph the host started last, else the default). Visitors'
+   * own graphs are ignored and they can't replay on the box.
+   */
+  demoGraph?: () => GraphSpec;
+  /** The host started a live session with this graph (the next demo graph). */
+  hostGraph?: (graph: GraphSpec) => void;
   log?: (msg: string) => void;
 }
 
@@ -69,6 +76,8 @@ class Page {
   constructor(
     readonly ws: WebSocket,
     base: DriverRegistry,
+    /** The host (token or local), not a demo visitor. */
+    readonly host: boolean,
   ) {
     this.drivers = { ...base, mic: this.mic, speaker: this.speaker };
   }
@@ -167,8 +176,8 @@ export class LiveHub {
   }
 
   /** A page connected. Each page runs its own sessions; pages don't take over each other, they queue. */
-  handle(ws: WebSocket) {
-    const page = new Page(ws, this.drivers);
+  handle(ws: WebSocket, { host = true }: { host?: boolean } = {}) {
+    const page = new Page(ws, this.drivers, host);
     this.pages.add(page);
     this.broadcastUsers(page);
     // A tab closed behind a tunnel may never send a close: without pongs the socket is dead.
@@ -227,7 +236,10 @@ export class LiveHub {
 
   private onBinary(page: Page, { header, payload }: { header: Header; payload: Uint8Array }) {
     if (header.k === 'mic') page.micSink?.recv({ frame: header.frame, ctxTime: header.ctxTime }, payload.slice());
-    else if (header.k === 'replay') this.startReplay(page, header, payload);
+    else if (header.k === 'replay') {
+      if (!page.host) return page.send({ type: 'notice', text: 'replays on the GPU box are for the host only' });
+      this.startReplay(page, header, payload);
+    }
   }
 
   /**
@@ -356,6 +368,7 @@ export class LiveHub {
   }
 
   private startLive(page: Page, m: { graph: GraphSpec; env?: Record<string, Json>; autosave?: boolean; title?: string }) {
+    if (!page.host && this.o.demoGraph) m = { graph: this.o.demoGraph(), env: m.env, autosave: true, title: '' };
     this.request(page, true, () => this.runLive(page, m));
   }
 
@@ -366,6 +379,7 @@ export class LiveHub {
     } catch (e) {
       return page.send({ type: 'notice', text: `bad graph: ${String(e)}` });
     }
+    if (page.host) this.o.hostGraph?.(graph);
     const scheduler = new LiveScheduler();
     const rt = new Runtime({
       graph,

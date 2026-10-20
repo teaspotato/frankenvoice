@@ -87,12 +87,20 @@ beforeAll(async () => {
     sessionsDir: () => sessions,
     modelsDir: join(sessions, 'models'),
     maxSessionMs: () => limitMs,
+    demoGraph: () => {
+      const c = defaultConfig();
+      c.vad.variant = 'energy';
+      c.backchannel.variant = 'off';
+      return buildGraph(c);
+    },
     heartbeatMs: 300,
     log: () => {},
   });
   const server = createServer();
   const wss = new WebSocketServer({ noServer: true });
-  server.on('upgrade', (req, socket, head) => wss.handleUpgrade(req, socket, head, (ws) => hub.handle(ws)));
+  server.on('upgrade', (req, socket, head) =>
+    wss.handleUpgrade(req, socket, head, (ws) => hub.handle(ws, { host: !req.url?.includes('visitor') })),
+  );
   livePort = await listen(server);
   servers = [gpubox, llm, server];
 });
@@ -302,6 +310,28 @@ describe('the pipeline in the server', () => {
     } finally {
       limitMs = 0;
     }
+  }, 20_000);
+
+  it('runs the demo pipeline for a visitor, whatever graph it sends, and keeps replays on the box for the host', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${livePort}/api/live?visitor`);
+    const msgs: { type: string; [k: string]: Json }[] = [];
+    ws.on('message', (data: Buffer, binary) => {
+      if (binary) return;
+      const m = JSON.parse(data.toString()) as { type: string; [k: string]: Json };
+      msgs.push(m);
+      if (m.type === 'mic.open') ws.send(JSON.stringify({ type: 'mic.ready', label: 'fake', contextSampleRate: 16000, settings: {} }));
+    });
+    await new Promise((r) => ws.once('open', r));
+    ws.send(frame({ k: 'replay', liveChannels: ['gpubox-tts'] }, new Uint8Array(4)));
+    ws.send(JSON.stringify({ type: 'start', graph: { format: 'not a graph' }, env: {}, autosave: false, title: '' }));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(msgs.filter((m) => m.type === 'notice').map((m) => m.text)).toEqual(['replays on the GPU box are for the host only']);
+    expect(msgs.filter((m) => m.type === 'session')).toHaveLength(1);
+    const saved = new Promise((r) => ws.on('message', (d: Buffer, bin) => !bin && JSON.parse(d.toString()).type === 'saved' && r(null)));
+    ws.send(JSON.stringify({ type: 'stop' }));
+    // A visitor's session is always kept.
+    await saved;
+    ws.close();
   }, 20_000);
 
   it('renders a canned line once on the box, in the background, then serves it from the cache', async () => {
