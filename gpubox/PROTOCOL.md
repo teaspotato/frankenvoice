@@ -29,7 +29,8 @@ Server to client (times are seconds from the first sample received on this conne
   "decode_ms": n}`. Partials (`is_final: false`) come while speech continues, at most
   every `partial_ms` of new audio, each one a re-decode of the whole segment so far.
   A final's words are timed by the forced aligner; a partial's are spread evenly over
-  the voiced part of the segment.
+  the voiced part of the segment. Finals also carry `align_ms`. A Finalize on a segment
+  with no voiced audio returns an empty final at once.
 - `{"type": "UtteranceEnd", "at": t}` 1 s after the last final's last word when no
   speech followed.
 - `{"type": "Error", "message": "..."}`.
@@ -51,6 +52,10 @@ Server to client:
 - binary: 16-bit little-endian mono PCM at 24 kHz, in order.
 - `{"type": "Words", "words": [{"word", "start", "end"}]}`: word timings in seconds
   from this connection's first audio sample, sent as words are spoken.
-- `{"type": "Flushed"}`, `{"type": "Done"}`, `{"type": "Error", "message": "..."}`.
+- `{"type": "Flushed"}`, `{"type": "Done", "stats": {...}}`, `{"type": "Error", "message": "..."}`.
 
-Closing the socket early cancels generation.
+The model needs the current word plus 2 words of lookahead, so it waits until 3 words are
+queued (or Close has come): a pause in the text pauses the audio, and the last words of a
+Flushed segment only come out once more text or Close arrives. A word's `end` is the next
+word's start. Closing the socket early cancels generation; 30 s with no text and no Close
+counts as Close.
