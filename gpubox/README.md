@@ -51,10 +51,15 @@ Environment variables: `GPUBOX_ROOT` (venvs, llama.cpp, pid files; default `/con
 `GPUBOX_DATA` (token, logs, LLM weights, UI settings and sessions; default `GPUBOX_ROOT`),
 `GPUBOX_TOKEN` (default: random, saved in `$DATA/gpubox.token`), `ASR_MODEL` (`Qwen/Qwen3-ASR-1.7B`, or
 `Qwen/Qwen3-ASR-0.6B`), `ASR_MEM` (0.15), `NO_LLM=1`, `LLM_CTX` (8192, shared by the slots), `LLM_SLOTS` (2), `LLM_SWA_FULL` (1; at 32k it needs 5.4 GB),
-`LLM_MTP` (1), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
+`LLM_MTP` (1), `CUDA_MPS` (1: GPU services share the GPU through a CUDA MPS daemon), `LLM_MPS_PCT` (40: Gemma's cap on SMs under MPS), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
 `NO_UI=1`, `FV_APP` (app archive, default `$ROOT/frankenvoice.tar.gz`).
 Logs are in `$DATA/logs/{asr,llm,tts,gateway,tunnel,ui,ui-tunnel}.log`. Model files for the LLM are in `$DATA/models`, llama.cpp
 in `$ROOT/llama.cpp`.
+`setup.sh restart-gpu` restarts only the GPU services (and MPS), keeping the tunnels' URLs.
+
+With Gemma decoding on one stream (`degrade.py`, 2026-10-20): no MPS, Kyutai RTF 1.05, first audio 617 ms, ASR final 582 ms,
+Gemma 20 tok/s. MPS uncapped: RTF 1.53, 916 ms, 561 ms, 53 tok/s (Gemma takes the SMs). MPS with Gemma at 40%: RTF 0.94,
+553 ms, 338 ms, 30 tok/s. Idle: RTF 0.63, 374 ms, 248 ms.
 
 ### Colab
 
@@ -96,7 +101,8 @@ Everything is preset: the UI talks to ASR, TTS and Gemma over localhost inside t
 goes in Settings as usual. Settings, recorded sessions, the token and the logs live in `/data`
 (`/data/logs/*.log`), so they survive `docker rm` and image updates. The setup.sh variables work as `-e`
 options, for example `-e GPUBOX_TOKEN=...` for a fixed token, `-e ASR_MODEL=Qwen/Qwen3-ASR-0.6B`, `-e NO_LLM=1`,
-or `-e CUDA_MPS=1` to run the GPU processes under a CUDA MPS daemon (see issue #23; untested). Add `-p 8000:8000`
+or `-e CUDA_MPS=0` to run without the CUDA MPS daemon (on by default, as on Colab; the daemon runs inside the
+container, which hasn't been tried on a GPU yet). Add `-p 8000:8000`
 to reach the gateway's ASR/TTS/LLM API directly. If any process exits, the container stops (and
 `--restart unless-stopped` brings it back).
 

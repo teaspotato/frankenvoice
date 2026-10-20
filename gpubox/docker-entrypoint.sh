@@ -10,16 +10,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null \
   || { log "no GPU visible: run with --gpus all (and the NVIDIA Container Toolkit installed)"; exit 1; }
 
 rm -f "$GPUBOX_ROOT"/*.pid   # left over from the previous run of this container
-stop() { bash "$SETUP" stop; [ -n "${CUDA_MPS:-}" ] && echo quit | nvidia-cuda-mps-control; }
+rm -rf "$GPUBOX_ROOT/mps"     # setup.sh runs the GPU services under CUDA MPS (CUDA_MPS=0 turns it off)
+stop() { bash "$SETUP" stop; }
 trap 'log "stopping"; stop; exit 0' TERM INT
-
-# CUDA_MPS=1: share the GPU through an MPS control daemon, so ASR, LLM and TTS kernels run side by side
-# instead of time-slicing (see issue #23). Every GPU process started after this uses it.
-if [ -n "${CUDA_MPS:-}" ]; then
-  export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps-pipe CUDA_MPS_LOG_DIRECTORY=$GPUBOX_DATA/logs/mps
-  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
-  nvidia-cuda-mps-control -d && log "CUDA MPS on" || { log "could not start the MPS daemon"; exit 1; }
-fi
 
 # in the background + wait, so docker stop interrupts a long first start instead of waiting it out
 bash "$SETUP" fetch & wait $! || log "weight download failed; starting with what is already in /data"

@@ -3,7 +3,7 @@
 # + a chat LLM (Gemma 4 12B QAT Q4_0 on llama.cpp) behind one authenticated gateway on :8000,
 # exposed through a cloudflared quick tunnel.
 #
-# usage: bash setup.sh [all|install|fetch|start|stop|restart|status|ui]   (default: all = install + start)
+# usage: bash setup.sh [all|install|fetch|start|stop|restart|restart-gpu|status|ui]   (default: all = install + start)
 #        fetch = download the model weights (install does it too, unless NO_FETCH=1)
 #        ui = (re)install the app from FV_APP and start only the ui + ui-tunnel processes
 # Run from the directory holding server.py / kyutai_tts.py, or set GPUBOX_SRC.
@@ -47,6 +47,8 @@ LLM_MMPROJ=mmproj-gemma-4-12b-it-qat-q4_0.gguf
 LLM_MTP_REPO=ggml-org/gemma-4-12B-it-GGUF          # MTP draft head for speculative decoding
 LLM_MTP_FILE=mtp-gemma-4-12B-it-Q4_0.gguf
 LLM_NAME=gemma-4-12b-it
+CUDA_MPS=${CUDA_MPS:-1}                            # CUDA MPS: the GPU services' kernels run concurrently instead of time-sliced
+LLM_MPS_PCT=${LLM_MPS_PCT:-40}                     # cap on the LLM's share of SMs under MPS, so Kyutai keeps up (measured, issue #23)
 LLM_CTX=${LLM_CTX:-8192}; LLM_SLOTS=${LLM_SLOTS:-2}; LLM_MTP=${LLM_MTP:-1}; LLM_SWA_FULL=${LLM_SWA_FULL:-1}
 
 log() { echo "[setup $(date +%H:%M:%S)] $*"; }
@@ -165,6 +167,39 @@ wait_http() {  # wait_http NAME URL TIMEOUT_S
   log "$1 not up after $3 s"; return 1
 }
 
+# CUDA MPS. Without it, the separate CUDA processes time-slice the GPU, and Kyutai's many small per-frame
+# kernels wait behind llama.cpp's decode. Clients find the daemon through these two variables.
+export CUDA_MPS_PIPE_DIRECTORY=$ROOT/mps/pipe CUDA_MPS_LOG_DIRECTORY=$ROOT/mps/log
+mps_up() { echo get_server_list | nvidia-cuda-mps-control > /dev/null 2>&1; }
+mps_start() {
+  if [ "$CUDA_MPS" != 1 ]; then unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_LOG_DIRECTORY; return 0; fi
+  mps_up && return 0
+  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+  nvidia-cuda-mps-control -d && log "CUDA MPS daemon started" || { log "CUDA MPS failed to start"; return 1; }
+}
+mps_stop() { mps_up && echo quit | nvidia-cuda-mps-control && log "CUDA MPS daemon stopped"; return 0; }
+
+stop_gpu() {  # the GPU services only; tunnels and the UI keep their URLs
+  for n in gateway tts llm asr; do
+    if alive $n; then
+      local p; p=$(cat "$ROOT/$n.pid")
+      kill -TERM -- "-$p" 2>/dev/null || kill "$p"
+      log "stopped $n ($p)"
+    fi
+    rm -f "$ROOT/$n.pid"
+  done
+  ports_free
+  mps_stop
+}
+
+ports_free() {  # wait for the services' ports, so restarted ones don't fall back to random ports
+  for _ in $(seq 1 60); do
+    ss -ltn | grep -qE ":($ASR_PORT|$TTS_PORT|$LLM_PORT|$GW_PORT) " || return 0
+    sleep 1
+  done
+  log "ports still busy: $(ss -ltn | grep -oE ":($ASR_PORT|$TTS_PORT|$LLM_PORT|$GW_PORT) " | tr -d '\n')"
+}
+
 stop() {
   for n in ui-tunnel ui tunnel gateway tts llm asr; do
     if alive $n; then
@@ -174,10 +209,12 @@ stop() {
     fi
     rm -f "$ROOT/$n.pid"
   done
-  sleep 3
+  ports_free
+  mps_stop
 }
 
 start() {
+  mps_start || return 1
   [ -f "$DATA/gpubox.token" ] || echo "${GPUBOX_TOKEN:-$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)}" > "$DATA/gpubox.token"
   [ -n "${GPUBOX_TOKEN:-}" ] && echo "$GPUBOX_TOKEN" > "$DATA/gpubox.token"
   local TOKEN; TOKEN=$(cat "$DATA/gpubox.token")
@@ -192,7 +229,8 @@ start() {
     # --swa-full: a full-size sliding-window cache, so a prompt that diverges from the slot's cached
     # tokens (a cancelled draft, a new user turn after a reply) reuses the shared prefix instead of re-reading it all
     local swa=(); [ "$LLM_SWA_FULL" = 1 ] && swa=(--swa-full)
-    LD_LIBRARY_PATH="$d:${LD_LIBRARY_PATH:-}" spawn llm "$d/llama-server" -m "$DATA/models/$LLM_FILE" \
+    local pct=(); [ -n "$LLM_MPS_PCT" ] && pct=(env CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="$LLM_MPS_PCT")
+    LD_LIBRARY_PATH="$d:${LD_LIBRARY_PATH:-}" spawn llm "${pct[@]}" "$d/llama-server" -m "$DATA/models/$LLM_FILE" \
         --mmproj "$DATA/models/$LLM_MMPROJ" --alias $LLM_NAME --host 127.0.0.1 --port $LLM_PORT \
         -ngl 999 -fa on -c "$LLM_CTX" -np "$LLM_SLOTS" -ctk q8_0 -ctv q8_0 --ctx-checkpoints 0 --cache-ram 0 "${swa[@]}" \
         --jinja --reasoning off "${mtp[@]}"
@@ -232,8 +270,9 @@ case "${1:-all}" in
   start) start ;;
   stop) stop ;;
   restart) stop; start ;;
+  restart-gpu) stop_gpu; start ;;
   status) status ;;
   ui) install_ui && start_ui && status ;;
   all) install && start ;;
-  *) echo "usage: $0 [all|install|fetch|start|stop|restart|status|ui]"; exit 2 ;;
+  *) echo "usage: $0 [all|install|fetch|start|stop|restart|restart-gpu|status|ui]"; exit 2 ;;
 esac

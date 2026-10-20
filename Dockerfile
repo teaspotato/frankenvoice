@@ -10,7 +10,7 @@ FROM nvcr.io/nvidia/cuda:12.8.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl ffmpeg git tini xz-utils build-essential \
+      ca-certificates curl ffmpeg git iproute2 tini xz-utils build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 ARG NODE_VERSION=v22.22.0
