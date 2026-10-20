@@ -131,6 +131,8 @@ export class LiveHub {
         return this.micSink?.close({ error: m.error ?? 'microphone failed' });
       case 'speaker.late':
         return this.speakers.get(m.id as number)?.recv({ type: 'late', at: m.at, ms: m.ms });
+      case 'speaker.gate':
+        return this.speakers.get(m.id as number)?.recv({ type: 'gate', at: m.at, pos: m.pos ?? null });
     }
   }
 

@@ -10,4 +10,5 @@ export default defineConfig({
       '/api': { target: proxy, ws: true, changeOrigin: true },
     },
   },
+  optimizeDeps: { exclude: ['onnxruntime-web'] },
 });

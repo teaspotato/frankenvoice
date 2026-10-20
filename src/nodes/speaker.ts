@@ -66,6 +66,12 @@ export function heardText(segs: PlayedSegment[], at: number): string {
  * sustained and faded over a short tail (or, with no tail, faded out over a release).
  * A resume picks up from the start of the word it stopped in (word timings
  * from tts.words), fading in, so the word is heard whole.
+ *
+ * Turn-taking can let the page stop playback on its own (control `gate`, until
+ * a session time): the page runs a VAD on the mic and, when it hears the user
+ * start, fades the reply out at once and reports when (a speaker recv, so a
+ * replay has it). That is a pause at the reported time (playback.paused with
+ * `gate`); turn-taking then resumes or cancels as for any pause.
  */
 interface SpeakerParams {
   cutoff: 'syllable' | 'hard';
@@ -244,15 +250,10 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       return { silent, echo: () => flushPlayed(silent) };
     };
 
-    const pause = () => {
-      const at = ctx.now();
-      const cut = cutPoint(at);
-      const { silent, echo } = flushAt(cut);
-      silentAt = silent;
+    /** Hold what hasn't played, from `from` where it resumes; the chunk playing there is split. */
+    const holdFrom = (from: number) => {
       endTimer?.clear();
       endTimer = undefined;
-      // Keep what hasn't played, from where it resumes; the chunk playing there is split.
-      const from = cut.from;
       queued = queued.flatMap((c) => {
         const dur = (c.samples.length / c.sampleRate) * 1000;
         if (c.at + dur <= from) return [];
@@ -263,14 +264,37 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       paused = from;
       endAt = Math.max(endAt, from);
       ctx.setState('paused', true);
+    };
+    const pause = () => {
+      const cut = cutPoint(ctx.now());
+      const { silent, echo } = flushAt(cut);
+      silentAt = silent;
+      holdFrom(cut.from);
       echo();
-      ctx.emit('playback', { type: 'playback.paused', rid, at: silent, ...(from !== silent ? { from } : {}) });
+      ctx.emit('playback', { type: 'playback.paused', rid, at: silent, ...(cut.from !== silent ? { from: cut.from } : {}) });
+    };
+    /** Where the page stopped playback on its own (gate), while paused so: what was heard ends there. */
+    let gateStop: number | null = null;
+    /** The page heard the user start and stopped playback at `at`, fading out over the release it was armed with. */
+    const pageStop = (d: { at: number; pos?: number }) => {
+      // The page drops what it is sent after stopping, until this.
+      io?.send({ cmd: 'flush' });
+      if (!playing || paused !== null) return void ctx.log('debug', 'the page stopped playback, nothing playing here', d as unknown as Json);
+      const at = Math.min(d.at, ctx.now());
+      const from = Math.min(cutPoint(at).from, at);
+      const silent = at + Math.max(0, p.releaseMs);
+      silentAt = Math.max(silentAt, silent);
+      holdFrom(from);
+      gateStop = at;
+      flushPlayed(silent);
+      ctx.emit('playback', { type: 'playback.paused', rid, at: silent, from, gate: true, cut: at, ...(typeof d.pos === 'number' ? { pos: d.pos } : {}) });
     };
     const resume = () => {
       const from = paused!;
       const at = Math.max(ctx.now(), silentAt);
       const shift = at - from;
       paused = null;
+      gateStop = null;
       endAt += shift;
       ctx.setState('paused', false);
       ctx.emit('playback', { type: 'playback.resumed', rid, at, from, shift });
@@ -307,6 +331,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
     const end = () => {
       setGain(1);
       queued = [];
+      gateStop = null;
       if (paused !== null) {
         paused = null;
         ctx.setState('paused', false);
@@ -336,8 +361,9 @@ export const speakerNode: NodeDef<SpeakerParams> = {
         io = ctx.io.open('speaker', {}, {
           onRecv(data) {
             // The page reports how late a run of playback started (its audio arrived after its time).
-            const d = data as { type?: string; ms?: number };
+            const d = data as { type?: string; ms?: number; at?: number };
             if (d?.type === 'late') ctx.setState('lateMs', d.ms ?? null);
+            else if (d?.type === 'gate' && typeof d.at === 'number') pageStop(d as { at: number });
             else ctx.setState('device', data);
           },
         });
@@ -348,6 +374,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
           else if (msg.type === 'unduck') setGain(1);
           if (msg.type === 'pause' && playing && paused === null) pause();
           else if (msg.type === 'resume' && paused !== null) resume();
+          if (msg.type === 'gate') io?.send({ cmd: 'gate', until: (msg.until as number | null) ?? null, releaseMs: p.releaseMs });
           if (msg.type === 'cancel') setGain(1);
           if (msg.type === 'cancel' && playing) {
             const wasPaused = paused !== null;
@@ -357,7 +384,8 @@ export const speakerNode: NodeDef<SpeakerParams> = {
             const at = flushed ? flushed.silent : Math.max(ctx.now(), silentAt);
             if (cut) silentAt = at;
             // `heardAt`: keep the reply only up to then (where the user's aside over it started).
-            const until = cut ? cut.stop : clock();
+            const until = cut ? cut.stop : (gateStop ?? clock());
+            gateStop = null;
             const heard = heardText(segs.get(rid) ?? [], typeof msg.heardAt === 'number' ? Math.min(msg.heardAt, until) : until);
             endTimer?.clear();
             endTimer = undefined;

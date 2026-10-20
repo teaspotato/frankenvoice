@@ -266,16 +266,24 @@ export function setOutputPaused(paused: boolean) {
 export function speakerOutputs(clock?: () => number) {
   const out = pcmOutput('agent', clock);
   const cues = pcmOutput('agent', clock);
+  /** Stopped by the page gate: the reply's audio sent meanwhile is dropped until the server's flush says it knows. */
+  let gated = false;
   return {
     /** Run one speaker command (see the speaker node), with the session clock `now` when it is run. */
     command(d: { cmd: string; at?: number; stop?: number; sampleRate?: number; gain?: number; releaseMs?: number }, bin: Uint8Array | undefined, now: number) {
       if (d.cmd === 'cue' && bin) return cues.play(new Float32Array(bin.slice().buffer), d.sampleRate!, d.at!, now);
+      if (gated && (d.cmd === 'play' || d.cmd === 'flush')) return void (gated = d.cmd === 'play');
       if (d.cmd === 'flush') {
         const tail = bin && d.sampleRate ? { samples: new Float32Array(bin.slice().buffer), sampleRate: d.sampleRate, stop: d.stop ?? d.at! } : undefined;
         return void (d.at === undefined ? out.stop() : out.stop(d.at, now, d.releaseMs, tail));
       }
       if (d.cmd === 'gain') return void out.setGain(d.gain ?? 1);
       if (d.cmd === 'play' && bin) return out.play(new Float32Array(bin.slice().buffer), d.sampleRate!, d.at!, now);
+    },
+    /** The page gate heard the user: stop the reply now (session time `now`), fading over `releaseMs`. */
+    gateCut(now: number, releaseMs: number) {
+      out.stop(now, now, releaseMs);
+      gated = true;
     },
     close() {
       out.close();

@@ -71,7 +71,7 @@ export const toneTtsNode: NodeDef<{ sampleRate: number; msPerChar: number }> = {
     let seg = 0;
     return {
       onInput(port, msg) {
-        if (port === 'control' || msg.type === 'llm.start') {
+        if ((port === 'control' && msg.type === 'cancel') || msg.type === 'llm.start') {
           seg = 0;
           return;
         }

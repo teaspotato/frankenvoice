@@ -40,7 +40,7 @@ const LEGEND: Record<string, string> = {
     'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the TTS server.',
   speaker:
-    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged. Accent boxes: backchannels said while the user talked; small grey dots near the bottom: backchannels held back (hover for why).',
+    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged. Red dot on a stub: the page stopped playback on its own VAD (page gate). Accent boxes: backchannels said while the user talked; small grey dots near the bottom: backchannels held back (hover for why).',
 };
 
 const AXIS = 20;
@@ -921,6 +921,12 @@ export function Dashboard({
         span('speaker', d.t0, end, col.warn, 0.22, '', 0.05, 0.25);
         hits[hits.length - 1].text = d.text;
         tag(d.seqs);
+      }
+      for (const k of m.gateStops) {
+        if (k.t < t0 || k.t > t1) continue;
+        vline('speaker', k.t, col.danger, 0, 0.35);
+        mark('speaker', k.t, col.danger, 0.35, 'dot', 3);
+        hits.push({ lane: 'speaker', x0: x(k.t) - 4, x1: x(k.t) + 4, text: k.text, seqs: [k.seq], ...(k.onset !== undefined ? { audio: [k.onset, k.t] as [number, number] } : {}) });
       }
       for (const s of m.playbackSegments) {
         if (s.t < t0 || s.t > t1) continue;

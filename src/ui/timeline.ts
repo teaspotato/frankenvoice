@@ -144,6 +144,8 @@ export class TimelineModel {
   playbackSegments: Marker[] = [];
   /** The agent was cut off (paused) or played quieter (ducked) while turn-taking judged the user's speech over it. */
   holds: Span[] = [];
+  /** The page gate stopped playback on its own VAD: when, and when the user's speech started (mic). */
+  gateStops: (Marker & { onset?: number })[] = [];
   /** Backchannels the agent said while the user talked, and proposals that were gated off. */
   backchannels: (Span & { id: string; why?: string })[] = [];
   bcSkips: (Marker & { why: string })[] = [];
@@ -518,7 +520,11 @@ export class TimelineModel {
         break;
       case 'playback.paused':
         this.closeHold(d.at ?? e.t, e.seq);
-        this.holds.push({ t0: d.at ?? e.t, text: 'cut off while the user spoke', seqs: [e.seq] });
+        if (d.gate) {
+          const onset = typeof d.pos === 'number' ? this.sampleToT(d.pos) : undefined;
+          this.gateStops.push({ t: d.cut, text: `stopped in the page, ${Math.round(e.t - d.cut)} ms before the server knew`, seq: e.seq, ...(onset !== undefined ? { onset } : {}) });
+        }
+        this.holds.push({ t0: d.gate ? d.cut : (d.at ?? e.t), text: d.gate ? 'stopped by the page on the user’s speech, until the VAD here judged it' : 'cut off while the user spoke', seqs: [e.seq] });
         // Held audio is sent again, at its new times, on resume.
         this.clipAgentAudio(d.at ?? e.t);
         break;
