@@ -33,7 +33,7 @@ const LEGEND: Record<string, string> = {
     'Turn model scores per 80 ms frame, placed on the audio they had heard: end of turn (blue) and take the floor (orange). Solid: the user; faint: the agent. Green: the backchannel head (the agent could say mm-hmm), green circles where it fired. Dashed: the thresholds.\nDiamonds: events the model committed for the user (top: end of turn, bottom: take the floor); hollow dots: the same for the agent.',
   asr:
     'Bar: a final transcript, from its first word to its last. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the last word to when its result arrived: the ASR latency.',
-  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.',
+  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM. Dots: TypeSafe at a pause in the user\'s speech (green: done, committed; amber: going on, the commit waits for more silence; red: failed).\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.',
   interject:
     'Early interjection. Dots: TypeSafe judging the user\'s words so far (grey: still going; green: they just completed something). Outlined bar: an "interrupt?" check with the LLM on those words, until it decided (grey: let them go on) or was dropped. Accent diamond: the LLM wanted to cut in (its line next to it); a line from there to where it was taken at the user\'s pause (accent tick: it took the floor and played; red tick: turn-taking refused it; grey tick: taken, but the LLM could not keep it).',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
@@ -670,6 +670,21 @@ export function Dashboard({
           text: `user turn${u.replaces ? ' (resent: the user kept talking)' : ''}: ${u.text}`,
           seqs: [u.seq],
           audio: u.a0 === undefined ? undefined : [u.a0, u.a1!],
+        });
+      }
+      // TypeSafe at the user's pauses: done (commit now) or going on (hold for more silence)
+      for (const q of m.eotChecks) {
+        if (q.t < t0 || q.t > t1) continue;
+        mark('turn', q.t, q.failed ? col.danger : q.hold ? col.warn : col.ok, 0.34, 'dot', 2.5);
+        const [ly0, ly1] = laneY.turn;
+        hits.push({
+          lane: 'turn',
+          x0: x(q.t) - 3,
+          x1: x(q.t) + 3,
+          y0: ly0 + (ly1 - ly0) * 0.2,
+          y1: ly0 + (ly1 - ly0) * 0.5,
+          text: `TypeSafe at a pause: ${q.failed ? 'request failed, committing as ASR said' : q.hold ? `going on, p(done)=${q.p}: commit held for more silence` : `done, p(done)=${q.p}`} after ${q.ms} ms\n${q.text}`,
+          seqs: [q.seq],
         });
       }
       // Barge-in: user speech while the agent had the floor, and the decision on it

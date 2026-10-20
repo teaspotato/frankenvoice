@@ -161,6 +161,8 @@ export class TimelineModel {
   userTurns: (Marker & { a0?: number; a1?: number; replaces?: string })[] = [];
   /** User speech over the agent and what turn-taking made of it. */
   bargeIns: { t0: number; t1?: number; decision?: string; why?: string; text: string; seqs: number[] }[] = [];
+  /** TypeSafe on whether the user is done at a pause (rules endpointing): p(done), and whether the commit was held. */
+  eotChecks: (Marker & { p?: number; hold?: boolean; failed?: boolean; ms: number })[] = [];
   llm: LlmSpan[] = [];
   drafts: Draft[] = [];
   openers: Opener[] = [];
@@ -495,6 +497,9 @@ export class TimelineModel {
         }
         break;
       }
+      case 'turn.eot_check':
+        this.eotChecks.push({ t: e.t, text: d.text ?? '', seq: e.seq, ms: d.ms ?? 0, ...(d.failed ? { failed: true } : { p: d.p, hold: !!d.hold }) });
+        break;
       case 'interject.gate':
         this.interjectGates.push({ t: e.t, text: d.text ?? '', seq: e.seq, go: !!d.go, ms: d.ms ?? 0, ...(d.failed ? { failed: true } : { confidence: d.confidence }) });
         break;

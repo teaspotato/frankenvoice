@@ -1,6 +1,7 @@
 import type { NodeDef, TimerHandle } from '../core/node';
 import type { Json, Msg } from '../core/types';
 import { seededRandom, takes } from './backchannel';
+import { askChoice, choiceRequest, parseChoiceOptions, readChoice } from './typesafe';
 
 interface TurnParams {
   commitOn: string;
@@ -102,11 +103,23 @@ interface DuplexParams {
   floorWords: string;
   asides: boolean;
   classifyWaitMs: number;
+  eotCheck: string;
+  eotYield: number;
+  eotHoldMs: number;
+  eotOptions: string;
+  eotInstructions: string;
   backoffAfter: number;
   backoffLines: string;
   backoffWords: number;
   backoffSilenceMs: number;
 }
+
+export const DEFAULT_EOT_OPTIONS = `# The first option means the user is done; "-" means they are probably going on.
+yield = The speaker has finished and is handing the turn over: they asked the listener a question, invited a reply ("your turn", "what about you"), or completed a point and are clearly waiting for a response.
+- = The speaker is likely to keep talking: mid-sentence or mid-phrase, partway through a list, story or explanation, a short reaction or acknowledgement (yeah, exactly, for real, I hear that, got you) that usually leads into more, or a statement that sets up something further.`;
+
+export const DEFAULT_EOT_INSTRUCTIONS =
+  'The text is a speech-recognition transcript of what a user has said so far in their turn, in a live spoken conversation with a voice agent; they have just paused. Judge whether the pause is the end of their turn or just a breath before they go on. When unsure, pick "-".';
 
 /** Who holds the floor, and whether the user is talking over the agent while it does. */
 export type FloorState = 'listening' | 'thinking' | 'speaking' | 'thinking+user' | 'speaking+user';
@@ -374,6 +387,26 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       when: { bargeIn: [true], overlap: ['classify'] },
     },
     {
+      key: 'eotCheck',
+      label: 'Done or pausing?',
+      type: 'select',
+      options: ['typesafe', 'off'],
+      default: 'typesafe',
+      description:
+        'Without the turn model, ASR endpointing ends the turn at the first pause. typesafe: TypeSafe Choice reads the words when the user pauses; unless it thinks they are handing the turn over, the commit waits for more silence (a draft still starts, so the reply is ready).',
+    },
+    {
+      key: 'eotYield',
+      label: 'Commit at once from p(done)',
+      type: 'number',
+      default: 0.5,
+      description: "TypeSafe's probability that the user is done at or above which the turn is committed at the pause; below it, after the hold.",
+      when: { eotCheck: ['typesafe'] },
+    },
+    { key: 'eotHoldMs', label: 'Hold (ms)', type: 'number', default: 1500, description: 'More silence needed before committing words TypeSafe thinks are not done.', when: { eotCheck: ['typesafe'] } },
+    { key: 'eotOptions', label: 'Done/pausing options', type: 'text', default: DEFAULT_EOT_OPTIONS, description: 'Sent to TypeSafe as the Choice criteria; the first option means done.', when: { eotCheck: ['typesafe'] } },
+    { key: 'eotInstructions', label: 'Done/pausing question', type: 'text', default: DEFAULT_EOT_INSTRUCTIONS, when: { eotCheck: ['typesafe'] } },
+    {
       key: 'backoffAfter',
       label: 'Back off after interruptions',
       type: 'number',
@@ -406,6 +439,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       when: { bargeIn: [true] },
     },
   ],
+  channels: [{ name: 'typesafe', description: "TypeSafe Choice on the user's words at a pause: done, or going on?" }],
+  requires: (p) => (p.eotCheck === 'typesafe' ? ['typesafe'] : []),
   create(ctx) {
     const p = ctx.params;
     let state: FloorState = 'listening';
@@ -423,6 +458,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let eotHeld: { why: string; at: number } | null = null;
     /** The model ended the turn, but ASR hasn't finalised its last words yet. */
     let eotWait: { why: string; timer: TimerHandle } | null = null;
+    /** TypeSafe's p(done) for the words at a pause, by their key: undefined while it answers, null if it failed. */
+    const eotAnswers = new Map<string, number | null | undefined>();
+    const eotOpts = p.eotCheck === 'typesafe' ? parseChoiceOptions(String(p.eotOptions)) : [];
+    /** The rules ended the turn but TypeSafe thinks the user is going on: commit after more silence. */
+    let eotHold: { why: string; key: string; timer: TimerHandle } | null = null;
     /** The turn model is loaded and scoring. */
     let model = false;
     /** With the model: commits the words if the user stays silent this long without its end of turn. */
@@ -624,6 +664,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       heldFinal = false;
       eotWait?.timer.clear();
       eotWait = null;
+      eotHold?.timer.clear();
+      eotHold = null;
       silence?.clear();
       silence = null;
       const text = parts.join(' ').trim();
@@ -646,6 +688,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       partial = null;
       from = to = -1;
       ctx.setState('pending', '');
+      eotAnswers.clear();
       go('commit', why);
       // Commits from timers too: the words are gone.
       syncWords();
@@ -667,6 +710,62 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         'eot-wait',
       );
       eotWait = { why, timer };
+    };
+
+    const eotOn = () => !useModel() && eotOpts.length > 0;
+    /** Ask TypeSafe whether these words end the user's turn (once per wording). */
+    const askEot = (text: string) => {
+      const key = draftKey(text);
+      if (!key || eotAnswers.has(key) || !eotOn()) return;
+      eotAnswers.set(key, undefined);
+      const t0 = ctx.now();
+      const done = eotOpts[0].key;
+      askChoice(ctx, choiceRequest(text, eotOpts, String(p.eotInstructions), 'jev-latest'), (res) => {
+        const got = res === null ? null : readChoice(res, eotOpts, 0);
+        const pDone = got ? Math.round((got.probabilities[done] ?? (got.choice === done ? got.confidence : 1 - got.confidence)) * 1000) / 1000 : null;
+        eotAnswers.set(key, pDone);
+        const hold = pDone !== null && pDone < p.eotYield;
+        ctx.emit('turn', { type: 'turn.eot_check', text, ms: Math.round(ctx.now() - t0), ...(pDone === null ? { failed: true } : { p: pDone, hold }) });
+        if (eotHold?.key === key && !hold) settleEot();
+      });
+    };
+    /** Commit a held turn now, if TypeSafe has said the user is done (or failed). */
+    const settleEot = () => {
+      const h = eotHold;
+      if (!h) return;
+      const a = eotAnswers.get(h.key);
+      if (a === undefined || (a !== null && a < p.eotYield)) return;
+      commit(`${h.why}; TypeSafe ${a === null ? 'failed' : `p(done)=${a}`}`);
+    };
+    /**
+     * The rules (an ASR endpoint) end the turn. Without the turn model these fire
+     * at the first short pause, so TypeSafe reads the words: unless it thinks the
+     * user is done, the commit waits for `eotHoldMs` more silence. A draft still
+     * goes out in the pause, so the reply is ready if it does commit.
+     */
+    const endpoint = (why: string) => {
+      const text = parts.join(' ').trim();
+      if (!eotOn() || !text || state !== 'listening' || backoff) return commit(why);
+      const key = draftKey(text);
+      // Already holding these words (an utterance end after the final): keep counting from the first.
+      if (eotHold?.key === key) return;
+      askEot(text);
+      eotHold?.timer.clear();
+      const h: { why: string; key: string; timer: TimerHandle } = {
+        why,
+        key,
+        timer: ctx.setTimer(
+          p.eotHoldMs,
+          () => {
+            if (eotHold !== h) return;
+            const a = eotAnswers.get(key);
+            commit(`${why}; TypeSafe ${a === undefined ? 'did not answer' : `p(done)=${a}`}, then ${p.eotHoldMs} ms more silence`);
+          },
+          'eot-hold',
+        ),
+      };
+      eotHold = h;
+      settleEot();
     };
 
     /** The model may never call the end of the turn: don't let silence go on forever. */
@@ -950,6 +1049,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             c.timer?.clear();
             holdWhenSustained(c);
             if (c.check) c.timer = ctx.setTimer(Math.max(1, p.maxBackchannelMs - (ctx.now() - c.since)), c.check, 'barge-in');
+          } else if (eotHold) {
+            // TypeSafe was right: they went on. Their next pause ends it (or the silence timeout, whatever ASR does).
+            eotHold.timer.clear();
+            eotHold = null;
+            heldFinal = true;
           } else if (eotWait) {
             // They went on after the model called the end of their turn: wait for the next one.
             eotWait.timer.clear();
@@ -960,7 +1064,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           speaking = false;
           // A partial from before the silence usually lacks the last words: wait for ASR to catch up.
           caughtUp = !partial;
-          if (state === 'listening') maybeDraft('silence, words final');
+          if (state === 'listening') {
+            maybeDraft('silence, words final');
+            // Ask ahead: the answer is usually in by the time ASR ends the turn.
+            if (!backoff) askEot(pendingText());
+          }
           armSilence();
           if (eotHeld && state === 'listening' && ctx.now() - eotHeld.at <= EOT_HOLD_MS) endOfTurn(`${eotHeld.why}, then VAD speech end`);
           eotHeld = null;
@@ -1017,14 +1125,14 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         // But not if the VAD hears them again by the time it lands: they only paused and went on (our
         // Finalize marks even a short pause speech_final), and the next speech end commits it all.
         else if (!useModel() && p.commitOn === 'speech_final' && (msg.fromFinalize ? !speaking : msg.speechFinal))
-          commit(msg.speechFinal ? 'speech_final' : 'finalized on VAD speech end');
+          endpoint(msg.speechFinal ? 'speech_final' : 'finalized on VAD speech end');
         else {
           if (!useModel() && msg.fromFinalize && speaking) heldFinal = true;
           refreshDraft('ASR final');
         }
       } else if (msg.type === 'asr.utterance_end') {
         if (speaking) ctx.log('debug', 'utterance end ignored: the VAD still hears speech');
-        else commit('utterance_end');
+        else endpoint('utterance_end');
       }
     };
 
