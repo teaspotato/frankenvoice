@@ -180,8 +180,10 @@ describe('streaming TTS (Kyutai on the GPU box)', () => {
     h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
     h.ios[0].h.onRecv!(null, h.pcm(30));
     h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
-    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'audio', 'tts.segment_end', 'tts.segment_start', 'audio', 'tts.segment_end', 'tts.response_end']);
-    expect(h.out.filter((m) => m.type === 'tts.segment_start').map((m) => m.text)).toEqual(['Sure, I can help.', 'Then bye.']);
+    // The first audio plays at once, before its sentence is all written; the rest of its text follows.
+    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.segment_text', 'audio', 'tts.segment_end', 'tts.segment_start', 'audio', 'tts.segment_end', 'tts.response_end']);
+    expect(h.out.filter((m) => m.type === 'tts.segment_start').map((m) => m.text)).toEqual(['Sure, I can', 'Then bye.']);
+    expect(h.out.find((m) => m.type === 'tts.segment_text')).toMatchObject({ seg: 0, text: 'Sure, I can help.' });
     // Close went out with the end of the text; it is not sent again.
     expect(h.ios[0].sent.filter((m) => (m as { type: string }).type === 'Close')).toHaveLength(1);
     expect(h.ios[0].closed).toBe(true);

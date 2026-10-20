@@ -381,6 +381,12 @@ export const speakerNode: NodeDef<SpeakerParams> = {
           if (paused === null || r !== rid) announce(r, s);
           return;
         }
+        if (msg.type === 'tts.segment_text') {
+          // A segment that started playing before all its words were written (word-streaming TTS).
+          const s = segs.get((msg.rid as string) ?? null)?.find((x) => x.seg === msg.seg);
+          if (s) s.text = msg.text as string;
+          return;
+        }
         if (msg.type === 'tts.words') {
           const r = (msg.rid as string) ?? null;
           words.set(r, [...(words.get(r) ?? []), ...(msg.words as unknown as SpokenWord[])]);

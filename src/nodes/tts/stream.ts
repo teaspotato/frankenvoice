@@ -144,8 +144,8 @@ function streamingTts(b: Backend): NodeDef<StreamParams> {
     requires: () => [b.wordStreaming ? 'gpubox' : 'deepgram'],
     create(ctx) {
       const p = ctx.params;
-      /** `held`: audio of a segment still open (word streaming), kept until its text is known. */
-      type Seg = { seg: number; text: string; started: boolean; held?: Float32Array[] };
+      /** With word streaming the open segment's `text` grows as words go out; its audio plays at once. */
+      type Seg = { seg: number; text: string; started: boolean; announced?: string };
       type Reply = {
         rid: string;
         io: ReturnType<typeof ctx.io.open>;
@@ -268,6 +268,7 @@ function streamingTts(b: Backend): NodeDef<StreamParams> {
       const emitAudio = (r: Reply, s: Seg, samples: Float32Array) => {
         if (!s.started) {
           s.started = true;
+          s.announced = s.text;
           ctx.emit('audio', { type: 'tts.segment_start', rid: r.rid, seg: s.seg, text: s.text });
         }
         if (!samples.length) return;
@@ -375,6 +376,7 @@ function streamingTts(b: Backend): NodeDef<StreamParams> {
             r.open = { seg: r.segNo++, text: '', started: false };
             r.segs.push(r.open);
           }
+          if (r.open) r.open.text = r.buf.slice(0, ready).trim();
           r.io.send({ type: 'Speak', text });
           r.spoken = ready;
           ctx.setState('status', 'synthesizing');
@@ -387,14 +389,14 @@ function streamingTts(b: Backend): NodeDef<StreamParams> {
           r.spoken -= i;
           if (r.open) {
             const s = r.open;
-            s.text = text;
             r.open = undefined;
             r.io.send({ type: 'Flush' });
-            // Its audio waited for the text, which tts.segment_start carries.
-            for (const out of s.held?.splice(0) ?? []) deliver(r, s, out);
+            // Its audio may have started with part of the text: tell the rest.
+            if (s.started && s.announced !== text) ctx.emit('audio', { type: 'tts.segment_text', rid: r.rid, seg: s.seg, text });
+            s.text = text;
           }
           if (r.spoken > 0 && r.buf.slice(0, r.spoken).trim()) {
-            r.open = { seg: r.segNo++, text: '', started: false };
+            r.open = { seg: r.segNo++, text: r.buf.slice(0, r.spoken).trim(), started: false };
             r.segs.push(r.open);
           }
           if (all) break;
@@ -452,8 +454,7 @@ function streamingTts(b: Backend): NodeDef<StreamParams> {
                 const view = new DataView(all.buffer, all.byteOffset, usable);
                 const out = new Float32Array(usable / 2);
                 for (let i = 0; i < out.length; i++) out[i] = view.getInt16(i * 2, true) / 0x8000;
-                if (s === r.open) (s.held ??= []).push(out);
-                else deliver(r, s, out);
+                deliver(r, s, out);
                 return;
               }
               const m = (data ?? {}) as JsonObject;
@@ -480,10 +481,7 @@ function streamingTts(b: Backend): NodeDef<StreamParams> {
             onClose(data) {
               if (reply !== r) return;
               if (data && (data as { error?: unknown }).error) ctx.log('error', 'TTS connection failed', data);
-              for (const s of r.segs) {
-                for (const out of s.held?.splice(0) ?? []) deliver(r, s, out);
-                ctx.emit('audio', { type: 'tts.segment_end', rid: r.rid, seg: s.seg });
-              }
+              for (const s of r.segs) ctx.emit('audio', { type: 'tts.segment_end', rid: r.rid, seg: s.seg });
               r.segs = [];
               finish(r);
             },

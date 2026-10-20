@@ -573,6 +573,14 @@ export class TimelineModel {
       case 'tts.segment_start':
         this.tts.push({ rid: d.rid, seg: d.seg, t0: e.t, text: d.text ?? '', seqs: [e.seq] });
         break;
+      case 'tts.segment_text': {
+        const s = this.tts.find((x) => x.rid === d.rid && x.seg === d.seg);
+        if (s) {
+          s.text = d.text ?? s.text;
+          s.seqs.push(e.seq);
+        }
+        break;
+      }
       case 'tts.segment_end': {
         const s = this.tts.find((x) => x.rid === d.rid && x.seg === d.seg);
         if (s) {
