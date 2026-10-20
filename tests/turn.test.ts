@@ -12,7 +12,7 @@ function harness(params: Record<string, unknown> = {}) {
   const ios: { request: Json; h: IOHandlers }[] = [];
   const ctx: NodeContext = {
     id: 'turn',
-    params: resolveParams(duplexTurnNode, { overlap: 'legacy', eotCheck: 'off', ...params } as never),
+    params: resolveParams(duplexTurnNode, { overlap: 'legacy', eotCheck: 'off', yieldWithinMs: 0, ...params } as never),
     now: () => now,
     cause: undefined,
     emit: (port, msg) => (out.push({ port, msg }), out.length),
@@ -294,6 +294,18 @@ describe('speech over the agent, classified by its words', () => {
     expect(h.states().at(-1)).toBe('speaking');
     h.advance(9000);
     expect(h.last('turn.user')?.text).toBe('tell me about Tokyo');
+  });
+
+  it('yields at once to speech that starts within a second of the agent starting', () => {
+    const h = speaking({ yieldWithinMs: 1000 });
+    h.send(2000, 'vad', { type: 'vad.speech_start', at: 2000 * sr });
+    expect(controls(h)).toEqual(['cancel']);
+    expect(h.decisions()).toEqual(['candidate', 'interrupt']);
+    expect(h.states().at(-1)).toBe('listening');
+    // Later in the reply, the usual rules apply.
+    const later = speaking({ holdAfterMs: 0, yieldWithinMs: 1000 });
+    later.send(2600, 'vad', { type: 'vad.speech_start', at: 2600 * sr });
+    expect(controls(later)).toEqual(['pause']);
   });
 
   it('by default talks on until the user has spoken over it for a second', () => {

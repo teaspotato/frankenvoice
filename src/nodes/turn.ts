@@ -99,6 +99,7 @@ interface DuplexParams {
   overlap: string;
   onset: string;
   holdAfterMs: number;
+  yieldWithinMs: number;
   duckDb: number;
   floorWords: string;
   asides: boolean;
@@ -347,6 +348,15 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       when: { bargeIn: [true], overlap: ['classify'] },
     },
     {
+      key: 'yieldWithinMs',
+      label: 'Yield if it just started (ms)',
+      type: 'number',
+      default: 1000,
+      description:
+        'User speech within this long of the agent starting to talk stops it at once and gives the user the floor: both started into a brief silence, and talking on turns into a fight over the floor. 0: off.',
+      when: { bargeIn: [true] },
+    },
+    {
       key: 'holdAfterMs',
       label: 'Cut after (ms)',
       type: 'number',
@@ -491,6 +501,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let draftNo = 0;
     /** The agent's audio is cut off (or ducked) while speech over it is judged. */
     let held = false;
+    /** When the agent's current reply started playing. */
+    let playingSince: number | null = null;
     /** Words said over the agent that it should take in, held until its current sentence ends. */
     let aside: { text: string; from: number; to: number; timer?: TimerHandle; cutting?: boolean } | null = null;
     const useModel = () => p.useModel && model;
@@ -981,6 +993,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       }
       if (port === 'playback') {
         if (msg.type === 'playback.start') {
+          playingSince = ctx.now();
           go('playback_start', 'playback started');
           // They started talking while it was thinking: don't talk over them while their words are judged.
           if (candidate) holdWhenSustained(candidate);
@@ -1016,7 +1029,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           silence?.clear();
           silence = null;
           backoff?.timer?.clear();
-          if (state === 'thinking' || state === 'speaking') overlap(msg.at as number, 'user speech (VAD)');
+          if (state === 'speaking' && p.yieldWithinMs > 0 && playingSince !== null && ctx.now() - playingSince < p.yieldWithinMs) {
+            // Both started into the same silence: the agent backs off at once rather than fight over the floor.
+            const c = overlap(msg.at as number, 'user speech (VAD)');
+            if (c && candidate === c) yieldFloor(c, `user spoke ${Math.round(ctx.now() - playingSince)} ms after the agent started`);
+          } else if (state === 'thinking' || state === 'speaking') overlap(msg.at as number, 'user speech (VAD)');
           else if (candidate?.ended !== undefined) {
             // They went on before the words of the last bit came in: one stretch of speech.
             const c = candidate;

@@ -313,5 +313,7 @@ export function apiConfig(): PipelineConfig {
   c.tts.variant = 'api';
   c.workers.variant = 'acp';
   c.turnmodel.variant = 'ssl_turn';
+  // The fake user talks soon after replies start; these tests are about the rest of the floor rules.
+  c.turn.params['full-duplex'] = { yieldWithinMs: 0 };
   return c;
 }
