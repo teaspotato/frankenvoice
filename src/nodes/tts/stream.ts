@@ -197,14 +197,36 @@ function streamingTts(b: Backend): NodeDef<StreamParams> {
        */
       const prerender = (lines: string[]) => {
         const todo = [...new Set(lines)].filter((l) => !canned.has(l));
-        // Kyutai speaks one utterance per socket, so each line gets its own.
-        const per = b.wordStreaming ? 1 : Math.max(1, p.maxFlushesPerMin);
+        if (b.wordStreaming) {
+          for (const l of todo) if (!waiting.includes(l)) waiting.push(l);
+          return pump();
+        }
+        const per = Math.max(1, p.maxFlushesPerMin);
         for (let i = 0; i < todo.length; i += per) renderBatch(todo.slice(i, i + per));
+      };
+
+      /**
+       * Kyutai speaks one utterance per socket and the GPU box renders one at a time, so lines go one
+       * by one and wait while a reply is speaking. Dozens of sockets at once also held up the ASR
+       * socket: the browser opens one WebSocket to a host at a time.
+       */
+      const waiting: string[] = [];
+      let rendering = false;
+      const pump = () => {
+        if (!b.wordStreaming || rendering || reply || !waiting.length) return;
+        rendering = true;
+        let done = false;
+        renderBatch([waiting.shift()!], () => {
+          if (done) return;
+          done = true;
+          rendering = false;
+          pump();
+        });
       };
 
       /** Lines already re-sent once after their socket closed early. */
       const retried = new Set<string>();
-      const renderBatch = (todo: string[]) => {
+      const renderBatch = (todo: string[], done?: () => void) => {
         const queue = [...todo];
         let chunks: Float32Array[] = [];
         const decode = decoder();
@@ -222,16 +244,17 @@ function streamingTts(b: Backend): NodeDef<StreamParams> {
               if (!queue.length && !io.closed) {
                 if (!b.wordStreaming) io.send({ type: 'Close' });
                 io.close();
+                done?.();
               }
             },
             onClose(err) {
               // Closed before every line came back: try those once more.
               const left = queue.filter((l) => !retried.has(l));
               queue.length = 0;
-              if (!left.length) return;
+              if (!left.length) return done?.();
               ctx.log('warn', 'canned lines not rendered; retrying', { lines: left, error: (err ?? null) as Json });
               for (const l of left) retried.add(l);
-              renderBatch(left);
+              renderBatch(left, done);
             },
           },
         );
@@ -310,6 +333,7 @@ function streamingTts(b: Backend): NodeDef<StreamParams> {
         if (r.align && !r.align.io.closed) r.align.io.send({ type: 'CloseStream' });
         ctx.emit('audio', { type: 'tts.response_end', rid: r.rid });
         ctx.setState('status', 'idle');
+        pump();
       };
 
       /** Send whatever text is ready, flushing within Deepgram's rate limit. */
@@ -478,6 +502,7 @@ function streamingTts(b: Backend): NodeDef<StreamParams> {
         if (r.align && !r.align.io.closed) r.align.io.close({ status: 'cancelled' });
         ctx.emit('audio', { type: 'tts.cancelled', rid: r.rid });
         ctx.setState('status', 'idle');
+        pump();
       };
 
       return {
