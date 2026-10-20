@@ -134,7 +134,9 @@ export class TimelineModel {
   eotChecks: (Marker & { p?: number; hold?: boolean; failed?: boolean; ms: number })[] = [];
   llm: LlmSpan[] = [];
   /** The tape (turn.tape): a cell per decision, from its boundary (`t0`) to when its line was written (`t1`). */
-  tapeCells: (Span & { n: number; action: string; state: string; ms?: number; forced?: string; dropped?: string; failed?: boolean; promptN?: number; promptMs?: number })[] = [];
+  tapeCells: (Span & { n: number; action: string; state: string; ms?: number; forced?: string; dropped?: string; failed?: boolean; promptN?: number; promptMs?: number; spec?: string })[] = [];
+  /** Speculation on the tape: cells written ahead (as if the user stays silent), their reply released or dropped. */
+  tapeSpec: (Marker & { event: string; action?: string; ms?: number; why?: string })[] = [];
   /** Cuts on the tape: words written but never heard, taken off it. */
   tapeCuts: (Marker & { unsaid: string[] })[] = [];
   drafts: Draft[] = [];
@@ -423,7 +425,11 @@ export class TimelineModel {
           ...(d.dropped ? { dropped: d.dropped } : {}),
           ...(d.failed ? { failed: true } : {}),
           ...(typeof d.promptN === 'number' ? { promptN: d.promptN, promptMs: d.promptMs } : {}),
+          ...(d.spec ? { spec: d.spec } : {}),
         });
+        break;
+      case 'tape.spec':
+        this.tapeSpec.push({ t: e.t, event: d.event, text: d.line ?? '', seq: e.seq, ...(d.action ? { action: d.action } : {}), ...(typeof d.ms === 'number' ? { ms: d.ms } : {}), ...(d.why ? { why: d.why } : {}) });
         break;
       case 'tape.cut':
         this.tapeCuts.push({ t: e.t, text: d.heard ?? '', unsaid: d.unsaid ?? [], seq: e.seq });

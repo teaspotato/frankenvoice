@@ -30,6 +30,7 @@ interface TapeParams {
   cutAfterMs: number;
   idleCells: number;
   cutOverCells: number;
+  specCells: number;
   maxLines: number;
   keepLines: number;
   stableWords: boolean;
@@ -63,6 +64,8 @@ interface Call {
   t0: number;
   io: IOHandle;
   res?: JsonObject;
+  /** A cell written ahead, for this speculation. */
+  spec: unknown;
 }
 
 /**
@@ -112,6 +115,14 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       default: 3,
       description: 'After a cut, this many cells without user words or voice (and no resume or answer) end the cut-off state: the next lines say silent. 0: it lasts until Gemma resumes or answers.',
     },
+    {
+      key: 'specCells',
+      label: 'Write ahead (cells)',
+      type: 'number',
+      default: 6,
+      description:
+        'Once the user stops (VAD silent, ASR caught up), write up to this many cells ahead as if they stay silent. A reply started there is rendered by TTS and held; its audio plays the moment a real cell confirms the silence. User voice or new words drop it. 0: off.',
+    },
     { key: 'maxLines', label: 'Max tape lines', type: 'number', default: 72, description: 'Longer tapes are cut to the last lines below, the rest kept as a plain transcript (one full prefill).' },
     { key: 'keepLines', label: 'Lines kept when cut', type: 'number', default: 40 },
     { key: 'stableWords', label: 'Commit stable partial words', type: 'boolean', default: true, description: 'Put ASR partial words on the tape once a later partial repeats them (else only finals).' },
@@ -135,7 +146,16 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     let head = promptHead(system, example);
     let earlier: string[] = [];
 
-    let state: TapeState = 'silent';
+    /** The agent as the tape has it: live, or as a speculation imagines it. */
+    interface Side {
+      state: TapeState;
+      reply: Reply | null;
+      /** Session ms when the words sent so far will have been said. */
+      queueEnd: number;
+      /** Cells in a row without user words or voice. */
+      idle: number;
+    }
+    const live: Side = { state: 'silent', reply: null, queueEnd: 0, idle: 0 };
     const cells: Cell[] = [];
     let t0 = 0;
     let cellNo = 0;
@@ -143,12 +163,8 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     let winVoice = false;
     /** The VAD hears the user. */
     let speaking = false;
-    let idle = 0;
     let call: Call | null = null;
-    let reply: Reply | null = null;
     let ridNo = 0;
-    /** Session ms when the words sent so far will have been said. */
-    let queueEnd = 0;
     let cutTimer: TimerHandle | null = null;
     let greet: string[] | null = null;
     let greetFinish = false;
@@ -157,9 +173,30 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     let segN = 0;
     let prevPartial: string[] = [];
 
+    /**
+     * A speculation: the cells after the live tape, written ahead on the assumption that the user stays
+     * silent. A reply it starts is rendered by TTS but held; each real cell that matches its cell (no
+     * words, no voice) adopts what it decided, and the reply's audio is released by the first one.
+     */
+    interface Spec {
+      id: number;
+      side: Side;
+      /** Decided cells, oldest first, with what they did to the side. */
+      cells: (Cell & { after: TapeState; stats: JsonObject })[];
+      /** Its reply's audio was released (a real cell adopted its start). */
+      released: boolean;
+      /** Nothing more to write ahead. */
+      stopped?: string;
+      /** The real cell waiting for the speculative call in flight for it. */
+      awaiting?: Cell;
+    }
+    let spec: Spec | null = null;
+    let specNo = 0;
+
+    const tOf = (n: number) => Math.round(n * cellMs) / 1000;
     const setFloor = () => {
-      ctx.setState('state', state);
-      ctx.setState('floor', state === 'speaking' || reply?.playing ? 'speaking' : 'listening');
+      ctx.setState('state', live.state);
+      ctx.setState('floor', live.state === 'speaking' || live.reply?.playing ? 'speaking' : 'listening');
     };
     setFloor();
 
@@ -167,11 +204,6 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       const l = line(c);
       ctx.setState('line', l);
       ctx.emit('turn', { type: 'tape.cell', n: c.n, t: c.t, at: t0 + c.n * cellMs, state: c.state, action: c.action, say: c.say, user: c.user, voice: c.voice, line: l, ...extra });
-    };
-
-    const commitWords = (ws: string[]) => {
-      // No periods on the user's words: the ASR ends every final with one, also at a pause mid-sentence.
-      winWords.push(...ws.map(noPeriods).filter(Boolean));
     };
 
     /** The tape gets too long for the slot: keep the last lines, the rest as a transcript in the head. */
@@ -188,16 +220,14 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       ctx.log('info', 'tape shortened', { dropped: drop.length, kept: cells.length });
     };
 
-    const queueWords = (n: number) => {
-      queueEnd = Math.max(ctx.now() + p.ttsLeadMs, queueEnd) + n * WORD_S * 1000;
-    };
-
-    const say = (r: Reply, c: Cell, ws: string[]) => {
-      if (!ws.length) return;
+    /** `s` sends `ws` (in cell `c`, at session time `at`). */
+    const say = (s: Side, c: Cell, ws: string[], at: number) => {
+      const r = s.reply;
+      if (!ws.length || !r) return;
       c.say.push(...ws);
       for (const w of ws) r.sent.push({ n: c.n, word: w });
       ctx.emit('text', { type: 'llm.delta', rid: r.rid, text: `${ws.join(' ')} ` });
-      queueWords(ws.length);
+      s.queueEnd = Math.max(at + p.ttsLeadMs, s.queueEnd) + ws.length * WORD_S * 1000;
     };
     const endReply = (r: Reply, status: string) => {
       if (r.ended) return;
@@ -205,41 +235,60 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       ctx.emit('text', { type: 'llm.end', rid: r.rid, status, stopReason: status === 'done' ? 'stop' : null, text: r.sent.map((w) => w.word).join(' '), tape: true });
     };
 
-    /** Carry out the action Gemma wrote for cell `c`. */
-    const act = (c: Cell, action: string, ws: string[]) => {
+    /**
+     * Carry out the action written for cell `c` on side `s` (at session time `at`). A speculation's
+     * reply is held in TTS, and its backchannel waits for a real cell to adopt it.
+     */
+    const act = (s: Side, c: Cell, action: string, ws: string[], at: number, held: boolean) => {
       c.action = action;
       if (action === 'backchannel') {
-        const text = ws.join(' ');
         c.say = ws;
-        ctx.emit('text', { type: 'bc.say', id: `${ctx.id}-bc${c.n}`, line: text, take: text, tailMs: 150, why: 'tape' });
-      } else if (action === 'respond' || action === 'resume' || (action === 'continue' && !reply)) {
+        if (!held) sayBackchannel(c);
+      } else if (action === 'respond' || action === 'resume' || (action === 'continue' && !s.reply)) {
         if (!ws.length) return;
-        if (reply && !reply.ended) endReply(reply, 'cancelled');
-        const r: Reply = { rid: `${ctx.id}-r${ridNo++}`, sent: [], ended: false, playing: false };
-        reply = r;
-        ctx.emit('text', { type: 'llm.start', rid: r.rid, turnId: null, tape: action });
-        queueEnd = Math.max(queueEnd, ctx.now());
-        say(r, c, ws);
-        state = 'speaking';
-      } else if (action === 'continue' && reply) {
-        say(reply, c, ws);
+        if (s.reply && !s.reply.ended) endReply(s.reply, 'cancelled');
+        s.reply = { rid: `${ctx.id}-r${ridNo++}`, sent: [], ended: false, playing: false };
+        ctx.emit('text', { type: 'llm.start', rid: s.reply.rid, turnId: null, tape: action, ...(held ? { held: true } : {}) });
+        s.queueEnd = Math.max(s.queueEnd, at);
+        say(s, c, ws, at);
+        s.state = 'speaking';
+      } else if (action === 'continue') {
+        say(s, c, ws, at);
       } else if (action === 'finish') {
-        if (reply) {
-          say(reply, c, ws);
-          endReply(reply, 'done');
-          if (!reply.playing && !reply.sent.length) reply = null;
+        const r = s.reply;
+        if (r) {
+          say(s, c, ws, at);
+          endReply(r, 'done');
+          if (!r.playing && !r.sent.length) s.reply = null;
         }
-        state = 'silent';
+        s.state = 'silent';
       }
-      setFloor();
+    };
+    const sayBackchannel = (c: Cell) => {
+      const text = c.say.join(' ');
+      ctx.emit('text', { type: 'bc.say', id: `${ctx.id}-bc${c.n}`, line: text, take: text, tailMs: 150, why: 'tape' });
     };
 
     const defaultAction = (s: TapeState) => (s === 'speaking' ? 'continue' : 'listen');
 
-    const ask = (c: Cell, maxWords: number) => {
+    /**
+     * Cell `n` of side `s`: its line up to the action, and whether a call decides it. The same rules
+     * write the live cell at its boundary and a speculative one ahead of time (at `at`).
+     */
+    const plan = (s: Side, n: number, user: string[], voice: boolean, at: number) => {
+      // Cut off, and the user has been quiet for a while without Gemma resuming or answering: the turn is over.
+      if (s.state === 'cut' && p.cutOverCells > 0 && s.idle >= p.cutOverCells) s.state = 'silent';
+      const c = newCell(n, tOf(n), s.state, user, voice);
+      s.idle = user.length || voice ? 0 : s.idle + 1;
+      const room = headroom(at / 1000, s.queueEnd / 1000, p.ttsLeadMs / 1000, cellMs / 1000, Math.max(1, p.maxWords));
+      const forced = s.state === 'speaking' && room === 0 ? 'TTS queue full' : s.state !== 'speaking' && p.idleCells > 0 && s.idle > p.idleCells ? 'idle' : null;
+      return { c, forced, maxWords: Math.max(1, room) };
+    };
+
+    const ask = (c: Cell, tape: Cell[], maxWords: number, sp: Spec | null) => {
       const allowed = ACTIONS[c.state];
       const body: JsonObject = {
-        prompt: tapePrompt(head, cells),
+        prompt: tapePrompt(head, tape),
         grammar: grammar(allowed, maxWords),
         n_predict: 32,
         temperature: p.temperature,
@@ -247,9 +296,9 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
         stop: ['\n'],
         ...(p.slot >= 0 ? { id_slot: p.slot } : {}),
       };
-      const k: Call = { cell: c, state: c.state, allowed, maxWords, t0: ctx.now(), io: undefined as unknown as Call['io'] };
+      const k: Call = { cell: c, state: c.state, allowed, maxWords, t0: ctx.now(), io: undefined as unknown as Call['io'], spec: sp };
       call = k;
-      ctx.setState('calling', true);
+      ctx.setState('calling', sp ? 'ahead' : 'live');
       k.io = ctx.io.open(CHANNEL, { body }, {
         onRecv(data) {
           if (data && typeof data === 'object' && !Array.isArray(data)) k.res = data as JsonObject;
@@ -258,83 +307,264 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
           if (call !== k) return;
           call = null;
           ctx.setState('calling', false);
-          answered(k, (data as JsonObject | null)?.error ?? null);
+          const error = (data as JsonObject | null)?.error ?? null;
+          if (k.spec) specAnswered(k, error);
+          else answered(k, error);
         },
       });
     };
 
-    const answered = (k: Call, error: Json) => {
-      const c = k.cell;
-      const ms = Math.round(ctx.now() - k.t0);
-      ctx.setState('lastMs', ms);
+    /** What a call wrote, or null (and why) if it failed. */
+    const read = (k: Call, error: Json) => {
       const timings = (k.res?.timings ?? null) as JsonObject | null;
       const stats: JsonObject = {
-        ms,
+        ms: Math.round(ctx.now() - k.t0),
         maxWords: k.maxWords,
         allowed: k.allowed,
         ...(timings ? { promptN: timings.prompt_n ?? null, promptMs: timings.prompt_ms ?? null, predictedN: timings.predicted_n ?? null, predictedMs: timings.predicted_ms ?? null } : {}),
       };
+      ctx.setState('lastMs', stats.ms);
       const text = typeof k.res?.content === 'string' ? k.res.content : null;
       const d = text === null ? null : parseAction(text);
       if (error || !d || !k.allowed.includes(d.action)) {
-        if (error || text === null) ctx.log('warn', 'tape call failed', { error, cell: c.n });
-        else ctx.log('warn', 'tape call wrote no action', { text, cell: c.n });
-        c.action = defaultAction(k.state);
-        return emitCell(c, { ...stats, failed: true, ...(text !== null ? { wrote: text } : {}) });
+        if (error || text === null) ctx.log('warn', 'tape call failed', { error, cell: k.cell.n });
+        else ctx.log('warn', 'tape call wrote no action', { text, cell: k.cell.n });
+        return { d: null, text, stats };
       }
-      if (state !== k.state) {
-        // The agent was cut off while Gemma wrote: what it wrote no longer applies.
-        c.action = defaultAction(k.state);
-        return emitCell(c, { ...stats, dropped: `the state changed to ${state}`, wrote: text });
-      }
-      act(c, d.action, d.words);
-      emitCell(c, { ...stats, late: ctx.now() > t0 + (c.n + 1) * cellMs });
+      return { d, text, stats };
     };
 
-    /** One cell ends: write its line up to the action and decide it. */
+    const answered = (k: Call, error: Json) => {
+      const c = k.cell;
+      const { d, text, stats } = read(k, error);
+      if (!d) {
+        c.action = defaultAction(k.state);
+        emitCell(c, { ...stats, failed: true, ...(text !== null ? { wrote: text } : {}) });
+      } else if (live.state !== k.state) {
+        // The agent was cut off while Gemma wrote: what it wrote no longer applies.
+        c.action = defaultAction(k.state);
+        emitCell(c, { ...stats, dropped: `the state changed to ${live.state}`, wrote: text });
+      } else {
+        act(live, c, d.action, d.words, ctx.now(), false);
+        setFloor();
+        emitCell(c, { ...stats, late: ctx.now() > t0 + (c.n + 1) * cellMs });
+      }
+      maybeSpeculate();
+    };
+
+    // ---- speculation ---------------------------------------------------------------------------
+
+    const emitSpec = (event: string, data: JsonObject = {}) => ctx.emit('turn', { type: 'tape.spec', event, spec: spec?.id ?? null, ...data });
+
+    /** Give up the speculation: its held reply is dropped, unless it was released (then it is live). */
+    const dropSpec = (why: string) => {
+      const sp = spec;
+      if (!sp) return;
+      if (call?.spec === sp) {
+        if (!call.io.closed) call.io.close({ status: 'cancelled' });
+        call = null;
+        ctx.setState('calling', false);
+      }
+      const r = sp.side.reply;
+      if (r && !sp.released) {
+        ctx.emit('text', { type: 'llm.drop', rid: r.rid });
+        if (!r.ended) endReply(r, 'dropped');
+      }
+      emitSpec('drop', { why, ahead: sp.cells.length, ...(r && !sp.released ? { rid: r.rid } : {}) });
+      spec = null;
+      ctx.setState('ahead', 0);
+    };
+
+    /** Start writing ahead, if the user is silent, ASR has their words and the agent has nothing in flight. */
+    const maybeSpeculate = () => {
+      if (spec || call || p.specCells <= 0 || speaking || greet || greetFinish) return;
+      if (live.state === 'speaking' || live.reply) return;
+      // An ASR partial with words not on the tape yet: they are still to come.
+      if (prevPartial.length > segN) return;
+      if (p.idleCells > 0 && live.idle >= p.idleCells) return;
+      spec = { id: specNo++, side: { ...live }, cells: [], released: false };
+      emitSpec('start', { from: cellNo + 1 });
+      specStep();
+    };
+
+    /** Write the next cell ahead. */
+    const specStep = () => {
+      const sp = spec;
+      if (!sp || call || sp.stopped) return;
+      const n = (sp.cells.at(-1)?.n ?? cellNo) + 1;
+      if (n - cellNo > p.specCells) return;
+      // The cell in progress has what the user did so far; later ones are silent.
+      const now = n === cellNo + 1;
+      const { c, forced, maxWords } = plan(sp.side, n, now ? [...winWords] : [], now ? winVoice || speaking : false, t0 + n * cellMs);
+      if (forced === 'idle') {
+        sp.stopped = 'idle';
+        return;
+      }
+      if (forced) {
+        sp.cells.push({ ...c, after: sp.side.state, stats: { forced } });
+        return specStep();
+      }
+      ask(c, [...cells, ...sp.cells, c], maxWords, sp);
+    };
+
+    const specAnswered = (k: Call, error: Json) => {
+      const sp = k.spec as Spec;
+      if (spec !== sp) return;
+      const c = k.cell;
+      const { d, text, stats } = read(k, error);
+      if (!d) {
+        sp.stopped = 'call failed';
+        emitSpec('stop', { why: 'call failed', n: c.n, ...(text !== null ? { wrote: text } : {}) });
+        if (sp.awaiting?.n === c.n) {
+          const real = sp.awaiting;
+          sp.awaiting = undefined;
+          real.action = defaultAction(real.state);
+          emitCell(real, { ...stats, failed: true });
+        }
+        return;
+      }
+      act(sp.side, c, d.action, d.words, Math.max(ctx.now(), t0 + c.n * cellMs), !sp.released);
+      const done = { ...c, after: sp.side.state, stats };
+      sp.cells.push(done);
+      emitSpec('cell', { n: c.n, action: c.action, line: line(c), ...stats });
+      ctx.setState('ahead', sp.cells.length);
+      if (d.action === 'finish' || d.action === 'backchannel') sp.stopped = d.action;
+      if (sp.awaiting?.n === c.n) {
+        // The real cell came while this was written: it takes it now.
+        const real = sp.awaiting;
+        sp.awaiting = undefined;
+        adopt(sp, real, true);
+      }
+      specStep();
+    };
+
+    /** Real cell `c` matches the speculation's first cell: take what it decided. */
+    const adopt = (sp: Spec, c: Cell, late = false) => {
+      const s = sp.cells.shift()!;
+      c.action = s.action;
+      c.say = [...s.say];
+      // The words were sent under the speculative cell: they are this cell's.
+      const r = sp.side.reply;
+      if (s.action === 'backchannel') sayBackchannel(c);
+      if ((s.action === 'respond' || s.action === 'resume') && r && !sp.released) {
+        sp.released = true;
+        ctx.emit('text', { type: 'llm.release', rid: r.rid });
+        emitSpec('release', { n: c.n, rid: r.rid });
+      }
+      if (sp.released || s.action === 'listen' || s.action === 'backchannel') {
+        live.state = s.after;
+        if (sp.released) {
+          live.reply = r;
+          live.queueEnd = Math.max(live.queueEnd, sp.side.queueEnd);
+        }
+      }
+      setFloor();
+      emitCell(c, { ...s.stats, spec: late ? 'adopted late' : 'adopted' });
+      ctx.setState('ahead', sp.cells.length);
+      if (!sp.cells.length && sp.stopped) {
+        spec = null;
+        emitSpec('done', { n: c.n });
+        maybeSpeculate();
+      } else specStep();
+    };
+
+    /** The real cell `c` differs from the speculation (the user spoke): what was released stays live. */
+    const breakSpec = (c: Cell, why: string) => {
+      const sp = spec!;
+      if (sp.released && sp.side.reply) {
+        // Words already sent for cells ahead belong to this cell now.
+        const r = sp.side.reply;
+        const rest = sp.cells.filter((x) => x.n >= c.n);
+        const ws = rest.flatMap((x) => x.say);
+        for (const w of r.sent) if (w.n >= c.n) w.n = c.n;
+        if (ws.length) {
+          c.say = ws;
+          c.action = rest.some((x) => x.action === 'finish') ? 'finish' : 'continue';
+        }
+        live.state = rest.length ? rest[rest.length - 1].after : live.state;
+        live.reply = r;
+        sp.released = true;
+      }
+      dropSpec(why);
+    };
+
+    // ---- the live tape -------------------------------------------------------------------------
+
+    /** One cell ends: write its line up to the action and decide it (or take the speculation's). */
     const boundary = () => {
       const n = ++cellNo;
-      // Cut off, and the user has been quiet for a while without Gemma resuming or answering: the turn is over.
-      if (state === 'cut' && p.cutOverCells > 0 && idle >= p.cutOverCells) {
-        state = 'silent';
-        setFloor();
-      }
-      const c = newCell(n, Math.round(n * cellMs) / 1000, state, winWords, winVoice || speaking);
+      const user = winWords;
+      const voice = winVoice || speaking;
       winWords = [];
       winVoice = speaking;
-      idle = c.user.length || c.voice ? 0 : idle + 1;
-      cells.push(c);
-      trim();
       ctx.setTimer(Math.max(0, t0 + (n + 1) * cellMs - ctx.now()), boundary, 'cell');
+      if (spec) {
+        const sp = spec;
+        const ahead = sp.cells[0]?.n === n ? sp.cells[0] : null;
+        const pending = !ahead && call?.spec === sp && call.cell.n === n ? call.cell : null;
+        const expect = ahead ?? pending;
+        const same = !!expect && expect.voice === voice && expect.user.join(' ') === user.join(' ');
+        if (same) {
+          // The real cell is the one written ahead.
+          const { c } = plan(live, n, user, voice, ctx.now());
+          cells.push(c);
+          trim();
+          if (ahead) return adopt(sp, c);
+          sp.awaiting = c;
+          return;
+        }
+        const planned = plan(live, n, user, voice, ctx.now());
+        const c = planned.c;
+        breakSpec(c, expect ? 'the user spoke' : 'nothing written for this cell');
+        if (c.say.length) {
+          cells.push(c);
+          trim();
+          setFloor();
+          return emitCell(c, { forced: 'sent ahead' });
+        }
+        return liveCell(c, planned.forced, planned.maxWords);
+      }
       if (greet) {
+        const { c } = plan(live, n, user, voice, ctx.now());
         // The opening line, said as a cue: on the tape as an answer.
         c.action = 'respond';
         c.say = greet;
         greet = null;
         greetFinish = true;
-        state = 'speaking';
+        live.state = 'speaking';
+        cells.push(c);
         return emitCell(c, { forced: 'greeting' });
       }
-      if (greetFinish && state === 'speaking' && !reply) {
+      if (greetFinish && live.state === 'speaking' && !live.reply) {
+        const { c } = plan(live, n, user, voice, ctx.now());
         greetFinish = false;
         c.action = 'finish';
-        state = 'silent';
+        live.state = 'silent';
+        cells.push(c);
         setFloor();
-        return emitCell(c, { forced: 'greeting' });
+        emitCell(c, { forced: 'greeting' });
+        return maybeSpeculate();
       }
       greetFinish = false;
+      const { c, forced, maxWords } = plan(live, n, user, voice, ctx.now());
+      liveCell(c, forced, maxWords);
+    };
+    const liveCell = (c: Cell, forced: string | null, maxWords: number) => {
+      cells.push(c);
+      trim();
       if (call) {
-        c.action = defaultAction(state);
+        c.action = defaultAction(live.state);
         return emitCell(c, { forced: 'a call is still out' });
       }
-      const room = headroom(ctx.now() / 1000, queueEnd / 1000, p.ttsLeadMs / 1000, cellMs / 1000, Math.max(1, p.maxWords));
-      if (state === 'speaking' && room === 0) return emitCell(c, { forced: 'TTS queue full' });
-      if (state !== 'speaking' && p.idleCells > 0 && idle > p.idleCells) return emitCell(c, { forced: 'idle' });
-      ask(c, Math.max(1, room));
+      if (forced) {
+        emitCell(c, { forced });
+        return maybeSpeculate();
+      }
+      ask(c, cells, maxWords, null);
     };
 
     /** User voice over the answer: stop it. */
-    const audible = () => !!reply && !reply.cutting && (state === 'speaking' || reply.playing);
+    const audible = () => !!live.reply && !live.reply.cutting && (live.state === 'speaking' || live.reply.playing);
     const armCut = () => {
       cutTimer?.clear();
       cutTimer = null;
@@ -345,11 +575,12 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       }, 'cut');
     };
     const cut = () => {
-      const r = reply!;
+      if (spec) dropSpec('the agent was cut off');
+      const r = live.reply!;
       ctx.emit('control', { type: 'cancel' });
       endReply(r, 'cancelled');
-      state = 'cut';
-      queueEnd = ctx.now();
+      live.state = 'cut';
+      live.queueEnd = ctx.now();
       if (r.playing) r.cutting = true;
       else heardOf(r, '');
       setFloor();
@@ -359,8 +590,18 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       const gone = cutTape(cells, r.sent, k);
       ctx.emit('turn', { type: 'tape.cut', rid: r.rid, heard, said: Math.min(k, r.sent.length), unsaid: gone });
       ctx.emit('turn', { type: 'turn.heard', rid: r.rid, text: heard });
-      if (reply === r) reply = null;
+      if (live.reply === r) live.reply = null;
       setFloor();
+      maybeSpeculate();
+    };
+
+    const commitWords = (ws: string[]) => {
+      // No periods on the user's words: the ASR ends every final with one, also at a pause mid-sentence.
+      const add = ws.map(noPeriods).filter(Boolean);
+      if (!add.length) return;
+      winWords.push(...add);
+      // New words: the cell in progress isn't what the speculation assumed.
+      if (spec && !spec.released) dropSpec('new words');
     };
 
     return {
@@ -376,30 +617,33 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
             speaking = true;
             winVoice = true;
             ctx.setState('userSpeaking', true);
+            if (spec && !spec.released) dropSpec('user voice');
             armCut();
           } else if (msg.type === 'vad.speech_end') {
             speaking = false;
             ctx.setState('userSpeaking', false);
             cutTimer?.clear();
             cutTimer = null;
+            maybeSpeculate();
           }
           return;
         }
         if (port === 'playback') {
-          const r = reply;
+          const r = live.reply;
           if (!r || msg.rid !== r.rid) return;
           if (msg.type === 'playback.start') {
             r.playing = true;
             if (speaking) armCut();
           } else if (msg.type === 'playback.end') {
             r.playing = false;
-            queueEnd = Math.min(queueEnd, ctx.now());
-            if (r.ended) reply = null;
+            live.queueEnd = Math.min(live.queueEnd, ctx.now());
+            if (r.ended) live.reply = null;
           } else if (msg.type === 'playback.interrupted') {
             r.playing = false;
             if (r.cutting) heardOf(r, String(msg.heard ?? ''));
           }
           setFloor();
+          maybeSpeculate();
           return;
         }
         // transcript
@@ -417,6 +661,7 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
           commitWords(ws.slice(segN));
           segN = 0;
           prevPartial = [];
+          maybeSpeculate();
         } else if (msg.type === 'asr.partial' && p.stableWords) {
           let same = 0;
           while (same < ws.length && same < prevPartial.length && ws[same] === prevPartial[same]) same++;

@@ -105,7 +105,13 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       received: number;
       /** The flags of the utterance being written (tagged replies). */
       flags?: Flags;
+      /** Held (a speculative reply): what it would emit, kept until it is released or dropped. */
+      hold?: Msg[];
     };
+    /** Held replies by rid, until released or dropped (they may finish rendering before). */
+    const held = new Map<string, Reply>();
+    /** A reply's output: emitted, or kept while the reply is held. */
+    const out = (r: Reply, m: Msg) => (r.hold ? void r.hold.push(m) : void ctx.emit('audio', m));
     let reply: Reply | undefined;
     /** Opener lines (fillers), synthesized ahead so they play at once. */
     const canned = new Map<string, Float32Array[]>();
@@ -177,11 +183,11 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       if (!s.started) {
         s.started = true;
         s.announced = s.text;
-        ctx.emit('audio', { type: 'tts.segment_start', rid: r.rid, seg: s.seg, text: s.text, ...(s.flags ?? {}) });
+        out(r, { type: 'tts.segment_start', rid: r.rid, seg: s.seg, text: s.text, ...(s.flags ?? {}) });
       }
       if (!samples.length) return;
       const ref = ctx.media.append('audio', samples, p.sampleRate);
-      ctx.emit('audio', { type: 'audio', ...ref, sampleRate: p.sampleRate, samples, rid: r.rid, seg: s.seg });
+      out(r, { type: 'audio', ...ref, sampleRate: p.sampleRate, samples, rid: r.rid, seg: s.seg });
       return ref;
     };
 
@@ -204,7 +210,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       reply = undefined;
       // Close (end of text) went out when the LLM finished.
       if (!r.io.closed) r.io.close();
-      ctx.emit('audio', { type: 'tts.response_end', rid: r.rid });
+      out(r, { type: 'tts.response_end', rid: r.rid });
       ctx.setState('status', 'idle');
     };
 
@@ -224,7 +230,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
         r.io.send({ type: 'Speak', text });
         // For the scheduler: how many words TTS has been given.
         const words = text.split(/\s+/).filter(Boolean).length;
-        if (words) ctx.emit('audio', { type: 'tts.sent', rid: r.rid, words });
+        if (words) out(r, { type: 'tts.sent', rid: r.rid, words });
         r.spoken = ready;
         ctx.setState('status', 'synthesizing');
       }
@@ -239,7 +245,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
           r.open = undefined;
           r.io.send({ type: 'Flush' });
           // Its audio may have started with part of the text: tell the rest.
-          if (s.started && s.announced !== text) ctx.emit('audio', { type: 'tts.segment_text', rid: r.rid, seg: s.seg, text });
+          if (s.started && s.announced !== text) out(r, { type: 'tts.segment_text', rid: r.rid, seg: s.seg, text });
           s.text = text;
         }
         if (r.spoken > 0 && r.buf.slice(0, r.spoken).trim()) {
@@ -258,7 +264,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       const s: Seg = { seg: r.segNo++, text, started: false };
       emitAudio(r, s, new Float32Array());
       for (const a of audio) emitAudio(r, s, a);
-      ctx.emit('audio', { type: 'tts.segment_end', rid: r.rid, seg: s.seg, canned: true });
+      out(r, { type: 'tts.segment_end', rid: r.rid, seg: s.seg, canned: true });
       return true;
     };
 
@@ -365,19 +371,19 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
                 start: placeOn(r.pieces, w.start),
                 end: placeOn(r.pieces, w.end),
               }));
-              if (words.length) ctx.emit('audio', { type: 'tts.words', rid: r.rid, words: words as unknown as Json });
+              if (words.length) out(r, { type: 'tts.words', rid: r.rid, words: words as unknown as Json });
               return;
             }
             if (m.type === 'Consumed') {
               // For the scheduler: the words the model still has to read.
-              ctx.emit('audio', { type: 'tts.consumed', rid: r.rid, words: m.words ?? 0, queued: m.queued ?? 0 });
+              out(r, { type: 'tts.consumed', rid: r.rid, words: m.words ?? 0, queued: m.queued ?? 0 });
               return;
             }
             if (m.type === 'Flushed') {
               const s = r.segs.shift();
               if (s) {
                 if (!s.started) emitAudio(r, s, new Float32Array());
-                ctx.emit('audio', { type: 'tts.segment_end', rid: r.rid, seg: s.seg });
+                out(r, { type: 'tts.segment_end', rid: r.rid, seg: s.seg });
               }
               if (r.llmDone && !r.segs.length && !r.buf) finish(r);
             } else if (m.type === 'Warning' || m.type === 'Error') ctx.log('warn', `TTS ${String(m.type)}`, m);
@@ -385,7 +391,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
           onClose(data) {
             if (reply !== r) return;
             if (data && (data as { error?: unknown }).error) ctx.log('error', 'TTS connection failed', data);
-            for (const s of r.segs) ctx.emit('audio', { type: 'tts.segment_end', rid: r.rid, seg: s.seg });
+            for (const s of r.segs) out(r, { type: 'tts.segment_end', rid: r.rid, seg: s.seg });
             r.segs = [];
             finish(r);
           },
@@ -400,7 +406,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       if (!r) return;
       reply = undefined;
       r.io.close({ status: 'cancelled' });
-      ctx.emit('audio', { type: 'tts.cancelled', rid: r.rid });
+      out(r, { type: 'tts.cancelled', rid: r.rid });
       ctx.setState('status', 'idle');
     };
 
@@ -415,7 +421,29 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
           case 'llm.start':
             cancel();
             start(msg.rid as string);
+            if (msg.held) {
+              // Rendered now, heard only once released.
+              reply!.hold = [];
+              held.set(msg.rid as string, reply!);
+            }
             break;
+          case 'llm.release': {
+            const h = held.get(msg.rid as string);
+            if (!h) break;
+            held.delete(h.rid);
+            const msgs = h.hold ?? [];
+            h.hold = undefined;
+            for (const m of msgs) ctx.emit('audio', m);
+            break;
+          }
+          case 'llm.drop': {
+            const h = held.get(msg.rid as string);
+            if (!h) break;
+            held.delete(h.rid);
+            if (reply === h) cancel();
+            h.hold = undefined;
+            break;
+          }
           case 'llm.utterance':
             // A new utterance: the one before ends its segment here, and the next ones carry its flags.
             if (!r || r.rid !== msg.rid) return;

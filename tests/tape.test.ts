@@ -94,8 +94,8 @@ describe('the tape format', () => {
 });
 
 describe('the tape stage', () => {
-  const run = () => {
-    const h = harness(tapeTurnNode, { cellMs: 640, greeting: '' });
+  const run = (params: Record<string, unknown> = {}) => {
+    const h = harness(tapeTurnNode, { cellMs: 640, greeting: '', specCells: 0, ...params });
     const answer = (content: string) => {
       const io = h.ios.at(-1)!;
       io.h.onRecv?.({ content, timings: { prompt_n: 20 } }, undefined);
@@ -176,8 +176,55 @@ describe('the tape stage', () => {
     expect(h.ios).toHaveLength(2);
   });
 
+  it('writes ahead once the user stops, renders the reply held, and releases it when real silence confirms the cell', () => {
+    const h = run({ specCells: 4 });
+    h.send(50, 'vad', { type: 'vad.speech_start', at: 0 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'how are you?', start: 0, end: 1 });
+    h.send(400, 'vad', { type: 'vad.speech_end', at: 0 });
+    // The cell in progress, as it stands.
+    expect(h.prompt().endsWith('  0.64 | user: "how are you?" (talking) | agent (silent):')).toBe(true);
+    h.answer(' listen');
+    expect(h.prompt().endsWith('  0.64 | user: "how are you?" (talking) | agent (silent): listen\n  1.28 | user: (silent) | agent (silent):')).toBe(true);
+    h.answer(' respond "I am fine"');
+    expect(h.of('llm.start')[0]).toMatchObject({ held: true });
+    expect(h.prompt().endsWith('  1.28 | user: (silent) | agent (silent): respond "I am fine"\n  1.92 | user: (silent) | agent (speaking):')).toBe(true);
+    h.answer(' finish "thanks."');
+    expect(h.of('llm.end')[0]).toMatchObject({ status: 'done', text: 'I am fine thanks.' });
+    expect(h.ios).toHaveLength(3);
+    // The real cells match: taken from the speculation, no calls.
+    h.advance(640);
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', spec: 'adopted' });
+    expect(h.of('llm.release')).toHaveLength(0);
+    h.advance(1280);
+    expect(h.cells().at(-1)).toMatchObject({ action: 'respond', spec: 'adopted' });
+    expect(h.of('llm.release')).toHaveLength(1);
+    h.advance(1920);
+    expect(h.cells().at(-1)).toMatchObject({ action: 'finish', spec: 'adopted' });
+    expect(h.ios).toHaveLength(3);
+    expect(h.cells().map((c) => c.line)).toEqual([
+      '  0.64 | user: "how are you?" (talking) | agent (silent): listen',
+      '  1.28 | user: (silent) | agent (silent): respond "I am fine"',
+      '  1.92 | user: (silent) | agent (speaking): finish "thanks."',
+    ]);
+  });
+
+  it('drops the speculation and its held reply when the user speaks again', () => {
+    const h = run({ specCells: 4 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'so I was thinking', start: 0, end: 1 });
+    h.answer(' respond "Yes?"');
+    const rid = h.of('llm.start')[0].rid;
+    h.send(500, 'vad', { type: 'vad.speech_start', at: 0 });
+    expect(h.of('llm.drop')).toEqual([{ type: 'llm.drop', rid }]);
+    expect(h.of('tape.spec').at(-1)).toMatchObject({ event: 'drop', why: 'user voice' });
+    h.send(600, 'transcript', { type: 'asr.final', text: 'about lunch', start: 0, end: 1 });
+    h.advance(640);
+    // Back to the live tape.
+    expect(h.prompt().endsWith('  0.64 | user: "so I was thinking about lunch" (talking) | agent (silent):')).toBe(true);
+    expect(h.of('llm.release')).toHaveLength(0);
+  });
+
   it('says the opening line and writes it on the tape', () => {
-    const h = harness(tapeTurnNode, { cellMs: 640 });
+    const h = harness(tapeTurnNode, { cellMs: 640, specCells: 0 });
     expect(h.of('bc.lines')[0].lines).toContain("Hi! What's on your mind?");
     h.send(10, 'transcript', { type: 'asr.open' } as Msg);
     expect(h.of('bc.say')[0]).toMatchObject({ why: 'greeting' });
