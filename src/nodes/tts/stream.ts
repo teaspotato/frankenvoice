@@ -442,8 +442,17 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
               break;
             }
             dropCue(msg.id as string, false, 'canned line said instead');
-            // The take, or else the line itself if that take never rendered.
-            playCue(msg.id as string, (canned.has(msg.take as string) ? msg.take : msg.line) as string, Number(msg.tailMs ?? 0));
+            // The take, or else the line itself if that take never rendered, or else rendered now on a cue socket.
+            const text = (canned.has(msg.take as string) ? msg.take : msg.line) as string;
+            if (!canned.has(text)) {
+              const c = prepCue(msg.id as string);
+              c.text = text;
+              c.tailMs = Number(msg.tailMs ?? 0);
+              c.io.send({ type: 'Speak', text });
+              c.io.send({ type: 'Close' });
+              break;
+            }
+            playCue(msg.id as string, text, Number(msg.tailMs ?? 0));
             break;
           }
           case 'opener.say':

@@ -114,6 +114,7 @@ interface DuplexParams {
   eotInstructions: string;
   backoffAfter: number;
   backoffLines: string;
+  greeting: string;
   backoffWords: number;
   backoffSilenceMs: number;
 }
@@ -472,6 +473,13 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     { key: 'eotOptions', label: 'Done/pausing options', type: 'text', default: DEFAULT_EOT_OPTIONS, description: 'Sent to TypeSafe as the Choice criteria; the first option means done.', when: { eotCheck: ['typesafe'] } },
     { key: 'eotInstructions', label: 'Done/pausing question', type: 'text', default: DEFAULT_EOT_INSTRUCTIONS, when: { eotCheck: ['typesafe'] } },
     {
+      key: 'greeting',
+      label: 'Opening line',
+      type: 'string',
+      default: "Hi! What's on your mind?",
+      description: 'What the agent says first, as soon as the ASR is connected (so the user can answer). Kept out of the LLM transcript, like openers. Empty: wait for the user. Needs a TTS that plays canned lines (Kyutai).',
+    },
+    {
       key: 'backoffAfter',
       label: 'Back off after interruptions',
       type: 'number',
@@ -571,6 +579,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       .split('|')
       .map((l) => l.trim())
       .filter(Boolean);
+    let greeted = false;
     /** The user is talking (VAD). */
     let speaking = false;
     /** ASR has caught up with the silence: a result arrived during it, or the words before it were all final. */
@@ -1305,6 +1314,15 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         }
         return;
       }
+      if (msg.type === 'asr.open') {
+        // The user can be heard now: the agent opens the conversation.
+        const line = p.greeting.trim();
+        if (greeted || !line) return;
+        greeted = true;
+        decide('greet', { why: 'ASR connected' });
+        ctx.emit('text', { type: 'bc.say', id: `${ctx.id}-greet`, line, take: line, tailMs: 150, why: 'greeting' });
+        return;
+      }
       const text = ((msg.text as string) ?? '').trim();
       if (candidate && (msg.type === 'asr.partial' || msg.type === 'asr.final') && (msg.end as number) > candidate.at - 4800) {
         // Speech over the agent: decide on what it says.
@@ -1349,6 +1367,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       start() {
         // Render the back-off lines ahead, so one plays at once when needed.
         if (p.bargeIn && p.backoffAfter > 0 && yieldLines.length) ctx.emit('text', { type: 'bc.lines', lines: yieldLines.flatMap((l) => takes(l, 3)) });
+        const greeting = p.greeting.trim();
+        if (greeting) ctx.emit('text', { type: 'bc.lines', lines: [greeting] });
       },
       onInput(port, msg) {
         handle(port, msg);

@@ -174,6 +174,11 @@ describe('the pipeline in the server', () => {
     const traj = decodeBundle(bundle!);
     const types = new Set(traj.events.filter((e) => e.kind === 'msg').map((e) => (e.data as { type: string }).type));
     for (const t of ['asr.final', 'turn.user', 'llm.delta', 'tts.words', 'playback.start']) expect(types).toContain(t);
+    // The agent opens once the ASR is connected.
+    const msgs = traj.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; why?: string });
+    const open = msgs.findIndex((m) => m.type === 'asr.open');
+    expect(open).toBeGreaterThanOrEqual(0);
+    expect(msgs.findIndex((m) => m.type === 'bc.say' && m.why === 'greeting')).toBeGreaterThan(open);
     expect(traj.events.some((e) => e.kind === 'io.recv' && (e.data as { payload?: { type?: string } }).payload?.type === 'late')).toBe(got.lateSent > 0);
     expect(traj.events.filter((e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toEqual([]);
     // The server's recording replays exactly, like one made in the page.
