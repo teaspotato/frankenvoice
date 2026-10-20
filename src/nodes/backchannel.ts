@@ -30,7 +30,11 @@ export const DEFAULT_BC_INSTRUCTIONS =
 export const BC_CONTEXT_NOTE =
   'The first line, in brackets, is not speech: it says when the agent last backchannelled. Only avoid a backchannel within about 2 s of the last one; otherwise judge from the words alone.';
 
-/** Added to the user's words so far, as their turn's last line, when Gemma writes the backchannel. */
+/**
+ * The last user turn of a generated backchannel's request starts with this, then the user's words so
+ * far: first, so it stays in llama.cpp's prompt cache (from the last request, or a warm-up) and only
+ * the newest words need a prefill.
+ */
 export const DEFAULT_BC_PROMPT =
   "(They're still talking. Reply with only a brief backchannel, one to three words, that fits what they just said. No question.)";
 
@@ -140,6 +144,7 @@ interface BackchannelParams {
   say: string;
   prompt: string;
   prefill: string;
+  warm: boolean;
   maxWords: number;
   temperature: number;
   waitMs: number;
@@ -233,6 +238,14 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       default: DEFAULT_BC_PREFILL,
       when: { say: ['generated'] },
       description: "The start of the LLM's answer, written for it: the utterance tag (not interruptible, not gated), so it writes only the words.",
+    },
+    {
+      key: 'warm',
+      label: 'Warm the cache',
+      type: 'boolean',
+      default: true,
+      when: { say: ['generated'] },
+      description: "While the user talks, send their words so far to the backchannel slot without asking for an answer (bc.warm), so when it's time only the last words need a prefill.",
     },
     { key: 'maxWords', label: 'Max words', type: 'number', default: 4, when: { say: ['generated'] }, description: 'A grammar caps the line at this many words (and no question).' },
     { key: 'temperature', label: 'Temperature', type: 'number', default: 0.3, when: { say: ['generated'] } },
@@ -473,9 +486,21 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       });
     };
 
+    /** The user's words so far, for the LLM. */
+    const userWords = () => `${finals} ${partial}`.trim().split(/\s+/).slice(-80).join(' ');
+    let lastWarm = -Infinity;
+    /** Prefill the backchannel slot with the words so far (at most every 300 ms), ahead of a line. */
+    const warm = () => {
+      if (!gen || !p.warm || pending || floor !== 'listening' || ctx.now() - lastWarm < 300) return;
+      const text = userWords();
+      if (!text) return;
+      lastWarm = ctx.now();
+      ctx.emit('ask', { type: 'bc.warm', text, prompt: String(p.prompt) });
+    };
+
     /** Have the LLM write the line now, while TTS opens a socket for it. */
     const generate = (why: string, data: JsonObject, prevBc: number) => {
-      const text = `${finals} ${partial}`.trim().split(/\s+/).slice(-80).join(' ');
+      const text = userWords();
       if (!text) {
         lastBc = prevBc;
         return void ctx.emit('text', { type: 'bc.skip', why, reason: 'no words yet', ...data });
@@ -612,7 +637,11 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
             finals = `${finals} ${String(msg.text ?? '')}`.trim();
             partial = '';
             if (msg.speechFinal && silentSince !== null) asrDone = true;
-          } else if (msg.type === 'asr.partial') partial = String(msg.text ?? '');
+            warm();
+          } else if (msg.type === 'asr.partial') {
+            partial = String(msg.text ?? '');
+            warm();
+          }
         }
       },
       stop() {

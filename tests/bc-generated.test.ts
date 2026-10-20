@@ -84,7 +84,7 @@ describe('generated backchannels: the LLM request', () => {
     expect(ask.id_slot).toBe(1);
     expect(msgs.slice(0, 3)).toEqual([...(reply.messages as JsonObject[]), { role: 'assistant', content: 'Hello!' }]);
     expect(msgs.slice(3)).toEqual([
-      { role: 'user', content: 'so my laptop died\n\n(Backchannel.)' },
+      { role: 'user', content: '(Backchannel.)\n\nso my laptop died' },
       { role: 'assistant', content: '[i0g0] ' },
     ]);
     expect(ask).toMatchObject({ max_tokens: 9, temperature: 0.3, grammar: 'root ::= "x"', stream: true });
@@ -97,6 +97,21 @@ describe('generated backchannels: the LLM request', () => {
     expect((body(h.ios[2]).messages as JsonObject[]).map((m) => m.content)).toEqual(['Be brief.', 'Hi there.', 'Hello!', 'Anyway.']);
     expect(body(h.ios[2]).id_slot).toBe(0);
     expect(h.of('llm.start')).toHaveLength(2);
+  });
+
+  it('warms the backchannel slot with the words so far, asking for no answer', () => {
+    const h = llm();
+    exchange(h);
+    h.send(500, 'bc', { type: 'bc.warm', text: 'so my laptop', prompt: '(Backchannel.)' });
+    h.send(600, 'bc', { type: 'bc.warm', text: 'so my laptop died', prompt: '(Backchannel.)' }); // one at a time
+    expect(h.ios).toHaveLength(2);
+    const warm = body(h.ios[1]);
+    expect(warm).toMatchObject({ max_tokens: 0, id_slot: 1 });
+    expect((warm.messages as JsonObject[]).at(-1)).toEqual({ role: 'user', content: '(Backchannel.)\n\nso my laptop' });
+    h.ios[1].h.onClose?.(null);
+    h.send(700, 'bc', { type: 'bc.warm', text: 'so my laptop died', prompt: '(Backchannel.)' });
+    expect(h.ios).toHaveLength(3);
+    expect(h.of('llm.bc')).toEqual([]);
   });
 
   it('cancels the request on bc.drop, and never touches a reply', () => {
@@ -118,6 +133,15 @@ describe('generated backchannels: the stage', () => {
     h.send(t, 'vad', { type: 'vad.speech_end' });
     h.advance(t);
   };
+
+  it('warms the slot as the words come, at most every 300 ms', () => {
+    const h = stage();
+    h.send(0, 'vad', { type: 'vad.speech_start' });
+    h.send(100, 'transcript', { type: 'asr.partial', text: 'so I' });
+    h.send(250, 'transcript', { type: 'asr.partial', text: 'so I went' });
+    h.send(450, 'transcript', { type: 'asr.partial', text: 'so I went to' });
+    expect(h.of('bc.warm').map((m) => m.text)).toEqual(['so I', 'so I went to']);
+  });
 
   it('asks the LLM at the moment, opens a TTS socket, and says what it wrote', () => {
     const h = stage();
