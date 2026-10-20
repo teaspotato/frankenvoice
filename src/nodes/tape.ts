@@ -170,7 +170,7 @@ const TAKE_TURNS_EAGER = `Take turns like a person, without dead air:
 
 export const PROMPTS: Record<string, string> = { base: SYSTEM_HEAD + TAKE_TURNS, eager: SYSTEM_HEAD + TAKE_TURNS_EAGER };
 
-/** The pilot's example tape (written by its rules agent on another call). */
+/** The pilot's example tape (written by its rules agent on another call), without periods on the user's words as the live tape has none. */
 export const EXAMPLE_TAPE = `  0.64 | user: (silent) | agent (silent): listen
   1.28 | user: (talking) | agent (silent): listen
   1.92 | user: "hey, do you" (talking) | agent (silent): listen
@@ -196,7 +196,7 @@ export const EXAMPLE_TAPE = `  0.64 | user: (silent) | agent (silent): listen
  14.72 | user: "oh" (talking) | agent (cut off): listen
  15.36 | user: "wait, I" (talking) | agent (cut off): listen
  16.00 | user: "meant the one" (talking) | agent (cut off): listen
- 16.64 | user: "on Oak Street." (talking) | agent (cut off): listen
+ 16.64 | user: "on Oak Street" (talking) | agent (cut off): listen
  17.28 | user: (silent) | agent (cut off): respond "Ah, the Oak Street"
  17.92 | user: (silent) | agent (speaking): continue "one is"
  18.56 | user: (silent) | agent (speaking): finish "closed on Sundays."`;

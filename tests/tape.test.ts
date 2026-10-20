@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { EXAMPLE_TAPE, PROMPTS, cutTape, grammar, headroom, line, newCell, parseAction, promptHead, tapePrompt, type Cell, type TapeState } from '../src/nodes/tape';
-import { tapeTurnNode } from '../src/nodes/turn-tape';
+import { noPeriods, tapeTurnNode } from '../src/nodes/turn-tape';
 import { harness } from './node-harness';
 import type { Json, Msg } from '../src/core/types';
 
@@ -119,6 +119,10 @@ describe('the tape stage', () => {
     h.answer(' listen');
     h.send(900, 'vad', { type: 'vad.speech_end', at: 0 });
     h.send(1000, 'transcript', { type: 'asr.final', text: 'how do I clean it?', start: 0, end: 1 });
+    expect(noPeriods('if.')).toBe('if');
+    expect(noPeriods('U.S.')).toBe('US');
+    expect(noPeriods('3.5')).toBe('3.5');
+    expect(noPeriods('...')).toBe('');
     h.advance(1280);
     expect(h.prompt().endsWith('  0.64 | user: "how do" (talking) | agent (silent): listen\n  1.28 | user: "I clean it?" (talking) | agent (silent):')).toBe(true);
     h.answer(' listen');
@@ -148,8 +152,9 @@ describe('the tape stage', () => {
 
   it('skips the call while one is out, and while the TTS queue is full', () => {
     const h = run();
-    h.send(100, 'transcript', { type: 'asr.final', text: 'hi there.', start: 0, end: 1 });
+    h.send(100, 'transcript', { type: 'asr.final', text: 'hi there. Wait...', start: 0, end: 1 });
     h.advance(640);
+    expect(h.prompt().endsWith('  0.64 | user: "hi there Wait" (silent) | agent (silent):')).toBe(true);
     expect(h.ios).toHaveLength(1);
     h.advance(1280);
     expect(h.ios).toHaveLength(1);

@@ -39,6 +39,8 @@ interface TapeParams {
 
 const CHANNEL = 'llama-completion';
 const words = (s: string) => s.split(/\s+/).filter(Boolean);
+/** A user word without its periods ("if." -> "if", "U.S." -> "US"); a decimal point between digits stays. */
+export const noPeriods = (w: string) => w.replace(/\.(?!\d)|(?<!\d)\./g, '');
 
 /** The answer being spoken (or whose audio still plays). */
 interface Reply {
@@ -160,8 +162,8 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     };
 
     const commitWords = (ws: string[]) => {
-      if (!ws.length) return;
-      winWords.push(...ws);
+      // No periods on the user's words: the ASR ends every final with one, also at a pause mid-sentence.
+      winWords.push(...ws.map(noPeriods).filter(Boolean));
     };
 
     /** The tape gets too long for the slot: keep the last lines, the rest as a transcript in the head. */
