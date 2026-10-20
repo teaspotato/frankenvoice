@@ -2,8 +2,8 @@ import type { Json, JsonObject } from '../../core/types';
 
 /**
  * Conversation history kept by the LLM node. `text` is provider-neutral;
- * `native` keeps the provider's own content (e.g. Claude thinking and tool_use
- * blocks, or a user turn's tool_result blocks) so the same provider gets it back verbatim.
+ * `native` keeps the provider's own content (e.g. tool_use blocks, or a user
+ * turn's tool_result blocks) so the same provider gets it back verbatim.
  */
 export interface ChatTurn {
   role: 'user' | 'assistant';
@@ -39,8 +39,6 @@ export interface LlmStreamParser {
 export interface LlmAdapter {
   provider: string;
   channel: string;
-  /** Used when the node's model param is empty. */
-  defaultModel?: string;
   buildRequest(history: ChatTurn[], params: JsonObject): Json;
   parser(): LlmStreamParser;
 }

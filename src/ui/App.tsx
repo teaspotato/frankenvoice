@@ -15,12 +15,13 @@ import { resolveParams } from '../core/node';
 import { turnModelRequest } from '../nodes/turn-model';
 import {
   CONFIG_FORMAT,
-  activeStages,
+  CONFIG_FORMAT_VERSION,
   buildGraph,
   configFromGraph,
   defaultConfig,
   normalizeConfig,
   requiredUpstreams,
+  STAGES,
   stageParams,
   stageType,
   type PipelineConfig,
@@ -37,7 +38,7 @@ import { ActivityTracker, NO_ACTIVITY, type Activity } from './activity';
 const CONFIG_KEY = 'frankenvoice.pipeline';
 const AUTOSAVE_KEY = 'frankenvoice.autosave';
 const MUTE_KEY = 'frankenvoice.mute';
-const TITLE_KEY = 'frankenvoice.autoTitle';
+const TITLE_KEY = 'frankenvoice.titleModel';
 
 /** What was said in a session, for naming it: user turns and the agent's replies, in order. */
 function transcriptOf(traj: Trajectory): string {
@@ -65,7 +66,9 @@ function titleToName(title: string): string {
 function loadConfig(): PipelineConfig {
   try {
     const raw = localStorage.getItem(CONFIG_KEY);
-    if (raw) return normalizeConfig(JSON.parse(raw) as PipelineConfig);
+    const saved = raw ? (JSON.parse(raw) as { formatVersion?: number; stages?: PipelineConfig }) : null;
+    // A config saved by another version starts over from the defaults.
+    if (saved?.formatVersion === CONFIG_FORMAT_VERSION) return normalizeConfig(saved.stages);
   } catch {
     /* storage unavailable or corrupt */
   }
@@ -157,9 +160,9 @@ export function App() {
   /** Name each finished live session from its content, with this model ('' = off). */
   const [autoTitle, setAutoTitle] = useState(() => {
     try {
-      return localStorage.getItem(TITLE_KEY) ?? 'claude-haiku-5-5';
+      return localStorage.getItem(TITLE_KEY) ?? 'gemma-4-12b-it';
     } catch {
-      return 'claude-haiku-5-5';
+      return 'gemma-4-12b-it';
     }
   });
   const [titleOn, setTitleOn] = useState(() => {
@@ -202,7 +205,7 @@ export function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
+      localStorage.setItem(CONFIG_KEY, JSON.stringify({ formatVersion: CONFIG_FORMAT_VERSION, stages: config }));
     } catch {
       /* storage unavailable */
     }
@@ -565,7 +568,9 @@ export function App() {
     try {
       if (f.name.endsWith('.json')) {
         if (running) throw new Error('Stop the run before loading a config: stage settings are locked while it runs.');
-        const j = JSON.parse(await f.text()) as { format?: string };
+        const j = JSON.parse(await f.text()) as { format?: string; formatVersion?: number };
+        if (j.format === CONFIG_FORMAT && j.formatVersion !== CONFIG_FORMAT_VERSION)
+          throw new Error(`pipeline config format ${j.formatVersion ?? 1}; this version only loads format ${CONFIG_FORMAT_VERSION} (older configs are not migrated)`);
         if (j.format === CONFIG_FORMAT) setConfig(normalizeConfig((j as { stages: PipelineConfig }).stages));
         else if (j.format === GRAPH_FORMAT) setConfig(configFromGraph(j as GraphSpec));
         else throw new Error('not a frankenvoice pipeline config');
@@ -583,14 +588,13 @@ export function App() {
   // ---- render -------------------------------------------------------------------
 
   const missingKeys = health ? requiredUpstreams(config).filter((k) => !health[k]) : [];
-  // The Playback lane belongs to the TTS stage when the browser speaks for itself.
   /** Selecting a stage shows its settings, so it opens a collapsed side panel. */
   const selectStage = (id: StageId | null, reveal = true) => {
     setSelected(id);
     if (reveal && id && !layout.sideOpen) setLayout({ ...layout, sideOpen: true });
   };
   const stageOf = (lane: string | null): StageId | null =>
-    lane === null ? null : activeStages(config).some((s) => s.id === lane) ? (lane as StageId) : 'tts';
+    lane === null ? null : STAGES.some((s) => s.id === lane) ? (lane as StageId) : 'tts';
 
   return (
     <div
@@ -609,7 +613,7 @@ export function App() {
           </button>
         )}
         <button
-          onClick={() => download('frankenvoice-pipeline.json', JSON.stringify({ format: CONFIG_FORMAT, stages: config }, null, 2), 'application/json')}
+          onClick={() => download('frankenvoice-pipeline.json', JSON.stringify({ format: CONFIG_FORMAT, formatVersion: CONFIG_FORMAT_VERSION, stages: config }, null, 2), 'application/json')}
         >
           Save config
         </button>
@@ -678,7 +682,7 @@ export function App() {
         <label className="autosave" title="Save each live session to the proxy's sessions folder when it stops">
           <input type="checkbox" checked={autosave} onChange={(e) => setAutosave(e.target.checked)} /> autosave live sessions
         </label>
-        <label className="autosave" title="When a live session stops, ask this model for a short title and rename the session to it (uses the Anthropic key)">
+        <label className="autosave" title="When a live session stops, ask this model on the LLM endpoint for a short title and rename the session to it">
           <input type="checkbox" checked={titleOn} onChange={(e) => setTitleOn(e.target.checked)} /> name sessions with{' '}
           <input className="title-model" value={autoTitle} disabled={!titleOn} onChange={(e) => setAutoTitle(e.target.value)} />
         </label>
@@ -700,7 +704,7 @@ export function App() {
           <label>
             live channels{' '}
             <input
-              placeholder="e.g. anthropic,cartesia"
+              placeholder="e.g. openai,gpubox-tts"
               value={replayOpts.liveChannels}
               onChange={(e) => setReplayOpts({ ...replayOpts, liveChannels: e.target.value })}
             />

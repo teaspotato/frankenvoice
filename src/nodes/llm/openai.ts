@@ -2,8 +2,8 @@ import type { Json, JsonObject } from '../../core/types';
 import type { ChatTurn, LlmAdapter, LlmStreamEvent } from './types';
 
 /**
- * OpenAI-compatible Chat Completions (OpenRouter, OpenAI, vLLM, Ollama, LM
- * Studio, ...). Payloads are the parsed `data:` lines of the SSE stream;
+ * OpenAI-compatible Chat Completions (llama.cpp on the GPU box, vLLM, Ollama,
+ * ...). Payloads are the parsed `data:` lines of the SSE stream;
  * `{"$done": true}` stands for the literal `[DONE]`.
  */
 export const openaiCompatAdapter: LlmAdapter = {
@@ -20,7 +20,6 @@ export const openaiCompatAdapter: LlmAdapter = {
     let extra: JsonObject = {};
     if (typeof p.extraBody === 'string' && p.extraBody.trim()) extra = JSON.parse(p.extraBody) as JsonObject;
     return {
-      endpoint: p.endpoint,
       body: {
         model: p.model,
         messages,
@@ -47,7 +46,7 @@ export const openaiCompatAdapter: LlmAdapter = {
         for (const choice of (c.choices as JsonObject[] | undefined) ?? []) {
           if ((choice.index ?? 0) !== 0) continue;
           const delta = choice.delta as JsonObject | undefined;
-          // Reasoning models stream their thinking as `reasoning` (OpenRouter) or `reasoning_content` (DeepSeek, vLLM).
+          // Reasoning models stream their thinking as `reasoning` or `reasoning_content` (llama.cpp, vLLM).
           const reasoning = delta?.reasoning ?? delta?.reasoning_content;
           if (typeof reasoning === 'string' && reasoning) out.push({ type: 'thinking' });
           const text = delta?.content;

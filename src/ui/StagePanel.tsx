@@ -1,7 +1,7 @@
 import { paramActive, resolveParams } from '../core/node';
 import type { Json } from '../core/types';
 import { registry } from '../nodes';
-import { activeStages, STAGES, stageParams, stageType, type PipelineConfig, type StageId } from '../pipeline';
+import { STAGES, stageParams, stageType, type PipelineConfig, type StageId } from '../pipeline';
 
 /** Choose a stage's implementation and edit its params. */
 export function StagePanel({
@@ -18,14 +18,6 @@ export function StagePanel({
   onChange(c: PipelineConfig): void;
 }) {
   const def = STAGES.find((s) => s.id === stage)!;
-  if (!activeStages(config).some((s) => s.id === stage)) {
-    return (
-      <>
-        <h3>{def.label}</h3>
-        <p className="muted">Not used: the TTS stage plays audio itself with the current setting.</p>
-      </>
-    );
-  }
   const node = registry[stageType(config, stage)];
   const values = resolveParams(node, stageParams(config, stage));
   const sc = config[stage];

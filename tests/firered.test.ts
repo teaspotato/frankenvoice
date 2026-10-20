@@ -8,7 +8,7 @@ import { prepareReplay } from '../src/core/replay';
 import { registry } from '../src/nodes';
 import { buildGraph } from '../src/pipeline';
 import { FireRedStream, KaldiFbank, MEL_BINS } from '../src/drivers/firered/stream';
-import { apiConfig, fakeDrivers } from './fake-drivers';
+import { testConfig, fakeDrivers } from './fake-drivers';
 
 describe('FireRedVAD features', () => {
   it('produces Kaldi fbank frames: 25 ms windows every 10 ms, snip_edges, 80 bins', () => {
@@ -42,7 +42,7 @@ describe('FireRedVAD features', () => {
 
 describe('vad.firered node', () => {
   it('segments speech from per-frame probabilities and replays exactly', async () => {
-    const c = apiConfig();
+    const c = testConfig();
     c.vad.variant = 'firered';
     const g = buildGraph(c);
     expect(g.nodes.find((n) => n.id === 'vad')!.type).toBe('vad.firered');

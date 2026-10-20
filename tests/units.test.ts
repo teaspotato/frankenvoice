@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { buildGraph, configFromGraph, defaultConfig, requiredUpstreams } from '../src/pipeline';
-import { SentenceSplitter } from '../src/nodes/segment';
 import { Framer } from '../src/nodes/audio';
 import { SimScheduler } from '../src/core/scheduler';
 import { TrackStore } from '../src/core/tracks';
@@ -9,17 +8,6 @@ import type { AudioMsg, TrajEvent } from '../src/core/types';
 import { ActivityTracker } from '../src/ui/activity';
 import { TimelineModel } from '../src/ui/timeline';
 import { Trajectory, TRAJECTORY_FORMAT } from '../src/core/trajectory';
-
-describe('SentenceSplitter', () => {
-  it('emits sentences as soon as their boundary is certain', () => {
-    const s = new SentenceSplitter();
-    expect(s.push('Hello there')).toEqual([]);
-    expect(s.push('! How are')).toEqual(['Hello there!']);
-    expect(s.push(' you? Pi is 3.')).toEqual(['How are you?']);
-    expect(s.push('14.')).toEqual([]);
-    expect(s.flush()).toBe('Pi is 3.14.');
-  });
-});
 
 describe('Framer', () => {
   it('re-chunks audio into fixed frames with exact sample ranges', () => {
@@ -74,7 +62,7 @@ describe('pipeline format', () => {
   });
 
   it('runs on the GPU box by default, with only TypeSafe going out', () => {
-    expect(requiredUpstreams(defaultConfig()).sort()).toEqual(['gpubox', 'openai/custom', 'typesafe']);
+    expect(requiredUpstreams(defaultConfig()).sort()).toEqual(['gpubox', 'llm', 'typesafe']);
     expect(buildGraph(defaultConfig()).nodes.find((n) => n.id === 'tts')?.type).toBe('tts.kyutai');
   });
 
@@ -96,9 +84,8 @@ describe('openai-compatible adapter', () => {
         { role: 'assistant', text: 'hello' },
         { role: 'user', text: 'how are you' },
       ],
-      { endpoint: 'openrouter', model: 'm', system: 'sys', maxTokens: 50, extraBody: '{"temperature":0.2}' },
-    ) as { endpoint: string; body: Record<string, unknown> };
-    expect(req.endpoint).toBe('openrouter');
+      { model: 'm', system: 'sys', maxTokens: 50, extraBody: '{"temperature":0.2}' },
+    ) as { body: Record<string, unknown> };
     expect(req.body).toEqual({
       model: 'm',
       stream: true,
@@ -237,7 +224,7 @@ describe('TimelineModel ASR placement', () => {
     const traj = new Trajectory({ format: TRAJECTORY_FORMAT, formatVersion: 1, id: 't', createdAt: '', mode: 'live', graph: { nodes: [], edges: [] } as never, graphHash: '' });
     // mic: 1 s frames arriving on time, so sample s is at s / 16 ms
     for (let i = 1; i <= 6; i++) traj.append({ seq: i - 1, t: i * 1000, node: 'mic', kind: 'msg', port: 'audio', data: { type: 'audio', sampleRate: 16000 }, media: { track: 'mic', start: (i - 1) * 16000, end: i * 16000 } });
-    // Deepgram-style final: window 0-5 s, words only 3.5-4.5 s
+    // A final whose window is 0-5 s, words only 3.5-4.5 s
     traj.append({ seq: 6, t: 5300, node: 'asr', kind: 'msg', port: 'transcript', data: { type: 'asr.final', text: 'hi there', start: 0, end: 80000, words: [{ word: 'hi', start: 56000, end: 64000 }, { word: 'there', start: 64000, end: 72000 }] } });
     const m = new TimelineModel(traj);
     m.update();

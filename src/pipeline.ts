@@ -41,7 +41,7 @@ export const STAGES: StageDef[] = [
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' }, managed: ['delegate'], managedNote: 'Delegation (the worker tools) is set by the Workers stage.' },
   { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', typesafe: 'opener.choice', off: 'opener.off' } },
   { id: 'workers', label: 'Workers', variants: { acp: 'workers', mock: 'workers.mock', off: 'workers.off' } },
-  { id: 'tts', label: 'TTS', variants: { api: 'tts', 'deepgram-stream': 'tts.stream', 'kyutai-gpubox': 'tts.kyutai', browser: 'tts.browser', tone: 'tts.tone' } },
+  { id: 'tts', label: 'TTS', variants: { 'kyutai-gpubox': 'tts.kyutai', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
 ];
 
@@ -54,16 +54,14 @@ export interface StageConfig {
 export type PipelineConfig = Record<StageId, StageConfig>;
 
 export const CONFIG_FORMAT = 'frankenvoice-pipeline';
+/** Saved stage configs of another version are not loaded (they are not migrated). */
+export const CONFIG_FORMAT_VERSION = 2;
 
 export function defaultConfig(): PipelineConfig {
   const c = {} as PipelineConfig;
   for (const s of STAGES) c[s.id] = { variant: Object.keys(s.variants)[0], params: {} };
-  // Defaults run on the GPU box (Qwen3-ASR, Gemma through its OpenAI-compatible endpoint, Kyutai);
-  // only the TypeSafe stages go out. Delegation needs Anthropic, so workers start off.
-  c.asr.params.streaming = { provider: 'gpubox' };
-  c.llm.params.api = { provider: 'openai-compatible', endpoint: 'custom', model: 'gemma-4-12b-it' };
-  c.tts.variant = 'kyutai-gpubox';
-  c.tts.params.api = { provider: 'cartesia' };
+  // Everything runs on the GPU box (Qwen3-ASR, Gemma through its OpenAI-compatible endpoint, Kyutai);
+  // only the TypeSafe stages go out. Delegation needs tool calls the LLM client doesn't parse, so workers start off.
   c.workers.variant = 'off';
   // The turn model is a big download; it loads only once picked.
   c.turnmodel.variant = 'off';
@@ -84,12 +82,6 @@ export function normalizeConfig(c: Partial<PipelineConfig> | undefined): Pipelin
 
 export const stageType = (c: PipelineConfig, id: StageId) => STAGES.find((s) => s.id === id)!.variants[c[id].variant];
 export const stageParams = (c: PipelineConfig, id: StageId) => c[id].params[c[id].variant] ?? {};
-
-/** The speaker stage only exists when TTS produces audio (the browser TTS plays it itself). */
-export function activeStages(c: PipelineConfig): StageDef[] {
-  const ttsPlays = registry[stageType(c, 'tts')].outputs.some((p) => p.name === 'playback');
-  return STAGES.filter((s) => s.id !== 'speaker' || !ttsPlays);
-}
 
 const COLUMN: Record<StageId, [number, number]> = {
   mic: [0, 110],
@@ -114,9 +106,8 @@ const e = (from: string, fp: string, to: string, tp: string): EdgeSpec => ({ fro
  * the opener watching the LLM and speaking through TTS too, workers taking the LLM's delegated tasks, with playback fed back to turn-taking and what was played to the turn model (the agent's channel).
  */
 export function buildGraph(c: PipelineConfig): GraphSpec {
-  const stages = activeStages(c);
   const cleanupType = stageType(c, 'cleanup');
-  const nodes: NodeSpec[] = stages.map((s) => ({
+  const nodes: NodeSpec[] = STAGES.map((s) => ({
     id: s.id,
     type: stageType(c, s.id),
     params:
@@ -126,20 +117,16 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
         : s.id === 'llm'
           ? // The workers stage decides whether the LLM can delegate, and how it hears back.
             { ...stageParams(c, 'llm'), delegate: delegation(c) }
-          : s.id === 'tts' && stageType(c, 'tts') === 'tts.stream' && !speakerWantsWords(c)
-            ? // Word timings cost a Deepgram ASR stream; only a speaker that resumes from a word's start uses them.
-              { ...stageParams(c, 'tts'), alignWords: false }
-            : stageParams(c, s.id),
+          : stageParams(c, s.id),
     ui: { x: COLUMN[s.id][0], y: COLUMN[s.id][1] },
   }));
-  const hasSpeaker = stages.some((s) => s.id === 'speaker');
   const wantsReference = registry[cleanupType].inputs.some((p) => p.name === 'ref');
   const edges = [
     e('mic', 'audio', 'cleanup', 'audio'),
     e('cleanup', 'audio', 'vad', 'audio'),
     e('cleanup', 'audio', 'asr', 'audio'),
     e('cleanup', 'audio', 'turnmodel', 'audio'),
-    ...(hasSpeaker ? [e('speaker', 'played', 'turnmodel', 'played')] : []),
+    e('speaker', 'played', 'turnmodel', 'played'),
     ...(registry[stageType(c, 'turn')].inputs.some((p) => p.name === 'scores') ? [e('turnmodel', 'scores', 'turn', 'scores')] : []),
     e('vad', 'vad', 'turn', 'vad'),
     // Speech end: ASR flushes its final words now rather than at its own endpointing.
@@ -167,20 +154,15 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('llm', 'workers', 'workers', 'workers'),
     e('workers', 'updates', 'llm', 'updates'),
     e('vad', 'vad', 'llm', 'vad'),
-    ...(hasSpeaker ? [e('tts', 'audio', 'speaker', 'audio'), e('speaker', 'playback', 'turn', 'playback')] : [e('tts', 'playback', 'turn', 'playback')]),
-    ...(hasSpeaker && wantsReference ? [e('speaker', 'played', 'cleanup', 'ref')] : []),
+    e('tts', 'audio', 'speaker', 'audio'),
+    e('speaker', 'playback', 'turn', 'playback'),
+    ...(wantsReference ? [e('speaker', 'played', 'cleanup', 'ref')] : []),
     // Barge-in: turn-taking can stop the reply in flight.
     ...(registry[stageType(c, 'turn')].outputs.some((p) => p.name === 'control')
-      ? [e('turn', 'control', 'llm', 'control'), e('turn', 'control', 'tts', 'control'), ...(hasSpeaker ? [e('turn', 'control', 'speaker', 'control')] : [])]
+      ? [e('turn', 'control', 'llm', 'control'), e('turn', 'control', 'tts', 'control'), e('turn', 'control', 'speaker', 'control')]
       : []),
   ];
   return { format: GRAPH_FORMAT, formatVersion: GRAPH_FORMAT_VERSION, name: 'Cascade', nodes, edges };
-}
-
-/** Whether the speaker resumes a cut-off reply from the start of a word (needs tts.words). */
-function speakerWantsWords(c: PipelineConfig): boolean {
-  if (!activeStages(c).some((s) => s.id === 'speaker')) return false;
-  return resolveParams(registry[stageType(c, 'speaker')], stageParams(c, 'speaker')).resumeFrom === 'word';
 }
 
 /** What the LLM needs to delegate to workers, or null when the stage is off. */
@@ -206,7 +188,7 @@ export function configFromGraph(graph: GraphSpec): PipelineConfig {
 /** Proxy upstreams (API keys) the configured pipeline needs. */
 export function requiredUpstreams(c: PipelineConfig): string[] {
   const out = new Set<string>();
-  for (const s of activeStages(c)) {
+  for (const s of STAGES) {
     const def = registry[stageType(c, s.id)];
     for (const u of def.requires?.(resolveParams(def, stageParams(c, s.id))) ?? []) out.add(u);
   }

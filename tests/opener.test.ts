@@ -46,7 +46,7 @@ const done = { $done: true };
 const body = (r: Json) => (r as { body: { messages: { role: string; content: string }[] } }).body;
 
 describe('fillers while a reasoning model thinks', () => {
-  const fparams = { provider: 'openai-compatible', model: 'big', system: 'sys' };
+  const fparams = { model: 'big', system: 'sys' };
   const think = { choices: [{ index: 0, delta: { reasoning: 'hmm' } }] };
 
   /** The opener stage on its own, fed the LLM's stream. */

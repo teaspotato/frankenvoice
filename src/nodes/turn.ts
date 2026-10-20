@@ -431,7 +431,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       label: 'Back-off lines',
       type: 'string',
       default: 'You go first. | Sorry, go ahead. | Go ahead.',
-      description: 'What the agent says when it backs off, separated by |. Needs a TTS that plays canned lines (Deepgram stream).',
+      description: 'What the agent says when it backs off, separated by |. Needs a TTS that plays canned lines (Kyutai).',
       when: { bargeIn: [true] },
     },
     {

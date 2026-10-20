@@ -2,7 +2,6 @@
 // one turns an IO exchange opened by a node into real-world calls and feeds
 // whatever comes back into the sink; the runtime records all of it.
 
-import Anthropic from '@anthropic-ai/sdk';
 import * as ort from 'onnxruntime-web/wasm';
 import ortWasmUrl from 'onnxruntime-web/ort-wasm-simd-threaded.wasm?url';
 import ortMjsUrl from 'onnxruntime-web/ort-wasm-simd-threaded.mjs?url';
@@ -117,7 +116,6 @@ const proxiedSocket = (upstream: string): LiveDriver => (req, sink) => {
   };
 };
 
-const deepgram = proxiedSocket('deepgram');
 const gpubox = proxiedSocket('gpubox');
 
 /** Workers: one ACP agent process per exchange, run by the proxy; JSON-RPC lines both ways. */
@@ -156,46 +154,6 @@ const acp: LiveDriver = (_req, sink) => {
   };
 };
 
-const claude = new Anthropic({
-  baseURL: `${location.origin}/api/anthropic`,
-  apiKey: 'injected-by-local-proxy',
-  dangerouslyAllowBrowser: true,
-});
-
-/**
- * A short title for a finished session, from its transcript. Called by the UI, outside the pipeline,
- * so it is not part of the recording.
- */
-export async function sessionTitle(model: string, transcript: string): Promise<string> {
-  const msg = await claude.messages.create({
-    model,
-    max_tokens: 40,
-    system:
-      'You name recorded voice conversations between a user and a voice agent. Reply with a title of 2 to 6 words that says what the conversation was about, in the language of the conversation. No quotes, no trailing punctuation.',
-    messages: [{ role: 'user', content: `<transcript>\n${transcript}\n</transcript>\n\nTitle:` }],
-  });
-  return msg.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('').trim();
-}
-
-const anthropic: LiveDriver = (req, sink) => {
-  // The request is recorded verbatim; extra SDK fields such as `fallbacks` pass through.
-  const stream = claude.beta.messages.stream(req as unknown as Parameters<typeof claude.beta.messages.stream>[0]);
-  let aborted = false;
-  (async () => {
-    for await (const ev of stream) sink.recv(toJson(ev));
-    sink.close(null);
-  })().catch((e) => {
-    if (!aborted) sink.close(errorJson(e));
-  });
-  return {
-    send() {},
-    close() {
-      aborted = true;
-      stream.abort();
-    },
-  };
-};
-
 /** Read a fetch body as Server-Sent Events, yielding each event's data string. Comment lines are dropped. */
 async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const reader = body.getReader();
@@ -225,6 +183,32 @@ async function postJson(url: string, body: Json, signal: AbortSignal): Promise<R
   return fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
 }
 
+/**
+ * A short title for a finished session, from its transcript. Called by the UI, outside the pipeline,
+ * so it is not part of the recording.
+ */
+export async function sessionTitle(model: string, transcript: string): Promise<string> {
+  const res = await postJson(
+    '/api/llm/chat/completions',
+    {
+      model,
+      max_tokens: 40,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You name recorded voice conversations between a user and a voice agent. Reply with a title of 2 to 6 words that says what the conversation was about, in the language of the conversation. No quotes, no trailing punctuation.',
+        },
+        { role: 'user', content: `<transcript>\n${transcript}\n</transcript>\n\nTitle:` },
+      ],
+    },
+    new AbortController().signal,
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  const j = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+  return (j.choices?.[0]?.message?.content ?? '').trim();
+}
+
 /** TypeSafe primitives (a Choice question): one JSON request, one JSON answer. */
 const typesafe: LiveDriver = (req, sink) => {
   const r = req as { path: string; body: Json };
@@ -241,10 +225,10 @@ const typesafe: LiveDriver = (req, sink) => {
 
 /** OpenAI-compatible chat completions; each SSE data line is recorded parsed, `[DONE]` as {"$done": true}. */
 const openai: LiveDriver = (req, sink) => {
-  const r = req as { endpoint: string; body: Json };
+  const r = req as { body: Json };
   const ac = new AbortController();
   (async () => {
-    const res = await postJson(`/api/openai/${encodeURIComponent(r.endpoint)}/chat/completions`, r.body, ac.signal);
+    const res = await postJson('/api/llm/chat/completions', r.body, ac.signal);
     if (!res.ok || !res.body) return sink.close({ error: { status: res.status, body: await res.text() } });
     for await (const data of sseData(res.body)) {
       if (data === '[DONE]') sink.recv({ $done: true });
@@ -260,35 +244,6 @@ const openai: LiveDriver = (req, sink) => {
   })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
   return { send() {}, close: () => ac.abort() };
 };
-
-/** POST a JSON request and stream the raw response bytes back (TTS providers). */
-type RawRequest = { endpoint?: string; path: string; query?: Record<string, Json>; body: Json };
-
-const withQuery = (url: string, query?: Record<string, Json>) =>
-  query ? `${url}?${new URLSearchParams(Object.entries(query).map(([k, v]) => [k, String(v)]))}` : url;
-
-const rawBytes =
-  (url: (r: RawRequest) => string): LiveDriver =>
-  (req, sink) => {
-    const r = req as RawRequest;
-    const ac = new AbortController();
-    (async () => {
-      const res = await postJson(url(r), r.body, ac.signal);
-      if (!res.ok || !res.body) return sink.close({ error: { status: res.status, body: await res.text() } });
-      const reader = res.body.getReader();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        sink.recv(null, value);
-      }
-      sink.close(null);
-    })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
-    return { send() {}, close: () => ac.abort() };
-  };
-
-const cartesia = rawBytes((r) => `/api/cartesia${r.path}`);
-const openaiTts = rawBytes((r) => `/api/openai/${encodeURIComponent(r.endpoint ?? '')}${r.path}`);
-const deepgramTts = rawBytes((r) => withQuery(`/api/deepgram${r.path}`, r.query));
 
 /**
  * RNNoise at 48 kHz: frames are upsampled, denoised in 480-sample blocks and
@@ -488,48 +443,6 @@ const turnModel: LiveDriver = (req, sink) => {
   };
 };
 
-/** Built-in speechSynthesis, one utterance per exchange. Closing the exchange cancels speech. */
-const liveUtterances = new Set<SpeechSynthesisUtterance>(); // Chrome drops events of utterances that get garbage collected
-const speechSynthesisDriver: LiveDriver = (req, sink) => {
-  const r = req as { text: string; voice: string; lang: string; rate: number; pitch: number };
-  if (typeof speechSynthesis === 'undefined') {
-    setTimeout(() => sink.close({ error: { message: 'speechSynthesis is not available in this browser' } }), 0);
-    return { send() {}, close() {} };
-  }
-  // Only reached as a replay monitor while skipping ahead: nothing to say.
-  if (outputSuppressed) return { send() {}, close() {} };
-  const u = new SpeechSynthesisUtterance(r.text);
-  const voice = r.voice ? speechSynthesis.getVoices().find((v) => v.name === r.voice || v.voiceURI === r.voice) : undefined;
-  if (voice) u.voice = voice;
-  u.lang = voice?.lang ?? r.lang;
-  u.rate = r.rate;
-  u.pitch = r.pitch;
-  // Browser speech can't change volume mid-sentence: a mute applies from the next sentence.
-  u.volume = muted.agent ? 0 : 1;
-  let done = false;
-  const finish = (data: Json) => {
-    if (done) return;
-    done = true;
-    liveUtterances.delete(u);
-    sink.close(data);
-  };
-  u.onstart = () => !done && sink.recv({ type: 'start', voice: u.voice?.name ?? null });
-  u.onboundary = (e) => !done && sink.recv({ type: 'boundary', name: e.name, charIndex: e.charIndex, charLength: e.charLength ?? null, elapsedTime: e.elapsedTime });
-  u.onend = () => finish(null);
-  u.onerror = (e) => finish(e.error === 'interrupted' || e.error === 'canceled' ? { status: e.error } : { error: { message: e.error } });
-  liveUtterances.add(u);
-  speechSynthesis.speak(u);
-  return {
-    send() {},
-    close() {
-      if (done) return;
-      done = true;
-      liveUtterances.delete(u);
-      speechSynthesis.cancel();
-    },
-  };
-};
-
 /** Output audio contexts, so a paused replay can freeze what is already scheduled. */
 const outputContexts = new Set<AudioContext>();
 
@@ -553,10 +466,9 @@ export function setOutputSuppressed(on: boolean) {
   }
   for (const s of playingSources) s.stop();
   playingSources.clear();
-  if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
 }
 
-/** Muted outputs: the agent's voice (speaker and browser speech) and the recorded mic during replay. */
+/** Muted outputs: the agent's voice and the recorded mic during replay. */
 const muted = { agent: false, mic: false };
 const gains = { agent: new Set<GainNode>(), mic: new Set<GainNode>() };
 
@@ -724,13 +636,9 @@ export function micMonitor() {
   return { play: (samples: Float32Array<ArrayBuffer>, sampleRate: number) => out.play(samples, sampleRate), close: out.close };
 }
 
-/** Pause or resume every playing output (speaker audio and browser speech). */
+/** Pause or resume every playing output. */
 export function setOutputPaused(paused: boolean) {
   for (const ctx of outputContexts) void (paused ? ctx.suspend() : ctx.resume());
-  if (typeof speechSynthesis !== 'undefined') {
-    if (paused) speechSynthesis.pause();
-    else speechSynthesis.resume();
-  }
 }
 
 const speaker: LiveDriver = (_req, sink, env) => {
@@ -796,4 +704,4 @@ const embed: LiveDriver = (req, sink) => {
   };
 };
 
-export const browserDrivers: DriverRegistry = { mic, silero, firered, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'gpubox-asr': gpubox, 'gpubox-tts': gpubox, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel, embed, acp, typesafe };
+export const browserDrivers: DriverRegistry = { mic, silero, firered, openai, 'gpubox-asr': gpubox, 'gpubox-tts': gpubox, rnnoise, speaker, 'turn-model': turnModel, embed, acp, typesafe };

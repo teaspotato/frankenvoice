@@ -143,7 +143,7 @@ describe('drafting replies before the turn is committed', () => {
 });
 
 describe('the LLM on drafts', () => {
-  const params = { provider: 'openai-compatible', model: 'm', system: 'sys' };
+  const params = { model: 'm', system: 'sys' };
   const tok = (text: string) => ({ choices: [{ index: 0, delta: { content: text } }] });
   const messages = (r: Json) => (r as { body: { messages: { role: string; content: string }[] } }).body.messages.map((m) => m.content);
 
@@ -203,7 +203,7 @@ describe('finalizing ASR on VAD speech end', () => {
     expect(h.of('turn.user')).toMatchObject([{ text: 'what about Osaka?' }]);
   });
 
-  it('asks the ASR provider to finalize on speech end', async () => {
+  it('asks the ASR server to finalize on speech end', async () => {
     const { asrNode } = await import('../src/nodes/asr');
     const h = harness(asrNode);
     h.send(0, 'audio', { type: 'audio', track: 'mic', start: 0, end: 160, sampleRate: 16000, samples: new Float32Array(160) });

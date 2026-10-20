@@ -43,19 +43,6 @@ interface SettingDef {
 }
 
 const SETTINGS: SettingDef[] = [
-  { name: 'DEEPGRAM_API_KEY', group: 'Deepgram (ASR, TTS)', label: 'API key', secret: true },
-  { name: 'DEEPGRAM_BASE_URL', group: 'Deepgram (ASR, TTS)', label: 'Base URL', default: 'wss://api.deepgram.com', hint: 'ws(s) URL; REST calls use the same host over http(s)' },
-  { name: 'ANTHROPIC_API_KEY', group: 'Anthropic (LLM)', label: 'API key', secret: true },
-  { name: 'ANTHROPIC_BASE_URL', group: 'Anthropic (LLM)', label: 'Base URL', default: 'https://api.anthropic.com' },
-  { name: 'OPENROUTER_API_KEY', group: 'OpenRouter (LLM)', label: 'API key', secret: true },
-  { name: 'OPENROUTER_BASE_URL', group: 'OpenRouter (LLM)', label: 'Base URL', default: 'https://openrouter.ai/api/v1' },
-  { name: 'OPENAI_API_KEY', group: 'OpenAI (LLM, TTS)', label: 'API key', secret: true },
-  { name: 'OPENAI_BASE_URL', group: 'OpenAI (LLM, TTS)', label: 'Base URL', default: 'https://api.openai.com/v1' },
-  { name: 'OPENAI_COMPAT_BASE_URL', group: 'Custom OpenAI-compatible (LLM, TTS)', label: 'Base URL', hint: 'e.g. http://localhost:11434/v1 (Ollama), vLLM, LM Studio' },
-  { name: 'OPENAI_COMPAT_API_KEY', group: 'Custom OpenAI-compatible (LLM, TTS)', label: 'API key (optional)', secret: true },
-  { name: 'CARTESIA_API_KEY', group: 'Cartesia (TTS)', label: 'API key', secret: true },
-  { name: 'CARTESIA_BASE_URL', group: 'Cartesia (TTS)', label: 'Base URL', default: 'https://api.cartesia.ai' },
-  { name: 'CARTESIA_VERSION', group: 'Cartesia (TTS)', label: 'API version', default: '2025-04-16' },
   {
     name: 'GPUBOX_BASE_URL',
     group: 'GPU box (Qwen3-ASR, Kyutai TTS)',
@@ -63,6 +50,13 @@ const SETTINGS: SettingDef[] = [
     hint: 'ws(s) URL of gpubox/server.py, e.g. wss://xyz.trycloudflare.com',
   },
   { name: 'GPUBOX_TOKEN', group: 'GPU box (Qwen3-ASR, Kyutai TTS)', label: 'Token', secret: true, hint: 'Printed by gpubox/setup.sh' },
+  {
+    name: 'OPENAI_COMPAT_BASE_URL',
+    group: 'LLM (OpenAI-compatible)',
+    label: 'Base URL',
+    hint: 'e.g. http://127.0.0.1:8103/v1 (llama.cpp on the GPU box), or any local server: vLLM, Ollama, LM Studio',
+  },
+  { name: 'OPENAI_COMPAT_API_KEY', group: 'LLM (OpenAI-compatible)', label: 'API key (optional)', secret: true },
   { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'API key', secret: true },
   { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
   {
@@ -70,8 +64,10 @@ const SETTINGS: SettingDef[] = [
     group: 'Workers (ACP agent)',
     label: 'Agent command',
     default: 'npx -y @agentclientprotocol/claude-agent-acp@0.85.1',
-    hint: 'Started once per worker; speaks the Agent Client Protocol on stdin/stdout. Gets the Anthropic key and base URL above.',
+    hint: 'Started once per worker; speaks the Agent Client Protocol on stdin/stdout. Gets the Anthropic key and base URL below.',
   },
+  { name: 'ANTHROPIC_API_KEY', group: 'Workers (ACP agent)', label: 'Anthropic API key', secret: true },
+  { name: 'ANTHROPIC_BASE_URL', group: 'Workers (ACP agent)', label: 'Anthropic base URL', hint: 'Empty uses the agent\'s default' },
   { name: 'FV_ACP_CWD', group: 'Workers (ACP agent)', label: 'Working folder', default: '.frankenvoice/workers', hint: 'Where workers run; relative to where the proxy runs' },
   { name: 'FV_SESSIONS_DIR', group: 'Storage', label: 'Sessions folder', default: 'sessions', hint: 'Relative to where the proxy runs' },
 ];
@@ -138,23 +134,10 @@ interface Upstream {
 const bearer = (key: string | undefined): Record<string, string> => (key ? { authorization: `Bearer ${key}` } : {});
 
 const upstreams: Record<string, Upstream> = {
-  anthropic: { baseVar: 'ANTHROPIC_BASE_URL', keyVar: 'ANTHROPIC_API_KEY', headers: (key) => ({ 'x-api-key': key! }) },
-  cartesia: {
-    baseVar: 'CARTESIA_BASE_URL',
-    keyVar: 'CARTESIA_API_KEY',
-    headers: (key) => ({ 'x-api-key': key!, 'cartesia-version': setting('CARTESIA_VERSION')! }),
-  },
-  deepgram: { baseVar: 'DEEPGRAM_BASE_URL', keyVar: 'DEEPGRAM_API_KEY', headers: (key) => ({ authorization: `Token ${key}` }) },
   typesafe: { baseVar: 'TYPESAFE_BASE_URL', keyVar: 'TYPESAFE_API_KEY', headers: bearer },
   gpubox: { baseVar: 'GPUBOX_BASE_URL', keyVar: 'GPUBOX_TOKEN', headers: bearer },
-  // OpenAI-compatible endpoints, addressed as /api/openai/<name>/...
-  'openai/openrouter': {
-    baseVar: 'OPENROUTER_BASE_URL',
-    keyVar: 'OPENROUTER_API_KEY',
-    headers: (key) => ({ ...bearer(key), 'x-title': 'frankenvoice' }),
-  },
-  'openai/openai': { baseVar: 'OPENAI_BASE_URL', keyVar: 'OPENAI_API_KEY', headers: bearer },
-  'openai/custom': { baseVar: 'OPENAI_COMPAT_BASE_URL', keyVar: 'OPENAI_COMPAT_API_KEY', keyOptional: true, headers: bearer },
+  // The OpenAI-compatible chat endpoint (llama.cpp on the GPU box), addressed as /api/llm/...
+  llm: { baseVar: 'OPENAI_COMPAT_BASE_URL', keyVar: 'OPENAI_COMPAT_API_KEY', keyOptional: true, headers: bearer },
 };
 
 const baseOf = (u: Upstream) => setting(u.baseVar);
@@ -222,7 +205,7 @@ async function serveStatic(p: string, res: ServerResponse) {
   res.end(await readFile(file));
 }
 
-const DROP_REQ = new Set(['host', 'connection', 'content-length', 'x-api-key', 'authorization', 'origin', 'referer', 'cookie', 'anthropic-dangerous-direct-browser-access']);
+const DROP_REQ = new Set(['host', 'connection', 'content-length', 'x-api-key', 'authorization', 'origin', 'referer', 'cookie']);
 // Added by a tunnel or reverse proxy in front of a hosted proxy; providers don't need the viewer's IP.
 const DROP_REQ_PREFIX = /^(cf-|x-forwarded-|x-real-ip$|true-client-ip$|forwarded$|cdn-loop$|via$)/;
 const DROP_RES = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection']);
@@ -251,7 +234,7 @@ async function forward(name: string, rest: string, req: IncomingMessage, res: Se
   const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : new Uint8Array(await readBody(req));
   const ac = new AbortController();
   res.on('close', () => ac.abort());
-  // Deepgram and the GPU box are ws(s) URLs for streaming; their REST endpoints use http(s).
+  // The GPU box is a ws(s) URL for streaming; its REST endpoints use http(s).
   const base = upBase.replace(/^ws(s?):/, 'http$1:');
   const upstream = await fetch(base + rest, { method: req.method, headers, body, signal: ac.signal });
   const outHeaders: Record<string, string> = {};
@@ -342,7 +325,7 @@ const server = createServer((req, res) => {
     if (p === '/api/health') {
       return json(res, 200, { ...Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])), acp: !!setting('FV_ACP_COMMAND') });
     }
-    let m = /^\/api\/(anthropic|cartesia|deepgram|gpubox|typesafe|openai\/[\w-]+)(\/.*)$/.exec(p);
+    let m = /^\/api\/(gpubox|typesafe|llm)(\/.*)$/.exec(p);
     if (m) return forward(m[1], m[2] + url.search, req, res);
     m = /^\/api\/sessions(?:\/([^/]+))?$/.exec(p);
     if (m) return sessions(req, res, m[1] && decodeURIComponent(m[1]));
@@ -355,7 +338,7 @@ const server = createServer((req, res) => {
   });
 });
 
-// Streaming (Deepgram, the GPU box): browser <-> proxy <-> upstream, frames passed through unchanged.
+// Streaming (the GPU box): browser <-> proxy <-> upstream, frames passed through unchanged.
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');
@@ -363,7 +346,7 @@ server.on('upgrade', (req, socket, head) => {
     if (!allowed(req)) return socket.destroy();
     return wss.handleUpgrade(req, socket, head, (client) => void acp(client).catch((e: unknown) => client.close(1011, String(e).slice(0, 120))));
   }
-  const m = /^\/api\/(deepgram|gpubox)(\/.*)$/.exec(url.pathname);
+  const m = /^\/api\/(gpubox)(\/.*)$/.exec(url.pathname);
   if (!m || !allowed(req)) return socket.destroy();
   const name = m[1];
   wss.handleUpgrade(req, socket, head, (client) => {
@@ -424,9 +407,10 @@ async function acp(client: WebSocket) {
   await mkdir(cwd, { recursive: true });
   if (hungUp) return;
   const env: NodeJS.ProcessEnv = { ...process.env };
-  const key = keyOf(upstreams.anthropic);
+  const key = setting('ANTHROPIC_API_KEY');
   if (key) env.ANTHROPIC_API_KEY = key;
-  if (settingSource('ANTHROPIC_BASE_URL') !== 'default') env.ANTHROPIC_BASE_URL = baseOf(upstreams.anthropic);
+  const base = setting('ANTHROPIC_BASE_URL');
+  if (base) env.ANTHROPIC_BASE_URL = base;
   // Its own process group: the command runs through a shell (npx, pnpm exec …), and stopping must reach the agent under it.
   const child = spawn(command, { cwd, env, shell: true, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
   const kill = (sig: NodeJS.Signals) => {

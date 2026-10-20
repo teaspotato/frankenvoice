@@ -83,71 +83,56 @@ const firered: LiveDriver = (_req, sink) => {
 };
 
 const utterances = ['hello there', 'what time is it', 'tell me a joke'];
-const deepgram: LiveDriver = (_req, sink) => {
+const words = (text: string, start: number) => text.split(' ').filter(Boolean).map((w, i) => ({ word: w, start: start + i * 0.2, end: start + i * 0.2 + 0.15 }));
+const results = (text: string, start: number, isFinal: boolean, fromFinalize = false): Json => ({
+  type: 'Results',
+  is_final: isFinal,
+  speech_final: isFinal,
+  from_finalize: fromFinalize,
+  start,
+  end: start + 0.8,
+  text,
+  words: words(text, start),
+  decode_ms: 20,
+});
+
+/** Qwen3-ASR on the GPU box: every ~40 frames an "utterance", as partials then a final (sooner on Finalize). */
+const gpuboxAsr: LiveDriver = (_req, sink) => {
   let sent = 0;
   let utt = 0;
   let closed = false;
-  later(jitter(2, 3), () => sink.recv({ type: '$open' }));
-  later(jitter(3, 3), () => sink.recv({ type: 'Metadata', request_id: 'fake' }));
+  /** The utterance in progress, until its final is sent. */
+  let pending: { text: string; start: number } | undefined;
+  const out = sequence((m) => sink.recv(m), () => closed);
+  out({ type: '$open' }, jitter(2, 3));
+  out({ type: 'Ready', model: 'fake-qwen3-asr' });
+  const final = (fromFinalize: boolean) => {
+    const u = pending;
+    pending = undefined;
+    if (u) out(results(u.text, u.start, true, fromFinalize));
+    else if (fromFinalize) out(results('', sent / 16000, true, true));
+  };
   return {
     send(data, bin) {
-      if (!bin || closed) return;
+      if (closed) return;
+      const m = data as { type?: string } | null;
+      if (m?.type === 'Finalize') return final(true);
+      if (m?.type === 'CloseStream') return final(false);
+      if (!bin) return;
       sent += bin.byteLength / 2;
-      // Every ~40 frames, transcribe one "utterance": two partials, then a final.
       if (sent >= (utt + 1) * 40 * 512 && utt < utterances.length) {
         const text = utterances[utt];
         const start = (utt * 40 * 512) / 16000;
         utt++;
-        const words = text.split(' ');
-        words.forEach((_, i) => {
-          later(jitter(1 + i * 2, 2), () => {
-            if (closed) return;
-            sink.recv(results(words.slice(0, i + 1).join(' '), start, false, false));
-          });
-        });
-        later(jitter(10, 4), () => !closed && sink.recv(results(text, start, true, true)));
+        pending = { text, start };
+        out({ type: 'SpeechStarted', at: start });
+        const ws = text.split(' ');
+        ws.forEach((_, i) => out(() => pending?.text === text && sink.recv(results(ws.slice(0, i + 1).join(' '), start, false)), jitter(1, 2)));
+        out(() => pending?.text === text && final(false), jitter(6, 4));
       }
-      void data;
     },
     close: () => void (closed = true),
   };
-};
-
-function results(text: string, start: number, isFinal: boolean, speechFinal: boolean): Json {
-  return {
-    type: 'Results',
-    is_final: isFinal,
-    speech_final: speechFinal,
-    start,
-    duration: 0.8,
-    channel: { alternatives: [{ transcript: text, confidence: 0.9, words: text.split(' ').map((w, i) => ({ word: w, start: start + i * 0.2, end: start + i * 0.2 + 0.15 })) }] },
-  };
-}
-
-const anthropic: LiveDriver = (req, sink) => {
-  const r = req as { messages: { role: string; content: { type: string }[] }[]; tools?: { name: string }[] };
-  const tools = new Set((r.tools ?? []).map((x) => x.name));
-  const last = r.messages[r.messages.length - 1];
-  // The conversation starts a worker on the first user turn.
-  const delegate = tools.has('spawn_worker') && r.messages.length === 1 && last.content[0]?.type === 'text';
-  const reply = delegate ? 'Let me look that up.' : `Reply number ${r.messages.length}. This is a second sentence! And a third?`;
-  const tokens = reply.match(/\S+\s*/g)!;
-  let closed = false;
-  const ev = sequence((e) => sink.recv(e), () => closed);
-  ev({ type: 'message_start', message: { id: 'msg_fake', role: 'assistant', content: [] } }, jitter(2.5, 4));
-  let i = 0;
-  ev({ type: 'content_block_start', index: i, content_block: { type: 'text', text: '' } });
-  for (const tok of tokens) ev({ type: 'content_block_delta', index: i, delta: { type: 'text_delta', text: tok } });
-  ev({ type: 'content_block_stop', index: i++ });
-  if (delegate) {
-    ev({ type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: 'toolu_fake', name: 'spawn_worker', input: {} } });
-    ev({ type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: '{"task":"the question"}' } });
-    ev({ type: 'content_block_stop', index: i++ });
-  }
-  ev({ type: 'message_delta', delta: { stop_reason: delegate ? 'tool_use' : 'end_turn' } });
-  ev({ type: 'message_stop' });
-  ev(() => sink.close(), 1);
-  return { send() {}, close: () => void (closed = true) };
 };
 
 /** An ACP agent: sets up a session, then answers each prompt after thinking and one web fetch (asking permission first). */
@@ -200,7 +185,7 @@ const typesafe: LiveDriver = (req, sink) => {
 
 const openai: LiveDriver = (req, sink) => {
   const r = req as { body: { messages: unknown[] } };
-  const tokens = `Compat reply ${r.body.messages.length}. Short and sweet!`.match(/\S+\s*/g)!;
+  const tokens = `Reply number ${r.body.messages.length}. This is a second sentence! And a third?`.match(/\S+\s*/g)!;
   let closed = false;
   let t = jitter(2, 3);
   const ev = (e: Json) => {
@@ -214,59 +199,48 @@ const openai: LiveDriver = (req, sink) => {
   return { send() {}, close: () => void (closed = true) };
 };
 
-const cartesia: LiveDriver = (req, sink) => {
-  const { body } = req as { body: { transcript: string; output_format: { sample_rate: number } } };
-  const n = Math.round(body.transcript.length * 0.004 * body.output_format.sample_rate);
-  const bytes = new Uint8Array(new Float32Array(n).map((_, i) => Math.sin(i / 10) * 0.1).buffer);
+/** Kyutai on the GPU box: audio, word times and Flushed for each flushed segment; Done and close after Close. */
+const gpuboxTts: LiveDriver = (_req, sink) => {
   let closed = false;
-  let off = 0;
-  let t = jitter(2, 4);
-  while (off < bytes.length) {
-    const len = Math.min(bytes.length - off, 1 + Math.floor(Math.random() * 3000)); // deliberately unaligned
-    const chunk = bytes.slice(off, off + len);
-    off += len;
-    t += jitter(0.2, 1);
-    later(t, () => !closed && sink.recv(null, chunk));
-  }
-  later(t + 0.5, () => !closed && sink.close());
-  return { send() {}, close: () => void (closed = true) };
-};
-
-/** Deepgram Aura: 16-bit PCM, streamed in chunks that split samples. */
-const deepgramTts: LiveDriver = (req, sink) => {
-  const { body, query } = req as { body: { text: string }; query: { sample_rate: number } };
-  const n = Math.round(body.text.length * 0.004 * query.sample_rate);
-  const pcm = new Int16Array(n).map((_, i) => Math.round(Math.sin(i / 10) * 3000));
-  const bytes = new Uint8Array(pcm.buffer);
-  let closed = false;
-  let off = 0;
-  let t = jitter(2, 4);
-  while (off < bytes.length) {
-    const len = Math.min(bytes.length - off, 1 + Math.floor(Math.random() * 3000));
-    const chunk = bytes.slice(off, off + len);
-    off += len;
-    t += jitter(0.2, 1);
-    later(t, () => !closed && sink.recv(null, chunk));
-  }
-  later(t + 0.5, () => !closed && sink.close());
-  return { send() {}, close: () => void (closed = true) };
-};
-
-/** Mimics speechSynthesis: start, a boundary per word, end (fast, jittered). */
-const speechSynthesis: LiveDriver = (req, sink) => {
-  const { text } = req as { text: string };
-  let closed = false;
-  let t = jitter(2, 4);
-  later(t, () => !closed && sink.recv({ type: 'start', voice: 'fake' }));
-  let charIndex = 0;
-  for (const word of text.split(' ')) {
-    const at = charIndex;
-    later(t + jitter(0.5, 1), () => !closed && sink.recv({ type: 'boundary', name: 'word', charIndex: at }));
-    charIndex += word.length + 1;
-    t += jitter(1, 2);
-  }
-  later(t + 1, () => !closed && sink.close());
-  return { send() {}, close: () => void (closed = true) };
+  let text = '';
+  /** Seconds of audio sent on this socket. */
+  let at = 0;
+  const out = sequence((m) => sink.recv(m), () => closed);
+  out({ type: '$open' }, jitter(2, 3));
+  out({ type: 'Ready', sample_rate: 24000 });
+  const speak = () => {
+    const ws = text.trim().split(/\s+/).filter(Boolean);
+    text = '';
+    if (!ws.length) return;
+    const n = Math.round(ws.join(' ').length * 0.004 * 24000);
+    const pcm = new Int16Array(n).map((_, i) => Math.round(Math.sin(i / 10) * 3000));
+    const bytes = new Uint8Array(pcm.buffer);
+    const per = n / 24000 / ws.length;
+    out({ type: 'Words', words: ws.map((word, i) => ({ word, start: at + i * per, end: at + (i + 1) * per })) }, jitter(1, 2));
+    at += n / 24000;
+    // Deliberately split mid-sample.
+    for (let off = 0; off < bytes.length; ) {
+      const len = Math.min(bytes.length - off, 1 + Math.floor(Math.random() * 3000));
+      const chunk = bytes.slice(off, (off += len));
+      out(() => sink.recv(null, chunk), jitter(0.2, 1));
+    }
+  };
+  return {
+    send(data) {
+      const m = data as { type: string; text?: string };
+      if (closed) return;
+      if (m.type === 'Speak') text += m.text ?? '';
+      else if (m.type === 'Flush') {
+        speak();
+        out({ type: 'Flushed' });
+      } else if (m.type === 'Close') {
+        speak();
+        out({ type: 'Done', stats: {} });
+        out(() => sink.close({ code: 1000, reason: '' }), 0.5);
+      }
+    },
+    close: () => void (closed = true),
+  };
 };
 
 /** RNNoise stand-in: halves the signal, one reply per frame, after a random delay. */
@@ -323,15 +297,11 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, firered, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp, typesafe };
+export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, openai, rnnoise, speaker, 'turn-model': turnModel, acp, typesafe };
 
-/** The pipeline on the API providers these fakes stand in for, with the turn model (the defaults run on the GPU box without it). */
-export function apiConfig(): PipelineConfig {
+/** The default pipeline with the turn model on (it is off by default, a big download). */
+export function testConfig(): PipelineConfig {
   const c = defaultConfig();
-  c.asr.params.streaming = { provider: 'deepgram' };
-  c.llm.params.api = { provider: 'anthropic' };
-  c.tts.variant = 'api';
-  c.workers.variant = 'acp';
   c.turnmodel.variant = 'ssl_turn';
   // The fake user talks soon after replies start; these tests are about the rest of the floor rules.
   c.turn.params['full-duplex'] = { yieldWithinMs: 0 };

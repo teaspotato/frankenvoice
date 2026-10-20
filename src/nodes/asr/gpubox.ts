@@ -10,7 +10,6 @@ type Word = { word: string; start: number; end: number };
  * a forced aligner. `$open` is synthesized by the driver on connect.
  */
 export const gpuboxAsrAdapter: AsrAdapter = {
-  provider: 'gpubox',
   channel: 'gpubox-asr',
   params: [
     { key: 'language', label: 'Language', type: 'string', default: 'English', description: 'Qwen3-ASR language name (English, Chinese, Japanese, …).' },

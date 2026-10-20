@@ -179,7 +179,6 @@ export class TimelineModel {
   /** Backchannels the agent said while the user talked, and proposals that were gated off. */
   backchannels: (Span & { id: string; why?: string })[] = [];
   bcSkips: (Marker & { why: string })[] = [];
-  boundaries: number[] = [];
   agentAudio: AudioBlock[] = [];
   errors: (Marker & { node: string })[] = [];
   /** Events caused by each event (the inverse of TrajEvent.cause). */
@@ -623,9 +622,6 @@ export class TimelineModel {
         break;
       case 'playback.resumed':
         this.closeHold(d.at ?? e.t, e.seq);
-        break;
-      case 'playback.boundary':
-        this.boundaries.push(d.at ?? e.t);
         break;
       case 'playback.end':
       case 'playback.interrupted': {

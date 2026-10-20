@@ -1,8 +1,7 @@
 import type { NodeDef } from '../../core/node';
 import type { Json, JsonObject, Msg } from '../../core/types';
-import { anthropicAdapter } from './anthropic';
-import { openaiCompatAdapter } from './openai';
-import type { ChatTurn, LlmAdapter, LlmStreamParser } from './types';
+import { openaiCompatAdapter as adapter } from './openai';
+import type { ChatTurn, LlmStreamParser } from './types';
 import { DEFAULT_DELEGATE_PROMPT, WORKER_TOOLS, toolCalls, workerStatus, workerUpdate, type ToolCall, type WorkerInfo } from './delegate';
 
 const words = (s: string) => s.split(/\s+/).filter(Boolean);
@@ -59,25 +58,16 @@ export function cutToHeard(history: ChatTurn[], indexes: number[], heard: string
   return history.flatMap((t, i) => (out.has(i) ? (out.get(i) ? [out.get(i)!] : []) : [t]));
 }
 
-export const llmAdapters: Record<string, LlmAdapter> = {
-  [anthropicAdapter.provider]: anthropicAdapter,
-  [openaiCompatAdapter.provider]: openaiCompatAdapter,
-};
-
 /** Enough for the one or two sentences an interjection is. */
 const CHECK_MAX_TOKENS = 300;
 
 const DEFAULT_SYSTEM =
   'You are a voice assistant in a live spoken conversation. Your words are converted to speech, so answer in short, natural spoken sentences. No markdown, lists, or emoji.';
 
-const anthropic = { provider: ['anthropic'] };
-const openai = { provider: ['openai-compatible'] };
-
 /**
- * Streams a reply for each user turn and keeps the conversation. The provider
- * is a parameter: swapping it changes only the request/stream format, never
- * the node's ports or messages. The request (full history included) is the
- * io.open payload and every raw stream payload is an io.recv, so a replay sees
+ * Streams a reply for each user turn and keeps the conversation, over an
+ * OpenAI-compatible endpoint (llama.cpp on the GPU box). The request (full
+ * history included) is the io.open payload and every raw stream payload is an io.recv, so a replay sees
  * the identical token stream with identical timing.
  *
  * A `turn.draft` (the user's words before their turn is committed) starts a
@@ -87,13 +77,11 @@ const openai = { provider: ['openai-compatible'] };
  * ordinary reply (llm.start with `draft`, then its deltas) and the rest
  * streams as usual. Any other turn, a new draft or a drop discards it.
  *
- * The first sign of reasoning in a reply (a thinking block, reasoning tokens)
- * is emitted as `llm.thinking`, for the opener stage to fill the wait with.
+ * The first sign of reasoning in a reply (reasoning tokens) is emitted as `llm.thinking`, for the opener stage to fill the wait with.
  *
  * An `interject.check` (the user's words so far, while they still talk) asks
  * whether to cut in: a request like a draft's, with the check's prompt after
- * the words, its stream held back, with thinking off and a short token limit
- * so it answers fast. As soon as the reply is clearly not the
+ * the words, its stream held back, with a short token limit so it answers fast. As soon as the reply is clearly not the
  * pass reply, `llm.check_verdict` says `interject` (else `pass`, and the check
  * ends). A committed turn that names the check (`interject`) keeps it the way
  * a kept draft is kept; the history records the committed words, marked as
@@ -103,7 +91,7 @@ export const llmNode: NodeDef = {
   type: 'llm',
   title: 'LLM',
   category: 'llm',
-  description: 'Streaming chat model. Providers: Anthropic (Claude), any OpenAI-compatible endpoint (OpenRouter, OpenAI, local servers).',
+  description: 'Streaming chat model on an OpenAI-compatible endpoint (llama.cpp on the GPU box, or any local server), set in the proxy.',
   inputs: [
     { name: 'turn', type: 'turn' },
     { name: 'control', type: 'control' },
@@ -116,36 +104,9 @@ export const llmNode: NodeDef = {
     { name: 'workers', type: 'workers', description: 'worker.start / worker.send / worker.stop for the workers' },
   ],
   params: [
-    { key: 'provider', label: 'Provider', type: 'select', options: Object.keys(llmAdapters), default: 'anthropic' },
-    {
-      key: 'endpoint',
-      label: 'Endpoint',
-      type: 'select',
-      options: ['openrouter', 'openai', 'custom'],
-      default: 'openrouter',
-      when: openai,
-      description: 'Named endpoint configured in the proxy (.env): base URL and key stay server-side.',
-    },
-    {
-      key: 'model',
-      label: 'Model',
-      type: 'string',
-      default: '',
-      description: 'Empty uses the provider default (Anthropic: claude-haiku-5-5). OpenAI-compatible endpoints need a model name, e.g. an OpenRouter slug.',
-    },
-    { key: 'effort', label: 'Effort', type: 'select', options: ['low', 'medium', 'high', 'xhigh', 'max'], default: 'low', when: anthropic },
-    {
-      key: 'thinking',
-      label: 'Thinking',
-      type: 'select',
-      options: ['model default', 'off'],
-      default: 'off',
-      when: anthropic,
-      description: 'Off sends thinking {type: "disabled"} (Haiku) or {type: "between_tools"} (Sonnet). Opus cannot turn it off.',
-    },
+    { key: 'model', label: 'Model', type: 'string', default: 'gemma-4-12b-it', description: 'The model name the endpoint serves (the GPU box: gemma-4-12b-it).' },
     { key: 'maxTokens', label: 'Max tokens', type: 'number', default: 4096 },
-    { key: 'fallbacks', label: 'Server-side refusal fallback', type: 'boolean', default: true, when: anthropic },
-    { key: 'extraBody', label: 'Extra request body (JSON)', type: 'text', default: '', when: openai, description: 'Merged into the request, e.g. {"temperature":0.7}' },
+    { key: 'extraBody', label: 'Extra request body (JSON)', type: 'text', default: '', description: 'Merged into the request, e.g. {"temperature":0.7}' },
     { key: 'system', label: 'System prompt', type: 'text', default: DEFAULT_SYSTEM },
     {
       key: 'delegate',
@@ -153,21 +114,17 @@ export const llmNode: NodeDef = {
       type: 'text',
       default: null,
       description:
-        'Set by the Workers stage: {prompt, progress, quietMs, maxWorkers}. With it, the model gets the worker tools and the workers\' updates (Anthropic only).',
+        'Set by the Workers stage: {prompt, progress, quietMs, maxWorkers}. The worker tools need tool calls, which the OpenAI-compatible client does not parse yet.',
     },
   ],
-  channels: [
-    { name: 'anthropic', description: 'Messages API stream (raw SDK stream events)' },
-    { name: 'openai', description: 'Chat Completions SSE (parsed data lines)' },
-  ],
-  requires: (p) => (p.provider === 'openai-compatible' ? [`openai/${String(p.endpoint)}`] : [String(p.provider)]),
+  channels: [{ name: 'openai', description: 'Chat Completions SSE (parsed data lines)' }],
+  requires: () => ['llm'],
   create(ctx) {
     const p = ctx.params as JsonObject;
-    const adapter = llmAdapters[p.provider as string];
-    const reqParams: JsonObject = { ...p, model: (p.model as string) || adapter?.defaultModel || '' };
-    // Delegation: the worker tools, and how the workers' updates come back.
-    const delegation = p.delegate && typeof p.delegate === 'object' && adapter?.provider === 'anthropic' ? (p.delegate as JsonObject) : null;
-    if (p.delegate && !delegation) ctx.log('warn', 'delegation needs the Anthropic provider: the worker tools are off');
+    const reqParams: JsonObject = { ...p };
+    // Delegation: the worker tools, and how the workers' updates come back. They need tool calls, which the client doesn't parse.
+    const delegation = null as JsonObject | null;
+    if (p.delegate) ctx.log('warn', 'delegation needs tool calls, which the OpenAI-compatible client does not parse yet: the worker tools are off');
     if (delegation) {
       reqParams.tools = WORKER_TOOLS;
       reqParams.system = `${String(p.system ?? '')}\n\n${String(delegation.prompt ?? DEFAULT_DELEGATE_PROMPT)}`.trim();
@@ -301,7 +258,7 @@ export const llmNode: NodeDef = {
     const deliver = () => {
       deliverTimer?.clear();
       deliverTimer = undefined;
-      if (!notes.speak || active || draft || committing || userWords || floor !== 'listening' || userSpeaking || !adapter || !reqParams.model) return;
+      if (!notes.speak || active || draft || committing || userWords || floor !== 'listening' || userSpeaking || !reqParams.model) return;
       const wait = lastSpeech + quietMs - ctx.now();
       if (wait > 0) return void (deliverTimer = ctx.setTimer(wait, deliver, 'worker-update'));
       const n = notes;
@@ -422,8 +379,8 @@ export const llmNode: NodeDef = {
       });
       ctx.emit('text', { type: 'llm.check', rid: r.rid, checkId: r.checkId!, text });
       check = r;
-      // A check is a reflex: no thinking (it took a second or more before the verdict), and a short answer.
-      send(r, historyFor(user, msg.replaces), { ...reqParams, thinking: 'off', maxTokens: Math.min(Number(reqParams.maxTokens) || CHECK_MAX_TOKENS, CHECK_MAX_TOKENS) });
+      // A check is a reflex: a short answer.
+      send(r, historyFor(user, msg.replaces), { ...reqParams, maxTokens: Math.min(Number(reqParams.maxTokens) || CHECK_MAX_TOKENS, CHECK_MAX_TOKENS) });
     };
     const dropDraft = (why: string) => {
       if (!draft) return;
@@ -455,9 +412,6 @@ export const llmNode: NodeDef = {
       draft = d;
       launch(d, historyFor(user, msg.replaces));
     };
-
-    if (!adapter) ctx.log('error', `unknown LLM provider "${String(p.provider)}"`);
-    ctx.setState('provider', p.provider);
 
     /** Replies taken back (their turn was replaced): the workers they started go too, with any news from them. */
     const stopWorkersOf = (removed: ChatTurn[]) => {
@@ -582,12 +536,12 @@ export const llmNode: NodeDef = {
         }
         if (port === 'interject') {
           if (msg.type === 'interject.check') {
-            if (adapter && reqParams.model) startCheck(msg);
+            if (reqParams.model) startCheck(msg);
           } else if (msg.type === 'interject.drop' && check?.checkId === msg.checkId) endCheck('dropped', (msg.why as string) ?? 'dropped');
           return;
         }
         if (msg.type === 'turn.draft') {
-          if (adapter && reqParams.model) startDraft(msg);
+          if (reqParams.model) startDraft(msg);
           return;
         }
         if (msg.type === 'turn.draft_drop') {
@@ -612,10 +566,10 @@ export const llmNode: NodeDef = {
           ctx.log('info', heard ? 'reply truncated to what was heard' : 'reply dropped: nothing was heard', { turnId: msg.turnId as string, heard });
           return;
         }
-        if (msg.type !== 'turn.user' || !adapter) return;
+        if (msg.type !== 'turn.user') return;
         userWords = false;
         if (!reqParams.model) {
-          ctx.log('error', `set a model for provider "${adapter.provider}"`);
+          ctx.log('error', 'set a model for the LLM');
           return;
         }
         committing = true;

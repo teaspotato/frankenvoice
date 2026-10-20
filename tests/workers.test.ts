@@ -1,10 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { llmNode, cutToHeard } from '../src/nodes/llm';
+import { cutToHeard } from '../src/nodes/llm';
 import { mockWorkersNode, workersNode } from '../src/nodes/workers';
 import { FLOOR, halfDuplexTurnNode } from '../src/nodes/turn';
-import { DEFAULT_DELEGATE_PROMPT } from '../src/nodes/llm/delegate';
 import { buildGraph } from '../src/pipeline';
-import { apiConfig } from './fake-drivers';
+import { testConfig } from './fake-drivers';
 import { resolveParams, type IOHandlers, type NodeContext, type NodeDef } from '../src/core/node';
 import type { Json, JsonObject, Msg } from '../src/core/types';
 import type { ChatTurn } from '../src/nodes/llm/types';
@@ -58,134 +57,7 @@ function harness(def: NodeDef, params: Record<string, unknown> = {}) {
   return { send, advance, out, of, ios };
 }
 
-/** A Messages API stream: text, then optional blocks given whole (tool_use input is streamed as JSON). */
-function stream(io: { h: IOHandlers }, text: string, blocks: JsonObject[] = [], stopReason = blocks.some((b) => b.type === 'tool_use') ? 'tool_use' : 'end_turn') {
-  const r = (e: Json) => io.h.onRecv?.(e, undefined);
-  let i = 0;
-  if (text) {
-    r({ type: 'content_block_start', index: i, content_block: { type: 'text', text: '' } });
-    r({ type: 'content_block_delta', index: i, delta: { type: 'text_delta', text } });
-    r({ type: 'content_block_stop', index: i++ });
-  }
-  for (const b of blocks) {
-    const { input, ...rest } = b;
-    r({ type: 'content_block_start', index: i, content_block: input !== undefined ? { ...rest, input: {} } : b });
-    if (input !== undefined) r({ type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } });
-    r({ type: 'content_block_stop', index: i++ });
-  }
-  r({ type: 'message_delta', delta: { stop_reason: stopReason } });
-  r({ type: 'message_stop' });
-  io.h.onClose?.(null);
-}
-
-const delegate = { prompt: DEFAULT_DELEGATE_PROMPT, progress: 'context', quietMs: 800, maxWorkers: 2 };
-const turn = (turnId: string, text: string) => ({ type: 'turn.user', turnId, text });
-const floor = (to: string) => ({ type: 'turn.transition', to });
-
-describe('the conversation LLM delegates', () => {
-  it('starts a worker with a tool call and continues the same reply with the result', () => {
-    const h = harness(llmNode, { delegate });
-    h.send(0, 'turn', turn('u0', 'What is the weather in Kyoto?'));
-    const req = h.ios[0].request;
-    expect((req.tools as JsonObject[]).map((t) => t.name)).toEqual(['spawn_worker', 'message_worker', 'check_worker', 'stop_worker']);
-    expect(String(req.system)).toContain('worker_update');
-    stream(h.ios[0], 'Let me look that up. ', [{ type: 'tool_use', id: 'tu1', name: 'spawn_worker', input: { task: 'Weather in Kyoto today' } }]);
-    expect(h.of('worker.start')).toMatchObject([{ workerId: 'w1', task: 'Weather in Kyoto today' }]);
-    expect(h.out.find((o) => o.msg.type === 'worker.start')!.port).toBe('workers');
-    // Same reply, a second request carrying the tool result.
-    expect(h.ios).toHaveLength(2);
-    const msgs = h.ios[1].request.messages as JsonObject[];
-    expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant', 'user']);
-    expect((msgs[2].content as JsonObject[])[0]).toMatchObject({ type: 'tool_result', tool_use_id: 'tu1' });
-    expect(h.of('llm.end')).toHaveLength(0);
-    stream(h.ios[1], 'It should only take a moment.');
-    expect(h.of('llm.start')).toHaveLength(1);
-    expect(h.of('llm.end')).toMatchObject([{ status: 'done', text: 'Let me look that up. It should only take a moment.' }]);
-  });
-
-  it('speaks a result once the floor is free and the user has paused', () => {
-    const h = harness(llmNode, { delegate });
-    h.send(0, 'turn', turn('u0', 'Find me a ramen place.'));
-    stream(h.ios[0], 'On it. ', [{ type: 'tool_use', id: 'tu1', name: 'spawn_worker', input: { task: 'ramen' } }]);
-    stream(h.ios[1], '');
-    h.send(100, 'turn', floor('speaking'));
-    h.send(2000, 'updates', { type: 'worker.done', workerId: 'w1', text: 'Ichiran in Gion, open until 2 am.' });
-    expect(h.of('llm.start')).toHaveLength(1);
-    h.send(2400, 'vad', { type: 'vad.speech_start' });
-    h.send(2500, 'turn', floor('listening'));
-    h.send(3000, 'vad', { type: 'vad.speech_end' });
-    h.advance(3700);
-    expect(h.of('llm.start')).toHaveLength(1);
-    h.advance(3800);
-    expect(h.of('llm.start')).toMatchObject([{}, { turnId: null, workers: ['w1'] }]);
-    const msgs = h.ios[2].request.messages as JsonObject[];
-    const last = msgs[msgs.length - 1].content as JsonObject[];
-    expect(String(last[last.length - 1].text)).toMatch(/<worker_update id="w1" kind="result">\nIchiran in Gion/);
-  });
-
-  /** A worker w1 started on the first turn, its reply spoken, the floor back with the user. */
-  const withWorker = () => {
-    const h = harness(llmNode, { delegate });
-    h.send(0, 'turn', turn('u0', 'Find me a ramen place.'));
-    stream(h.ios[0], 'On it. ', [{ type: 'tool_use', id: 'tu1', name: 'spawn_worker', input: { task: 'ramen' } }]);
-    stream(h.ios[1], '');
-    h.send(100, 'turn', floor('speaking'));
-    h.send(200, 'turn', floor('listening'));
-    return h;
-  };
-
-  it('holds news while turn-taking has words of the user not yet committed', () => {
-    const h = withWorker();
-    h.send(1000, 'turn', { type: 'turn.pending', words: true });
-    h.send(2000, 'updates', { type: 'worker.done', workerId: 'w1', text: 'Ichiran.' });
-    h.advance(5000);
-    expect(h.of('llm.start')).toHaveLength(1);
-    // The turn is committed: the news goes with it, not on its own.
-    h.send(5000, 'turn', turn('u1', 'Somewhere quiet please.'));
-    expect(h.of('llm.start')).toMatchObject([{}, { turnId: 'u1' }]);
-    expect(JSON.stringify(h.ios[2].request.messages)).toContain('Ichiran.');
-  });
-
-  it('drops a reply to news the user spoke up before, and tries again after', () => {
-    const h = withWorker();
-    h.send(2000, 'updates', { type: 'worker.done', workerId: 'w1', text: 'Ichiran.' });
-    expect(h.of('llm.start')).toHaveLength(2);
-    h.send(2100, 'vad', { type: 'vad.speech_start' });
-    expect(h.ios[2].closed).toBe(true);
-    expect(h.of('llm.end')[1]).toMatchObject({ status: 'cancelled' });
-    // Only a cough: once they are quiet again, the news is told.
-    h.send(2300, 'vad', { type: 'vad.speech_end' });
-    h.advance(3200);
-    expect(h.of('llm.start')).toHaveLength(3);
-    const msgs = JSON.stringify(h.ios[3].request.messages);
-    expect(msgs.split('Ichiran.').length).toBe(2);
-  });
-
-  it('stops the workers of a reply whose turn was replaced', () => {
-    const h = harness(llmNode, { delegate });
-    h.send(0, 'turn', turn('u0', 'Find me a ramen'));
-    stream(h.ios[0], '', [{ type: 'tool_use', id: 'tu1', name: 'spawn_worker', input: { task: 'ramen' } }]);
-    stream(h.ios[1], 'On it.');
-    h.send(500, 'turn', { ...turn('u1', 'Find me a ramen place in Gion.'), replaces: 'u0' });
-    expect(h.of('worker.stop')).toMatchObject([{ workerId: 'w1' }]);
-    h.send(600, 'updates', { type: 'worker.done', workerId: 'w1', text: 'Ichiran.' });
-    expect(JSON.stringify(h.ios.map((io) => io.request.messages))).not.toContain('Ichiran.');
-  });
-
-  it('caps follow-ups at the most workers at once', () => {
-    const h = harness(llmNode, { delegate });
-    h.send(0, 'turn', turn('u0', 'a and b and c'));
-    stream(h.ios[0], '', ['a', 'b'].map((task, i) => ({ type: 'tool_use', id: `tu${i}`, name: 'spawn_worker', input: { task } })));
-    h.send(10, 'updates', { type: 'worker.done', workerId: 'w1', text: 'A' });
-    stream(h.ios[1], '', [
-      { type: 'tool_use', id: 'tu2', name: 'spawn_worker', input: { task: 'c' } },
-      { type: 'tool_use', id: 'tu3', name: 'message_worker', input: { worker_id: 'w1', message: 'more' } },
-    ]);
-    const results = (h.ios[2].request.messages as JsonObject[]).at(-1)!.content as JsonObject[];
-    expect(results.map((r) => !!r.is_error)).toEqual([false, true]);
-    expect(h.of('worker.send')).toHaveLength(0);
-  });
-
+describe('the LLM and turn-taking', () => {
   it('half-duplex turn-taking tells the LLM about the floor', () => {
     const h = harness(halfDuplexTurnNode);
     h.send(0, 'transcript', { type: 'asr.final', text: 'hi', start: 0, end: 1, speechFinal: true });
@@ -193,64 +65,6 @@ describe('the conversation LLM delegates', () => {
     h.send(20, 'playback', { type: 'playback.end' });
     expect(h.of('turn.transition').map((m) => m.to)).toEqual(['thinking', 'speaking', 'listening']);
     expect(h.of('turn.pending')).toMatchObject([{ words: true }]);
-  });
-
-  it('keeps progress notes for the next request instead of speaking them', () => {
-    const h = harness(llmNode, { delegate });
-    h.send(0, 'turn', turn('u0', 'Plan a trip.'));
-    stream(h.ios[0], '', [{ type: 'tool_use', id: 'tu1', name: 'spawn_worker', input: { task: 'trip' } }]);
-    stream(h.ios[1], 'Working on it.');
-    h.send(5000, 'updates', { type: 'worker.progress', workerId: 'w1', text: 'Found three hotels.' });
-    h.advance(9000);
-    expect(h.ios).toHaveLength(2);
-    h.send(9000, 'turn', turn('u1', 'How is it going?'));
-    const text = JSON.stringify(h.ios[2].request.messages);
-    expect(text).toContain('kind=\\"progress\\">\\nFound three hotels.');
-    expect(text.indexOf('Found three hotels')).toBeLessThan(text.indexOf('How is it going?'));
-  });
-
-  it('answers a bad worker id with an error result', () => {
-    const h = harness(llmNode, { delegate });
-    h.send(0, 'turn', turn('u0', 'Stop it.'));
-    stream(h.ios[0], '', [{ type: 'tool_use', id: 'tu1', name: 'stop_worker', input: { worker_id: 'w9' } }]);
-    expect(h.of('worker.stop')).toHaveLength(0);
-    expect(((h.ios[1].request.messages as JsonObject[])[2].content as JsonObject[])[0]).toMatchObject({ is_error: true });
-  });
-
-  it('runs workers in parallel, up to the most at once', () => {
-    const h = harness(llmNode, { delegate });
-    h.send(0, 'turn', turn('u0', 'Compare flights and hotels and trains.'));
-    stream(h.ios[0], '', ['flights', 'hotels', 'trains'].map((task, i) => ({ type: 'tool_use', id: `tu${i}`, name: 'spawn_worker', input: { task } })));
-    expect(h.of('worker.start').map((m) => m.workerId)).toEqual(['w1', 'w2']);
-    const results = (h.ios[1].request.messages as JsonObject[])[2].content as JsonObject[];
-    expect(results.map((r) => !!r.is_error)).toEqual([false, false, true]);
-    // One finishes: room for another.
-    h.send(100, 'updates', { type: 'worker.done', workerId: 'w1', text: 'BA 7 at 9 am.' });
-    stream(h.ios[1], '', [{ type: 'tool_use', id: 'tu9', name: 'spawn_worker', input: { task: 'trains' } }]);
-    expect(h.of('worker.start').map((m) => m.workerId)).toEqual(['w1', 'w2', 'w3']);
-  });
-
-  it("answers check_worker at once from the worker's updates", () => {
-    const h = harness(llmNode, { delegate });
-    h.send(0, 'turn', turn('u0', 'Find a hotel.'));
-    stream(h.ios[0], '', [{ type: 'tool_use', id: 'tu1', name: 'spawn_worker', input: { task: 'hotel in Kyoto' } }]);
-    stream(h.ios[1], 'On it.');
-    h.send(1000, 'updates', { type: 'worker.tool', workerId: 'w1', title: 'Search: kyoto hotels', kind: 'fetch' });
-    h.send(2000, 'updates', { type: 'worker.progress', workerId: 'w1', text: '[x] search\n[>] compare prices' });
-    h.send(3000, 'turn', turn('u1', 'How is it going?'));
-    stream(h.ios[2], '', [{ type: 'tool_use', id: 'tu2', name: 'check_worker', input: { worker_id: 'w1' } }]);
-    expect(h.ios).toHaveLength(4);
-    const msgs = h.ios[3].request.messages as JsonObject[];
-    const status = String(((msgs[msgs.length - 1].content as JsonObject[])[0] as JsonObject).content);
-    expect(status).toContain('Worker w1: running, 3 s');
-    expect(status).toContain('[>] compare prices');
-    expect(status).toContain('- Search: kyoto hotels');
-  });
-
-  it('has no tools without workers', () => {
-    const h = harness(llmNode, {});
-    h.send(0, 'turn', turn('u0', 'Hi'));
-    expect(h.ios[0].request.tools).toBeUndefined();
   });
 
   it('cuts a reply that called a tool to what was heard, keeping the call', () => {
@@ -484,7 +298,8 @@ describe('mock workers', () => {
 
 describe('wiring', () => {
   it('gives the LLM delegation only while the workers stage is on', () => {
-    const c = apiConfig();
+    const c = testConfig();
+    c.workers = { variant: 'acp', params: {} };
     const llm = (g: ReturnType<typeof buildGraph>) => g.nodes.find((n) => n.id === 'llm')!.params.delegate;
     expect(llm(buildGraph(c))).toMatchObject({ progress: 'context', quietMs: 800, maxWorkers: 4 });
     expect(buildGraph(c).edges).toContainEqual({ from: { node: 'llm', port: 'workers' }, to: { node: 'workers', port: 'workers' } });

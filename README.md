@@ -9,7 +9,7 @@ pnpm install
 pnpm dev               # local proxy on :8787 + Vite on :5173
 ```
 
-Open **Settings** in the toolbar to enter API keys and base URLs. The proxy saves them to `.frankenvoice/settings.json` (git-ignored, readable only by you); the page never gets a key back, only whether it is set. A `.env` file (see `.env.example`) still works, and values set in Settings override it. The proxy port (`FV_PROXY_PORT`) is the one thing that has to come from the environment, since the page needs it to reach the proxy.
+Everything but the TypeSafe stages runs on your own GPU box (`gpubox/README.md`): Qwen3-ASR, Gemma on llama.cpp and Kyutai TTS. Open **Settings** in the toolbar to enter its URL and token, the LLM endpoint and the TypeSafe key. The proxy saves them to `.frankenvoice/settings.json` (git-ignored, readable only by you); the page never gets a key back, only whether it is set. A `.env` file (see `.env.example`) still works, and values set in Settings override it. The proxy port (`FV_PROXY_PORT`) is the one thing that has to come from the environment, since the page needs it to reach the proxy.
 
 Open http://localhost:5173 and press **Run live**. Allow microphone access. Press **Stop** to finish. The session is saved to `./sessions/<id>.fvs` (uncheck **autosave live sessions** to keep sessions only in the tab) and appears in the Sessions list, where **Replay** runs it again.
 
@@ -22,16 +22,16 @@ Open http://localhost:5173 and press **Run live**. Allow microphone access. Pres
   - *Turn model*: end-of-turn (blue) and take-the-floor (orange) scores per 80 ms, the user solid and the agent faint, against the thresholds (dashed); diamonds for the user's committed events, hollow dots for the agent's. Hover for the values.
   - *Turn*: floor state (thinking, speaking) and committed user turns. Below it, each time the user talked over the agent: a band for how long, ending in the verdict (red *interrupt*, amber *continue*, grey *backchannel*). Hover for the reason and what the ASR had heard.
   - *LLM*: waiting for the first token (light), then generating (solid), labelled with time to first token, chunk count and chars/s. Below it, each streamed chunk gets a dot and its text at the moment it arrived (zoom in to read them); hover a chunk for its offset and the text so far.
-  - *TTS*: a diamond per request sent and each sentence's audio stream. *Playback*: the scheduled agent audio, sentence starts (diamonds), word boundaries (dots), and interruptions.
+  - *TTS*: a diamond per request sent and each sentence's audio stream. *Playback*: the scheduled agent audio, sentence starts (diamonds), and interruptions.
   - Scroll to zoom, drag to pan, double-click or **Fit** for the whole session, **Follow** to track the live edge. Hover for details; click a lane's name to select its stage, empty space to seek. Errors show as red dots on their stage's lane.
-- **Stage panel** (right): pick a stage's implementation (for example Silero or energy VAD, API or browser TTS) and edit its params. Saved in the browser; **Save config** / **Open…** move it as a file, and **Use its config** on a session restores what that session ran with.
+- **Stage panel** (right): pick a stage's implementation (for example Silero or energy VAD, Kyutai or the tone mock for TTS) and edit its params. Saved in the browser; **Save config** / **Open…** move it as a file, and **Use its config** on a session restores what that session ran with.
 - **Event log** (bottom): every recorded event, filterable.
 - **Hover**: hovering an item makes it glow and outlines what triggered it (amber) and what it produced (blue), following each event's recorded causes; the user audio behind it is shaded on the Mic and Cleaned lanes, and VAD/ASR items on the same audio get a dashed outline. The tooltip lists both sides. Hover a lane's name (ⓘ) for what its marks mean. With the event log open, clicking an item scrolls to and selects its first event and marks the rest, clearing filters that would hide it.
 - **Transport** (dashboard header): ▶ replays the shown session, ❚❚ pauses a realtime replay (the session clock and any audio already scheduled freeze) and resumes it, ■ stops. Space does the same as ▶ / ❚❚. Click empty timeline space (or the time axis) to seek: a running replay jumps there, skipping ahead with audio muted or restarting if the point is earlier; when nothing runs it sets where ▶ starts (blue marker). Click a lane's name to select its stage.
 - **Layout**: drag the edges between the diagram, dashboard, event log and side panel to resize them (double-click an edge to reset); **Hide panel** in the toolbar collapses the side panel (selecting a stage brings it back); the event log starts collapsed, click **Events** to open it. Sizes are remembered in the browser.
 - **Sessions** (right): **New session** clears the dashboard; click a session's name to rename it (a saved session's file is renamed too); **Save** writes an unsaved live session to `./sessions` when autosave is off; **Delete** removes a session from the list and, for a recorded session, its file in `./sessions`.
 
-The pipeline runs in the browser. The small proxy in `server/` keeps API keys out of the page, avoids CORS, and stores settings and session bundles. It only answers requests from the local UI: other websites (by `Origin`) and DNS-rebinding hosts (by `Host`) get 403. It forwards requests and streams responses unchanged, so the browser records exactly what each provider sent.
+The pipeline runs in the browser. The small proxy in `server/` keeps API keys out of the page, avoids CORS, and stores settings and session bundles. It only answers requests from the local UI: other websites (by `Origin`) and DNS-rebinding hosts (by `Host`) get 403. It forwards requests and streams responses unchanged, so the browser records exactly what each server sent.
 
 To host the UI somewhere else (for example on the GPU box, behind a tunnel), build it with `pnpm build` and start the proxy with `FV_STATIC_DIR=dist` and `FV_HOST_TOKEN=<secret>`. It then serves the UI too, and instead of local-only access every request must be same-origin and carry the token: open the page once with `?token=<secret>`, which sets an HttpOnly cookie. Anyone with the token can change settings, including the worker command, so treat it like a password.
 
@@ -61,26 +61,18 @@ The stage between the mic and VAD/ASR has four implementations, each with its kn
 
 The echo canceller is deterministic, so a replay with changed knobs (**replay with current config**) shows what they would have done to the same recorded audio. RNNoise's output is recorded, and its mix and gate are applied after the recording, so those two can also be retuned on a replay.
 
-## Providers
+## Services
 
-ASR, LLM and TTS each have a **Provider** param:
-
-| node | providers | setting (Settings panel or env) |
+| stage | runs on | setting (Settings panel or env) |
 | --- | --- | --- |
-| `asr` | `deepgram` | `DEEPGRAM_API_KEY` |
-| | `gpubox` (Qwen3-ASR-1.7B on your own GPU box, see `gpubox/README.md`) | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` |
-| `llm` | `anthropic` | `ANTHROPIC_API_KEY` |
-| | `openai-compatible`, endpoint `openrouter` / `openai` / `custom` | `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `OPENAI_COMPAT_BASE_URL` (+ optional key) |
-| `tts` | `cartesia` | `CARTESIA_API_KEY` |
-| | `deepgram` (Aura, `/v1/speak`, 16-bit PCM; default voice `aura-2-thalia-en`) | `DEEPGRAM_API_KEY` |
-| | `openai-compatible` (`/audio/speech`, PCM), endpoint `openai` / `custom` | as above |
-| `tts.kyutai` (TTS stage *kyutai-gpubox*) | Kyutai TTS on the GPU box: words stream in as the LLM writes them, word timings come back | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` |
-| `tts.browser` | the browser's built-in `speechSynthesis` | none |
+| `asr` | Qwen3-ASR-1.7B on the GPU box (`/v1/asr`) | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` |
+| `llm` | an OpenAI-compatible chat endpoint: llama.cpp with Gemma 4 12B on the GPU box (model `gemma-4-12b-it`), or any local server | `OPENAI_COMPAT_BASE_URL` (+ optional `OPENAI_COMPAT_API_KEY`) |
+| `tts.kyutai` | Kyutai TTS on the GPU box (`/v1/tts`): words stream in as the LLM writes them, word timings come back | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` |
 | `opener.choice`, `backchannel` (*decide* `typesafe`), `interject` | TypeSafe Choice (`/v1/systemone`, model `jev-latest`) | `TYPESAFE_API_KEY` |
 
-For OpenRouter, set the LLM stage provider to `openai-compatible`, endpoint `openrouter`, and a model slug. The toolbar shows which keys the current config still needs; click it to open Settings.
+The toolbar shows which settings the current config still needs; click it to open Settings.
 
-Each provider is a small pure adapter (`src/nodes/{asr,llm,tts}/`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`src/drivers/index.ts`). Recordings keep the provider's raw payloads, so replay feeds the same bytes through the same adapter. Adding a provider means one adapter, plus a driver and proxy route if it speaks a new protocol.
+The GPU box protocols are in `gpubox/PROTOCOL.md`. ASR and the LLM each have a small pure adapter (`src/nodes/asr/gpubox.ts`, `src/nodes/llm/openai.ts`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`src/drivers/index.ts`). Recordings keep the raw payloads, so replay feeds the same bytes through the same adapter.
 
 Turn-taking is full-duplex by default (`turn.duplex` in `src/nodes/turn.ts`); `half-duplex` is still selectable and ignores the user while the agent talks. The full-duplex stage is an explicit state machine (`FLOOR` in `src/nodes/turn.ts`): listening, thinking, speaking, and thinking+user / speaking+user while the user talks over the agent. Every transition is emitted as a `turn.transition` message with what triggered it.
 
@@ -100,9 +92,7 @@ Without the model, the stage commits a user turn on ASR endpointing. When VAD he
 
 The speaker no longer reports the end of playback during a gap between sentences; it waits until the TTS reply is complete.
 
-`tts.browser` (TTS implementation `browser`) replaces both `tts` and `speaker`; the pipeline drops the speaker stage when it is selected. The browser plays the audio itself, so no samples are recorded. What is recorded is when each sentence started, each word boundary the browser reported, and when it ended, so replay reproduces the playback timing and audible replay speaks the text again. Voices differ between browsers and machines, and headless browsers usually have none.
-
-`llm.echo` and `tts.tone` (implementations `echo` and `tone`) are mocks for trying the pipeline without API keys.
+`llm.echo` and `tts.tone` (implementations `echo` and `tone`) are mocks for trying the pipeline without the GPU box.
 
 ## Time, logging and replay
 
@@ -111,16 +101,16 @@ The core rule is that **everything is replayable as-is**: ASR partials, LLM toke
 How the runtime ensures that:
 
 - **One session clock.** Every event has `t`, its arrival time in ms on a monotonic session clock. Events about audio also carry `media: {track, start, end}`, a sample range on a recorded media track. So each event records both *when* it happened and *which audio* it refers to. The mic driver also logs the AudioContext time of every captured frame.
-- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `rnnoise`, `silero`, `deepgram`, `gpubox-asr`, `gpubox-tts`, `anthropic`, `openai`, `cartesia`, `openai-tts`, `deepgram-tts`, `speech-synthesis`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
+- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `rnnoise`, `silero`, `gpubox-asr`, `gpubox-tts`, `openai`, `typesafe`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
 - **Deterministic turns.** When an external event arrives, the runtime stamps it with the current time, hands it to its node, and drains every resulting message synchronously, all at that timestamp. Nodes are pure functions of what they receive, so the same external events at the same times always produce the same log.
 - **Replay on a virtual clock.** A replay serves every recorded exchange and timer from the trajectory at its original time, with the original event order breaking ties. The result is checked against the source: the Sessions list shows *identical to source ✓* or the first event where the two differ.
 - **Causality.** Every event lists the seqs of the events that caused it, so any output (a TTS chunk, say) can be traced back through the LLM tokens to the ASR result and the audio frames behind it.
 
 Replay options:
 
-- **real time / audible** paces the virtual clock against the wall clock and plays both sides again: the recorded mic, and the agent audio (output channels such as `speaker` and `speech-synthesis` run live as monitors). The 🔊 buttons on the Mic and Playback lanes mute either side.
+- **real time / audible** paces the virtual clock against the wall clock and plays both sides again: the recorded mic, and the agent audio (output channels such as `speaker` run live as monitors). The 🔊 buttons on the Mic and Playback lanes mute either side.
 - **replay with current config** runs the current stage config against the recorded world. Upstream nodes reproduce exactly; any exchange whose request differs from the recording is flagged as an `io.diverge` event.
-- **live channels** (for example `anthropic`) serves those channels live during replay, so the same recorded user audio can be run against a new LLM or TTS.
+- **live channels** (for example `openai`) serves those channels live during replay, so the same recorded user audio can be run against a new LLM or TTS.
 
 ### Session bundle format (`.fvs`, a zip)
 
@@ -149,7 +139,7 @@ The browser side of a channel is a `LiveDriver` in `src/drivers/index.ts`. Regis
 src/core/     runtime, scheduler (live + virtual clock), world (live/replay IO), trajectory, bundle, compare
 src/pipeline.ts  the fixed pipeline: stages, their implementations, wiring
 src/nodes/    node definitions
-src/drivers/  browser drivers: mic worklet, Silero (onnxruntime-web), Deepgram WS, Claude SDK, OpenAI-compatible SSE, TTS byte streams, Web Audio
+src/drivers/  browser drivers: mic worklet, Silero (onnxruntime-web), GPU box WebSockets, OpenAI-compatible SSE, TypeSafe, Web Audio
 src/ui/       pipeline diagram, dashboard (timeline.ts derives lanes, Dashboard.tsx draws them), stage panel, settings, sessions, event log
 server/       local proxy and session storage
 tests/        replay determinism tests with randomized fake drivers

@@ -94,10 +94,10 @@ Preset from the environment (shown as `env` in Settings):
 | Setting | Value |
 |---|---|
 | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` | `ws://127.0.0.1:8000` and the gpubox token: the GPU box ASR/TTS stages work as is |
-| `OPENAI_COMPAT_BASE_URL` | `http://127.0.0.1:8103/v1` (llama.cpp directly; it needs no key): pick the custom OpenAI-compatible provider with model `gemma-4-12b-it` |
+| `OPENAI_COMPAT_BASE_URL` | `http://127.0.0.1:8103/v1` (llama.cpp directly; it needs no key): the LLM stage's default model `gemma-4-12b-it` works as is |
 | `FV_SESSIONS_DIR` | `$ROOT/fv-sessions` |
 
-Other keys (Anthropic, TypeSafe, Deepgram, Cartesia, ...) are entered in the UI's Settings on the box and saved in
+Other keys (TypeSafe) are entered in the UI's Settings on the box and saved in
 `$ROOT/fv-settings.json` (mode 600), which overrides the environment. The token itself is never written to the
 app folder or the settings file; `setup.sh` reads it from `$ROOT/gpubox.token` and passes it in the environment.
 `NO_UI=1` skips all of this. Log: `$ROOT/logs/ui.log`, install log `$ROOT/logs/install-ui.log`.

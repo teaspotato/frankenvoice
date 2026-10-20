@@ -24,7 +24,7 @@ const LONG = 40;
 
 /**
  * Details of the item selected on the timeline: its events, and every IO exchange behind them with the
- * full request and response as recorded. A streamed Anthropic reply is also shown reassembled.
+ * full request and response as recorded. A streamed LLM reply is also shown reassembled.
  */
 export function SpanDetails({ trajectory, seqs, onClose }: { trajectory: Trajectory; seqs: number[]; onClose(): void }) {
   const { events, exchanges, related } = useMemo(() => collect(trajectory, seqs), [trajectory, seqs]);
@@ -59,7 +59,7 @@ function ExchangeView({ x, related }: { x: Exchange; related: Set<number> }) {
   const recvs = long ? x.recvs.filter((e) => related.has(e.seq)) : x.recvs;
   const sends = (long ? x.sends.filter((e) => related.has(e.seq)) : x.sends).filter((e) => obj(e.data).payload != null);
   const payloads = recvs.map((e) => obj(e.data).payload);
-  const reply = reassembleAnthropic(payloads) ?? reassembleOpenAI(payloads);
+  const reply = reassembleOpenAI(payloads);
   const chat = chatOf(request);
   const close = obj(x.close?.data);
   const dur = x.open && x.close ? Math.round(x.close.t - x.open.t) : undefined;
@@ -184,34 +184,6 @@ interface Reply {
   usage: Json;
 }
 
-/** The reply an Anthropic message stream adds up to: text, thinking, tool calls, stop reason and usage. */
-export function reassembleAnthropic(payloads: Json[]): Reply | null {
-  const evs = payloads.map(obj);
-  if (!evs.some((p) => p.type === 'message_start')) return null;
-  const blocks: Block[] = [];
-  let stop = '';
-  let usage: Obj = {};
-  for (const p of evs) {
-    if (p.type === 'message_start') usage = { ...obj(obj(p.message).usage) };
-    else if (p.type === 'content_block_start') {
-      const b = obj(p.content_block);
-      const type = b.type === 'redacted_thinking' ? 'thinking' : String(b.type);
-      blocks[Number(p.index)] = { type, text: typeof b.text === 'string' ? b.text : b.type === 'tool_use' ? `${String(b.name)} ` : '' };
-    } else if (p.type === 'content_block_delta') {
-      const d = obj(p.delta);
-      const b = (blocks[Number(p.index)] ??= { type: 'text', text: '' });
-      b.text += String(d.text ?? d.thinking ?? d.partial_json ?? '');
-    } else if (p.type === 'message_delta') {
-      stop = String(obj(p.delta).stop_reason ?? '');
-      usage = { ...usage, ...obj(p.usage) };
-    } else if (p.type === 'error') {
-      blocks.push({ type: 'error', text: clip(pretty(p.error)) });
-      stop = 'error';
-    }
-  }
-  return { blocks: blocks.filter(Boolean), stop, usage };
-}
-
 /** The reply an OpenAI-compatible chat completion (streamed or not) adds up to: text, reasoning, tool calls, errors. */
 export function reassembleOpenAI(payloads: Json[]): Reply | null {
   const evs = payloads.map(obj).filter((p) => Array.isArray(p.choices) || p.error != null);
@@ -258,11 +230,10 @@ export function reassembleOpenAI(payloads: Json[]): Reply | null {
 
 /**
  * A chat request's conversation as turns of blocks, without the system prompt (it is in the LLM settings), plus its other
- * parameters. Takes an Anthropic request or an OpenAI-compatible one (`{ endpoint, body }`).
+ * parameters. Takes an OpenAI-compatible request (`{ body }`).
  */
 export function chatOf(request: Json | undefined): { turns: { role: string; blocks: Block[] }[]; params: Obj } | null {
-  const outer = obj(request);
-  const r = Array.isArray(outer.messages) ? outer : obj(outer.body);
+  const r = obj(obj(request).body);
   if (!Array.isArray(r.messages)) return null;
   const turns = r.messages.map(obj).flatMap((m) => {
     const role = String(m.role ?? '');
@@ -270,20 +241,15 @@ export function chatOf(request: Json | undefined): { turns: { role: string; bloc
     const content = typeof m.content === 'string' ? [{ type: 'text', text: m.content } as Obj] : Array.isArray(m.content) ? m.content.map(obj) : [];
     const blocks = content.map((b): Block => {
       if (b.type === 'text') return { type: role === 'tool' ? 'tool_result' : 'text', text: String(b.text ?? '') };
-      if (b.type === 'thinking') return { type: 'thinking', text: String(b.thinking ?? '') };
-      if (b.type === 'redacted_thinking') return { type: 'thinking', text: '' };
-      if (b.type === 'tool_use') return { type: 'tool_use', text: `${String(b.name)} ${clip(JSON.stringify(b.input))}` };
-      if (b.type === 'tool_result') return { type: 'tool_result', text: clip(typeof b.content === 'string' ? b.content : JSON.stringify(b.content)) };
       return { type: String(b.type), text: clip(JSON.stringify(b)) };
     });
-    // OpenAI-style tool calls and results live outside `content`.
+    // Tool calls and results live outside `content`.
     if (Array.isArray(m.tool_calls))
       for (const t of m.tool_calls.map(obj))
         blocks.push({ type: 'tool_use', text: `${String(obj(t.function).name)} ${clip(String(obj(t.function).arguments ?? ''))}` });
     return [{ role: role === 'tool' ? 'tool' : role, blocks }];
   });
   const params: Obj = {};
-  if (r !== outer && outer.endpoint != null) params.endpoint = outer.endpoint;
   for (const [k, v] of Object.entries(r)) if (!['messages', 'system', 'stream'].includes(k)) params[k] = v;
   return { turns, params };
 }
@@ -320,10 +286,6 @@ function Bubble({ role, blocks, current, note }: { role: string; blocks: Block[]
       {blocks.map((b, i) =>
         b.type === 'text' ? (
           <div key={i}>{b.text}</div>
-        ) : b.type === 'thinking' && !b.text ? (
-          <div key={i} className="bubble-thinking">
-            thinking (text not returned by the API)
-          </div>
         ) : b.type === 'thinking' ? (
           <details key={i} className="bubble-thinking">
             <summary>thinking</summary>

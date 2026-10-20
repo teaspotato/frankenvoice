@@ -41,9 +41,9 @@ const LEGEND: Record<string, string> = {
     'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
   workers:
     'Workers the LLM started, each an agent session; workers that overlap get their own row. Bar: the worker from start to its result (green), error (red) or stop (grey); a dark tick where its session was ready, grey ticks where it started reasoning; darker blocks are its tool calls (red: failed). Dots: plan updates (amber), its in-between text (blue), refused permissions (red); diamonds: messages from the LLM. On the LLM lane, a purple diamond is a worker tool call (red: refused), and a reply labelled "worker news" is one the LLM gave on its own to a result.',
-  tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the provider.',
+  tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the TTS server.',
   speaker:
-    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts; dots at the bottom: word boundaries. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged. Accent boxes: backchannels said while the user talked; small grey dots near the bottom: backchannels held back (hover for why).',
+    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged. Accent boxes: backchannels said while the user talked; small grey dots near the bottom: backchannels held back (hover for why).',
 };
 
 const AXIS = 20;
@@ -941,7 +941,7 @@ export function Dashboard({
           x1: x(r.t) + 3,
           y0: ly0 + (ly1 - ly0) * 0.72,
           y1: ly1,
-          text: 'request sent to the TTS provider',
+          text: 'request sent to the TTS server',
           seqs: [r.seq],
         });
       }
@@ -992,7 +992,6 @@ export function Dashboard({
         mark('speaker', s.t, col.text, 0.14, 'diamond');
         hits.push({ lane: 'speaker', x0: x(s.t) - 3, x1: x(s.t) + 60, text: s.text, seqs: [s.seq] });
       }
-      for (const b of m.boundaries) if (b >= t0 && b <= t1) mark('speaker', b, col.sink, 0.88, 'dot', 2);
       // Backchannels: what was said (accent box over its audio) and what was held back (grey dot, reason on hover)
       for (const b of m.backchannels) {
         const end = b.t1 ?? b.t0 + 400;
