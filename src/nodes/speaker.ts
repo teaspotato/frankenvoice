@@ -3,6 +3,7 @@ import type { Json } from '../core/types';
 import { isAudioMsg } from '../core/types';
 import { bytesFromF32 } from './audio';
 import { fadeIn, level, soundEnd, wordStart, type Span } from './cutpoint';
+import { sustain } from './tts/tail';
 import type { SpokenWord } from './tts/stream';
 
 interface PlayedSegment {
@@ -61,7 +62,8 @@ export function heardText(segs: PlayedSegment[], at: number): string {
  * (playback.paused / playback.resumed; the held sentences are announced again).
  *
  * A pause or cancel doesn't stop mid-sound: playback runs on to the end of the
- * syllable playing (the next quiet point) and fades out over a short release.
+ * syllable playing (the next quiet point), then trails off: its last sound is
+ * sustained and faded over a short tail (or, with no tail, faded out over a release).
  * A resume picks up from the start of the word it stopped in (word timings
  * from tts.words), fading in, so the word is heard whole.
  */
@@ -69,6 +71,7 @@ interface SpeakerParams {
   cutoff: 'syllable' | 'hard';
   maxFinishMs: number;
   releaseMs: number;
+  tailMs: number;
   resumeFrom: 'word' | 'cut';
   attackMs: number;
 }
@@ -99,7 +102,14 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       description: 'syllable: when paused or cancelled, play on to the end of the sound playing, then fade out. hard: stop at once.',
     },
     { key: 'maxFinishMs', label: 'Finish the sound for at most (ms)', type: 'number', default: 300 },
-    { key: 'releaseMs', label: 'Release (ms)', type: 'number', default: 40, description: 'Fade-out at the cut.' },
+    {
+      key: 'tailMs',
+      label: 'Tail (ms)',
+      type: 'number',
+      default: 60,
+      description: 'After the syllable, sustain its last sound and fade it over this long (as backchannel tails do). 0 = fade out over the release instead.',
+    },
+    { key: 'releaseMs', label: 'Release (ms)', type: 'number', default: 40, description: 'Fade-out at the cut when there is no tail.' },
     {
       key: 'resumeFrom',
       label: 'Resume from',
@@ -198,18 +208,41 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       }
     };
 
-    /** Stop the reply's output: at once, or at `stop` with a fade over `release` ms. Returns when the sound ends. */
-    const flushAt = (stop: number, release: number) => {
+    /** The last sound before `stop` that a tail sustains: up to 90 ms, and at least 65 (WSOLA needs that much). */
+    const TAIL_SEG_MS = 90;
+    const MIN_SEG_MS = 65;
+    /**
+     * Stop the reply's output: at once, at `stop` with a fade over `release` ms, or (with a tail)
+     * from just before `stop`, where the tail takes over. Returns when the sound ends, and `echo`,
+     * which cuts the echo reference to match.
+     */
+    const flushAt = (cut: { stop: number; release: number }) => {
       const now = ctx.now();
-      if (stop <= now && release <= 0) io?.send({ cmd: 'flush' });
-      else io?.send({ cmd: 'flush', at: stop, releaseMs: release });
-      return stop + release;
+      const voiced = cut.release > 0;
+      // The tail can only take over from audio that hasn't played yet.
+      const t0 = Math.max(now + 5, cut.stop - TAIL_SEG_MS);
+      const a = voiced && p.cutoff === 'syllable' && p.tailMs > 0 ? spanOf(queued, t0, Math.max(cut.stop, t0 + MIN_SEG_MS)) : null;
+      if (a) {
+        const samples = sustain(a.samples, a.sampleRate, p.tailMs);
+        const src = posAt(a.at);
+        io?.send({ cmd: 'flush', at: a.at, sampleRate: a.sampleRate }, { bin: bytesFromF32(samples), logBin: false });
+        const silent = a.at + (samples.length / a.sampleRate) * 1000;
+        const echo = () => {
+          flushPlayed(a.at);
+          if (src) ctx.emit('played', { type: 'audio', track: src.track, start: src.pos, end: src.pos + samples.length, sampleRate: a.sampleRate, samples, at: a.at });
+        };
+        return { silent, echo };
+      }
+      if (cut.stop <= now && cut.release <= 0) io?.send({ cmd: 'flush' });
+      else io?.send({ cmd: 'flush', at: cut.stop, releaseMs: cut.release });
+      const silent = cut.stop + cut.release;
+      return { silent, echo: () => flushPlayed(silent) };
     };
 
     const pause = () => {
       const at = ctx.now();
       const cut = cutPoint(at);
-      const silent = flushAt(cut.stop, cut.release);
+      const { silent, echo } = flushAt(cut);
       silentAt = silent;
       endTimer?.clear();
       endTimer = undefined;
@@ -225,7 +258,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       paused = from;
       endAt = Math.max(endAt, from);
       ctx.setState('paused', true);
-      flushPlayed(silent);
+      echo();
       ctx.emit('playback', { type: 'playback.paused', rid, at: silent, ...(from !== silent ? { from } : {}) });
     };
     /** When the last cut's release has faded out; nothing new plays before. */
@@ -314,7 +347,8 @@ export const speakerNode: NodeDef<SpeakerParams> = {
             const wasPaused = paused !== null;
             // Paused, the sound already stopped and the user heard up to the pause.
             const cut = wasPaused ? null : cutPoint(ctx.now());
-            const at = cut ? flushAt(cut.stop, cut.release) : ctx.now();
+            const flushed = cut ? flushAt(cut) : null;
+            const at = flushed ? flushed.silent : ctx.now();
             if (cut) silentAt = at;
             const heard = heardText(segs.get(rid) ?? [], cut ? cut.stop : clock());
             endTimer?.clear();
@@ -329,7 +363,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
             ctx.setState('playing', false);
             ctx.emit('playback', { type: 'playback.interrupted', rid, at, heard });
             // Paused, the device was flushed (and the echo reference cut) at the pause.
-            if (!wasPaused) flushPlayed(at);
+            flushed?.echo();
           }
           return;
         }

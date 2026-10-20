@@ -613,9 +613,24 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
       play(c.samples.subarray(cut), c.sampleRate, Math.max(c.at, now), now);
     }
   };
-  /** Stop everything: now, or at session time `at` (ms, with the session clock `now`) after fading out over `releaseMs`. */
-  const stop = (at?: number, now?: number, releaseMs = 0) => {
-    if (o && fade && at !== undefined && now !== undefined) {
+  /**
+   * Stop everything: now, or at session time `at` (ms, with the session clock `now`) after fading
+   * out over `releaseMs`, or with `tail` taking over at `at` (sample-exact, in the same context).
+   */
+  const stop = (at?: number, now?: number, releaseMs = 0, tail?: { samples: Float32Array<ArrayBuffer>; sampleRate: number }) => {
+    if (o && duck && tail && at !== undefined && now !== undefined && o.ctx.sampleRate === tail.sampleRate) {
+      const t = o.ctx.currentTime + Math.max(0, (at - now) / 1000);
+      for (const src of playing) src.stop(t);
+      const buf = o.ctx.createBuffer(1, tail.samples.length, tail.sampleRate);
+      buf.copyToChannel(tail.samples, 0);
+      const src = o.ctx.createBufferSource();
+      src.buffer = buf;
+      // Past the fade node: a later cut doesn't touch it.
+      src.connect(duck);
+      src.onended = () => playingSources.delete(src);
+      playingSources.add(src);
+      src.start(t);
+    } else if (o && fade && at !== undefined && now !== undefined) {
       const t = o.ctx.currentTime + Math.max(0, (at - now) / 1000);
       const r = Math.max(0.001, releaseMs / 1000);
       fade.gain.cancelScheduledValues(o.ctx.currentTime);
@@ -711,7 +726,10 @@ const speaker: LiveDriver = (_req, sink, env) => {
     send(data, bin) {
       const d = data as { cmd: string; at?: number; sampleRate?: number; gain?: number; releaseMs?: number };
       if (d.cmd === 'cue' && bin) return cues.play(new Float32Array(bin.slice().buffer), d.sampleRate!, d.at!, env.now());
-      if (d.cmd === 'flush') return d.at === undefined ? out.stop() : out.stop(d.at, env.now(), d.releaseMs);
+      if (d.cmd === 'flush') {
+        const tail = bin && d.sampleRate ? { samples: new Float32Array(bin.slice().buffer), sampleRate: d.sampleRate } : undefined;
+        return d.at === undefined ? out.stop() : out.stop(d.at, env.now(), d.releaseMs, tail);
+      }
       if (d.cmd === 'gain') return out.setGain(d.gain ?? 1);
       if (d.cmd !== 'play' || !bin) return;
       out.play(new Float32Array(bin.slice().buffer), d.sampleRate!, d.at!, env.now());

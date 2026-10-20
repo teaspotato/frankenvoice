@@ -4,13 +4,13 @@ import { resolveParams, type NodeContext } from '../src/core/node';
 import type { Json, Msg } from '../src/core/types';
 
 describe('speaker pause and resume', () => {
-  function speaker() {
+  function speaker(params: Record<string, unknown> = {}) {
     let now = 0;
     const out: Msg[] = [];
     const sent: Json[] = [];
     const ctx = {
       id: 'speaker',
-      params: resolveParams(speakerNode, {}),
+      params: resolveParams(speakerNode, params as never),
       now: () => now,
       emit: (_port: string, msg: Msg) => (out.push(msg), out.length),
       setState() {},
@@ -123,19 +123,34 @@ describe('speaker pause and resume', () => {
     return x;
   };
 
-  it('finishes the sound playing and fades out, instead of stopping mid-sound', () => {
+  it('finishes the sound playing and trails off with a sustained tail, instead of stopping mid-sound', () => {
     const s = speaker();
     s.play(0, 0, speech());
     s.control(100, { type: 'pause' });
-    const flush = s.sent.at(-1) as { cmd: string; at: number; releaseMs: number };
+    // The tail takes over 90 ms before the sound ends (at 300): 90 ms sustained, then 60 ms fading.
+    const flush = s.sent.at(-1) as { cmd: string; at: number; sampleRate: number };
     expect(flush.cmd).toBe('flush');
+    expect(flush.at).toBeGreaterThanOrEqual(205);
+    expect(flush.at).toBeLessThanOrEqual(220);
+    expect(flush.sampleRate).toBe(24000);
+    const paused = s.of('playback.paused')[0] as unknown as { at: number; from?: number };
+    expect(paused.at).toBe(flush.at + 150);
+    // The echo reference is cut where the tail takes over, and the tail is added to it.
+    expect(s.of('played.flush').at(-1)).toMatchObject({ at: flush.at });
+    expect((s.out.at(-2) as unknown as { samples: Float32Array }).samples.length).toBe(3600);
+    // No word timings: it carries on from where the sound stopped.
+    expect(paused.from).toBe(flush.at + 90);
+  });
+
+  it('fades out over the release when there is no tail', () => {
+    const s = speaker({ tailMs: 0 });
+    s.play(0, 0, speech());
+    s.control(100, { type: 'pause' });
+    const flush = s.sent.at(-1) as { cmd: string; at: number; releaseMs: number };
     expect(flush.at).toBeGreaterThanOrEqual(295);
     expect(flush.at).toBeLessThanOrEqual(310);
     expect(flush.releaseMs).toBe(40);
-    const paused = s.of('playback.paused')[0] as unknown as { at: number; from?: number };
-    expect(paused.at).toBe(flush.at + 40);
-    // No word timings: it carries on from where the sound stopped.
-    expect(paused.from).toBe(flush.at);
+    expect((s.of('playback.paused')[0] as unknown as { at: number }).at).toBe(flush.at + 40);
   });
 
   it('resumes from the start of the word it stopped in, fading in', () => {
@@ -144,7 +159,7 @@ describe('speaker pause and resume', () => {
     s.input(0, { type: 'tts.words', rid: 'r0', words: [{ word: 'one', start: 0, end: 7200 }, { word: 'two', start: 8160, end: 15360 }] });
     s.control(500, { type: 'pause' }); // in the middle of "two" (340 to 640 ms)
     const paused = s.of('playback.paused')[0] as unknown as { at: number; from: number };
-    expect(paused.at).toBe(640 + 40); // its sound ends with the audio
+    expect(paused.at).toBe(640 + 60); // its sound ends with the audio, then the tail
     expect(paused.from).toBeGreaterThanOrEqual(300);
     expect(paused.from).toBeLessThanOrEqual(345);
     s.control(1500, { type: 'resume' });
@@ -159,9 +174,10 @@ describe('speaker pause and resume', () => {
     const s = speaker();
     s.play(0, 0, speech());
     s.control(100, { type: 'cancel' });
-    expect(s.sent.at(-1)).toMatchObject({ cmd: 'flush', releaseMs: 40 });
+    const flush = s.sent.at(-1) as { cmd: string; at: number };
+    expect(flush.cmd).toBe('flush');
     const at = (s.of('playback.interrupted')[0] as unknown as { at: number }).at;
-    expect(at).toBeGreaterThan(330);
-    expect(s.of('played.flush').at(-1)).toMatchObject({ at });
+    expect(at).toBe(flush.at + 150);
+    expect(s.of('played.flush').at(-1)).toMatchObject({ at: flush.at });
   });
 });
