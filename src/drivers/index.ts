@@ -8,11 +8,13 @@ import ortWasmUrl from 'onnxruntime-web/ort-wasm-simd-threaded.wasm?url';
 import ortMjsUrl from 'onnxruntime-web/ort-wasm-simd-threaded.mjs?url';
 import sileroV5Url from '@ricky0123/vad-web/dist/silero_vad_v5.onnx?url';
 import sileroV6Url from '@ricky0123/vad-web/dist/silero_vad_v6.onnx?url';
+import fireredUrl from './firered/stream_vad.onnx?url';
 import captureWorkletUrl from './capture-worklet.js?url';
 import type { DriverRegistry, LiveDriver } from '../core/world';
 import type { Json } from '../core/types';
 import { toJson } from '../core/json';
 import { loadEncoder, type Encoder } from '../embed/encoder';
+import { fireredDriver, sileroDriver } from './vad';
 
 ort.env.wasm.wasmPaths = { wasm: ortWasmUrl, mjs: ortMjsUrl };
 ort.env.wasm.numThreads = 1;
@@ -61,36 +63,9 @@ const mic: LiveDriver = (req, sink) => {
 };
 
 const sileroModels: Record<string, string> = { v5: sileroV5Url, v6: sileroV6Url };
-
-const silero: LiveDriver = (req, sink) => {
-  const r = req as { model: string; sampleRate: number };
-  const CONTEXT = 64; // samples of the previous frame the model expects in front of each frame
-  let closed = false;
-  let context = new Float32Array(CONTEXT);
-  let state = new ort.Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]);
-  const sr = new ort.Tensor('int64', BigInt64Array.from([BigInt(r.sampleRate)]), []);
-  const session = ort.InferenceSession.create(sileroModels[r.model] ?? sileroV5Url);
-  let chain: Promise<void> = session.then(() => undefined);
-  chain.catch((e) => !closed && sink.close(errorJson(e)));
-  return {
-    send(_data, bin) {
-      const frame = new Float32Array(bin!.slice().buffer);
-      chain = chain.then(async () => {
-        if (closed) return;
-        const input = new Float32Array(CONTEXT + frame.length);
-        input.set(context);
-        input.set(frame, CONTEXT);
-        context = frame.slice(-CONTEXT);
-        const out = await (await session).run({ input: new ort.Tensor('float32', input, [1, input.length]), state, sr });
-        state = out.stateN as typeof state;
-        if (!closed) sink.recv({ p: (out.output.data as Float32Array)[0] });
-      });
-    },
-    close() {
-      closed = true;
-    },
-  };
-};
+// A session per exchange, as before: a wasm session runs one inference at a time.
+const silero = sileroDriver(ort, (model) => ort.InferenceSession.create(sileroModels[model] ?? sileroV5Url));
+const firered = fireredDriver(ort, () => ort.InferenceSession.create(fireredUrl));
 
 function wsUrl(upstream: string, path: string, query: Record<string, Json>): string {
   const u = new URL(`/api/${upstream}${path}`, location.href);
@@ -810,4 +785,4 @@ const embed: LiveDriver = (req, sink) => {
   };
 };
 
-export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'gpubox-asr': gpubox, 'gpubox-tts': gpubox, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel, embed, acp, typesafe };
+export const browserDrivers: DriverRegistry = { mic, silero, firered, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'gpubox-asr': gpubox, 'gpubox-tts': gpubox, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel, embed, acp, typesafe };

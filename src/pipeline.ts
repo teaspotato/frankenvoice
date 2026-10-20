@@ -32,7 +32,7 @@ export const STAGES: StageDef[] = [
     label: 'Noise / echo',
     variants: { browser: 'cleanup.browser', aec: 'cleanup.aec', rnnoise: 'cleanup.rnnoise', off: 'cleanup.off' },
   },
-  { id: 'vad', label: 'VAD', variants: { silero: 'vad.silero', energy: 'vad.energy' } },
+  { id: 'vad', label: 'VAD', variants: { silero: 'vad.silero', firered: 'vad.firered', energy: 'vad.energy' } },
   { id: 'turnmodel', label: 'Turn model', variants: { ssl_turn: 'turnmodel.ssl', off: 'turnmodel.off' } },
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },

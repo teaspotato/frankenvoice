@@ -62,6 +62,26 @@ const silero: LiveDriver = (_req, sink) => {
   };
 };
 
+/** FireRedVAD stand-in: one probability per completed 10 ms frame (400-sample windows, 160 hop), from RMS. */
+const firered: LiveDriver = (_req, sink) => {
+  let chain = Promise.resolve();
+  let buf: number[] = [];
+  return {
+    send(_d, bin) {
+      buf.push(...new Float32Array(bin!.slice().buffer));
+      const p: number[] = [];
+      while (buf.length >= 400) {
+        let sum = 0;
+        for (let i = 0; i < 400; i++) sum += buf[i] * buf[i];
+        p.push(Math.round(Math.min(1, Math.sqrt(sum / 400) * 5) * 1000) / 1000);
+        buf = buf.slice(160);
+      }
+      chain = chain.then(() => new Promise((r) => later(jitter(0, 2), () => (sink.recv({ p }), r()))));
+    },
+    close() {},
+  };
+};
+
 const utterances = ['hello there', 'what time is it', 'tell me a joke'];
 const deepgram: LiveDriver = (_req, sink) => {
   let sent = 0;
@@ -303,7 +323,7 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp, typesafe };
+export const fakeDrivers: DriverRegistry = { mic, silero, firered, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp, typesafe };
 
 /** The pipeline on the API providers these fakes stand in for, with the turn model (the defaults run on the GPU box without it). */
 export function apiConfig(): PipelineConfig {
