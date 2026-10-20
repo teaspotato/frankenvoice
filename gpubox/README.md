@@ -11,7 +11,7 @@ is in [PROTOCOL.md](PROTOCOL.md); the LLM is plain OpenAI `POST /v1/chat/complet
 |---|---|---|---|
 | `asr` | `v-asr` (sglang-omni 0.1.8) | 127.0.0.1:8101 | `sgl-omni serve` Qwen3-ASR-1.7B (or `ASR_MODEL`) with FP8 weights, `mem_fraction_static 0.15`, `max_running_requests 8` |
 | `llm` | none (prebuilt llama.cpp `b11753`, CUDA) | 127.0.0.1:8103 | `llama-server`: `google/gemma-4-12B-it-qat-q4_0-gguf` (official QAT Q4_0) + MTP draft head from `ggml-org/gemma-4-12B-it-GGUF`, 2 slots x 4k context, q8_0 KV cache with a full-size sliding-window cache (`--swa-full`, so a diverging prompt reuses its prefix), thinking off |
-| `tts` | `v-tts` (moshi 0.2.13) | 127.0.0.1:8102 | `kyutai_tts.py`: Kyutai streaming generation, one reply at a time |
+| `tts` | `v-tts` (moshi 0.2.13) | 127.0.0.1:8102 | `kyutai_tts.py`: Kyutai streaming generation, one reply at a time; background renders (canned lines) only when no reply waits, preempted by one |
 | `gateway` | `v-gw` (qwen-asr 0.0.6, FastAPI) | 0.0.0.0:8000 | `server.py`: auth, ASR segmenting/partials/finals, Qwen3-ForcedAligner-0.6B, relays `/v1/tts`, passes `/v1/chat/completions` and `/v1/models` through to `llm` |
 | `tunnel` | none | none | `cloudflared tunnel --protocol http2 --url http://localhost:8000` (quick tunnel; over the default QUIC it moved only ~110 KB/s, random `*.trycloudflare.com`) |
 | `ui` | Node 22 (`$ROOT/node`) | 127.0.0.1:8787 | The Frankenvoice server (`server/index.ts`) in hosted mode: runs the pipeline (VAD and the turn model on its CPU) against the gateway and llama.cpp over localhost, and serves the built UI from `$ROOT/frankenvoice/dist` behind the gpubox token; the page only sends the mic and plays the agent |

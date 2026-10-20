@@ -5,7 +5,10 @@ The gateway (server.py) authenticates clients and relays `/v1/tts` WebSockets he
 Protocol: see PROTOCOL.md ("TTS: WS /v1/tts").
 
 Generation runs on one worker thread, one reply at a time. A cancelled reply (socket closed)
-stops at its next model step, so the next connection never waits behind it.
+stops at its next model step, so the next connection never waits behind it. Background jobs
+(`?priority=background`, canned lines rendered ahead) run only when no reply is queued: a reply
+that arrives preempts one at its next model step, and the line is rendered again from the start
+afterwards. A background job's output is held until it is done, so a restart is invisible.
 
 Adapted from the streaming loop in delayed-streams-modeling/scripts/tts_pytorch_streaming.py
 (via open-tts/scripts/kyutai.py): words are fed only when the model's lookahead needs them,
@@ -13,6 +16,7 @@ and the model is not stepped while it could ask for a word that has not arrived 
 """
 import argparse
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -51,6 +55,15 @@ class Job:
     events: "queue.Queue" = field(default_factory=queue.Queue)
     cancelled: bool = False
     t_first_speak: float | None = None
+    background: bool = False
+    history: list = field(default_factory=list)   # events consumed, to run a preempted job again
+    replay: list = field(default_factory=list)
+    held: list = field(default_factory=list)      # a background job's output, sent when it is done
+    preempted: int = 0
+
+
+class Preempted(Exception):
+    pass
 
 
 class Engine:
@@ -71,7 +84,9 @@ class Engine:
         # per-reply state, read by the hooks
         self.offset = 0
         self.state = None
-        self.jobs: "queue.Queue[Job]" = queue.Queue()
+        self.fg: collections.deque = collections.deque()
+        self.bg: collections.deque = collections.deque()
+        self.cv = threading.Condition()
         self.missing = torch.full((1, m.lm.n_q - m.lm.dep_q, 1), m.machine.token_ids.zero, dtype=torch.long, device=device)
         self.no_depformer = torch.full((1, m.lm.dep_q, 1), m.machine.token_ids.zero, dtype=torch.long, device=device)
 
@@ -132,22 +147,62 @@ class Engine:
         return out
 
     # ---- worker ------------------------------------------------------------------------------
+    def submit(self, job: Job):
+        with self.cv:
+            (self.bg if job.background else self.fg).append(job)
+            self.cv.notify()
+
+    def _next(self) -> Job:
+        with self.cv:
+            while True:
+                for q in (self.fg, self.bg):
+                    while q:
+                        job = q.popleft()
+                        if not job.cancelled:
+                            return job
+                self.cv.wait()
+
+    def _check_preempt(self, job: Job):
+        if job.background:
+            with self.cv:
+                if any(not j.cancelled for j in self.fg):
+                    raise Preempted()
+
     def run_forever(self):
         while True:
-            job = self.jobs.get()
-            if job.cancelled:
-                continue
+            job = self._next()
             try:
                 with torch.no_grad():
                     self._run(job)
+            except Preempted:
+                job.preempted += 1
+                job.replay = job.history + job.replay
+                job.history = []
+                job.held = []
+                log.info("background job preempted by a reply (%d)", job.preempted)
+                with self.cv:
+                    self.bg.appendleft(job)
+                continue
             except Exception as e:  # noqa: BLE001
                 log.exception("tts job failed")
                 self._send(job, {"type": "Error", "message": f"tts failed: {e}"})
                 self._send(job, None)
+            if job.background:
+                held, job.background = job.held, False
+                for item in held:
+                    self._send(job, item)
 
     def _send(self, job: Job, item):
-        if not job.cancelled and job.out is not None:
+        if job.background:
+            job.held.append(item)
+        elif not job.cancelled and job.out is not None:
             job.loop.call_soon_threadsafe(job.out.put_nowait, item)
+
+    @staticmethod
+    def _event(job: Job, timeout: float | None = None):
+        if job.replay:
+            return job.replay.pop(0)
+        return job.events.get_nowait() if timeout is None else job.events.get(timeout=timeout)
 
     def _run(self, job: Job):
         m = self.m
@@ -193,6 +248,7 @@ class Engine:
 
         def handle(ev):
             nonlocal closed
+            job.history.append(ev)
             last_ev[0] = time.perf_counter()
             kind, val = ev
             if kind == "text":
@@ -248,8 +304,9 @@ class Engine:
 
         # wait for the first word (or Close) before touching the model
         while not job.cancelled and not pending and not closed:
+            self._check_preempt(job)
             try:
-                handle(job.events.get(timeout=0.1))
+                handle(self._event(job, 0.1))
             except queue.Empty:
                 idle_check()
         if job.cancelled:
@@ -260,9 +317,10 @@ class Engine:
             self.state = m.machine.new_state([])
             end_at = None
             while not job.cancelled:
+                self._check_preempt(job)
                 while True:
                     try:
-                        handle(job.events.get_nowait())
+                        handle(self._event(job))
                     except queue.Empty:
                         break
                 st = self.state
@@ -273,7 +331,7 @@ class Engine:
                     can_ask = not st.queued and st.forced_padding <= 0
                     if can_ask and len(st.entries) <= self.ssa:
                         try:
-                            handle(job.events.get(timeout=0.05))
+                            handle(self._event(job, 0.05))
                         except queue.Empty:
                             idle_check()
                         continue
@@ -303,6 +361,9 @@ class Engine:
         stats = {"audio_s": round(audio_s, 3), "gen_s": round(t_gen, 3), "rtf": round(t_gen / audio_s, 3) if audio_s else None,
                  "ttfa_ms": round((t_first_audio - job.t_first_speak) * 1000) if t_first_audio and job.t_first_speak else None,
                  "words": len(words)}
+        if job.background:
+            stats["background"] = True
+            stats["preempted"] = job.preempted
         log.info("tts done %s", stats)
         self._send(job, {"type": "Done", "stats": stats})
         self._send(job, None)
@@ -329,6 +390,12 @@ def build_app(engine: Engine, default_voice: str, default_cfg: float) -> FastAPI
     def health():
         return {"ok": True, "tts": DEFAULT_DSM_TTS_REPO, "n_q": engine.m.n_q}
 
+    @app.get("/config")
+    def config():
+        # everything besides the text that decides what a render sounds like (canned-line cache keys)
+        return {"model": DEFAULT_DSM_TTS_REPO, "n_q": engine.m.n_q, "temp": engine.m.temp, "voice": default_voice,
+                "cfg": default_cfg, "sample_rate": SR}
+
     @app.websocket("/v1/tts")
     async def tts(ws: WebSocket):
         await ws.accept()
@@ -342,8 +409,9 @@ def build_app(engine: Engine, default_voice: str, default_cfg: float) -> FastAPI
             await ws.send_text(json.dumps({"type": "Error", "message": f"cfg must be one of {sorted(valid)}"}))
             await ws.close()
             return
-        job = Job(voice=voice, cfg=cfg, loop=asyncio.get_running_loop(), out=asyncio.Queue())
-        engine.jobs.put(job)
+        job = Job(voice=voice, cfg=cfg, loop=asyncio.get_running_loop(), out=asyncio.Queue(),
+                  background=ws.query_params.get("priority") == "background")
+        engine.submit(job)
         await ws.send_text(json.dumps({"type": "Ready", "sample_rate": SR}))
 
         async def pump_out():

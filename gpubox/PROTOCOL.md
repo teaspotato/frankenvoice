@@ -9,6 +9,11 @@ messages are text frames; audio is binary frames.
 
 Returns `{"ok": true, "asr": "<model>", "tts": "<model>"}`.
 
+## `GET /v1/tts/config`
+
+What decides a TTS render besides its text: `{"model", "n_q", "temp", "voice", "cfg", "sample_rate"}`
+(`voice` and `cfg` are the defaults a connection gets without them). Clients that cache renders key them on this.
+
 ## ASR: `WS /v1/asr`
 
 Query: `language` (`English`, default), `sample_rate` (16000), `context` (optional
@@ -37,7 +42,13 @@ Server to client (times are seconds from the first sample received on this conne
 
 ## TTS: `WS /v1/tts`
 
-One connection per reply. Query: `voice` (Kyutai voice path, optional), `cfg` (optional).
+One connection per reply. Query: `voice` (Kyutai voice path, optional), `cfg` (optional),
+`priority` (optional: `background` for audio rendered ahead, such as canned lines).
+
+The box renders one utterance at a time. A `background` connection only renders while no other
+connection is waiting: when one arrives, the background render stops at its next model step
+(80 ms of audio) and starts over once the box is free again. Its messages and audio are held
+until it is done, so the client sees one uninterrupted render, only later.
 
 Client to server:
 - `{"type": "Speak", "text": "..."}`: more text of the reply, as it streams.

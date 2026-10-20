@@ -113,6 +113,8 @@ async function updateSettings(patch: Record<string, unknown>) {
 const sessionsDir = () => resolve(setting('FV_SESSIONS_DIR')!);
 /** Downloaded models (the turn model), next to the settings file so a redeployed app keeps them. */
 const MODELS_DIR = resolve(process.env.FV_MODELS_DIR ?? join(dirname(SETTINGS_FILE), 'fv-models'));
+/** Canned lines' audio, rendered once per GPU box and kept across sessions and redeploys. */
+const CANNED_DIR = resolve(process.env.FV_TTS_CACHE_DIR ?? join(dirname(SETTINGS_FILE), 'fv-tts-cache'));
 
 interface Upstream {
   baseVar: string;
@@ -300,7 +302,7 @@ const server = createServer((req, res) => {
 });
 
 // The page's socket: mic in, agent audio and the run's trajectory out.
-const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR });
+const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR });
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');

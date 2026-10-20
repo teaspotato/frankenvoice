@@ -208,6 +208,22 @@ const gpuboxTts: LiveDriver = (_req, sink) => {
   };
 };
 
+/** The server's canned-line cache: a tone for the line, from the cache or a background render. */
+const ttsCanned: LiveDriver = (req, sink) => {
+  const { text } = req as { text: string };
+  let closed = false;
+  const n = Math.round(text.length * 0.004 * 24000);
+  const pcm = new Int16Array(n).map((_, i) => Math.round(Math.sin(i / 7) * 3000));
+  const cached = Math.random() < 0.5;
+  later(jitter(cached ? 0.5 : 5, 3), () => {
+    if (closed) return;
+    sink.recv({ type: 'Canned', cached, key: 'k', sampleRate: 24000 });
+    sink.recv(null, new Uint8Array(pcm.buffer));
+    sink.close(null);
+  });
+  return { send() {}, close: () => void (closed = true) };
+};
+
 /** RNNoise stand-in: halves the signal, one reply per frame, after a random delay. */
 const rnnoise: LiveDriver = (_req, sink) => {
   let closed = false;
@@ -262,7 +278,7 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, openai, rnnoise, speaker, 'turn-model': turnModel, typesafe };
+export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, 'tts-canned': ttsCanned, openai, rnnoise, speaker, 'turn-model': turnModel, typesafe };
 
 /** The default pipeline with the turn model on (it is off by default, a big download). */
 export function testConfig(): PipelineConfig {

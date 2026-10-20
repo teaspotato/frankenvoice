@@ -69,7 +69,7 @@ The echo canceller is deterministic, so a replay with changed knobs (**replay wi
 | --- | --- | --- |
 | `asr` | Qwen3-ASR-1.7B on the GPU box (`/v1/asr`) | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` |
 | `llm` | an OpenAI-compatible chat endpoint: llama.cpp with Gemma 4 12B on the GPU box (model `gemma-4-12b-it`), or any local server | `OPENAI_COMPAT_BASE_URL` (+ optional `OPENAI_COMPAT_API_KEY`) |
-| `tts.kyutai` | Kyutai TTS on the GPU box (`/v1/tts`): words stream in as the LLM writes them, word timings come back | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` |
+| `tts.kyutai` | Kyutai TTS on the GPU box (`/v1/tts`): words stream in as the LLM writes them, word timings come back. Canned lines (backchannels, openers) render once per box: the server keeps their audio (`fv-tts-cache` next to the settings file, or `FV_TTS_CACHE_DIR`), keyed by the text, voice and the box's TTS settings, and renders a missing one as a background job the box drops whenever a reply needs it | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` |
 | `opener.choice`, `backchannel` (*decide* `typesafe`), `interject` | TypeSafe Choice (`/v1/systemone`, model `jev-latest`) | `TYPESAFE_API_KEY` |
 
 The toolbar shows which settings the current config still needs; click it to open Settings.
@@ -103,7 +103,7 @@ The core rule is that **everything is replayable as-is**: ASR partials, LLM toke
 How the runtime ensures that:
 
 - **One session clock.** Every event has `t`, its arrival time in ms on a monotonic session clock. Events about audio also carry `media: {track, start, end}`, a sample range on a recorded media track. So each event records both *when* it happened and *which audio* it refers to. The mic driver also logs the AudioContext time of every captured frame.
-- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `rnnoise`, `silero`, `gpubox-asr`, `gpubox-tts`, `openai`, `typesafe`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
+- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `rnnoise`, `silero`, `gpubox-asr`, `gpubox-tts`, `tts-canned`, `openai`, `typesafe`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. A canned line served from the server's cache is such an exchange too, so a replay gets it from the recording, not the cache. Timers are recorded the same way (`timer.set` / `timer.fire`).
 - **Deterministic turns.** When an external event arrives, the runtime stamps it with the current time, hands it to its node, and drains every resulting message synchronously, all at that timestamp. Nodes are pure functions of what they receive, so the same external events at the same times always produce the same log.
 - **Replay on a virtual clock.** A replay serves every recorded exchange and timer from the trajectory at its original time, with the original event order breaking ties. The result is checked against the source: the Sessions list shows *identical to source ✓* or the first event where the two differ.
 - **Causality.** Every event lists the seqs of the events that caused it, so any output (a TTS chunk, say) can be traced back through the LLM tokens to the ASR result and the audio frames behind it.

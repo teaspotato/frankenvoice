@@ -97,12 +97,12 @@ describe('streaming TTS (Kyutai on the GPU box)', () => {
     const h = kyutai();
     h.send(0, 'text', { type: 'opener.lines', lines: ['Hmm, let me think.'] });
     const pre = h.ios[0];
-    expect(pre.sent).toEqual([{ type: 'Speak', text: 'Hmm, let me think.' }, { type: 'Flush' }, { type: 'Close' }]);
+    expect(pre.request).toEqual({ text: 'Hmm, let me think.', voice: '', sampleRate: 24000 });
+    pre.h.onRecv!({ type: 'Canned', cached: false }, undefined);
     pre.h.onRecv!(null, h.pcm(30));
     pre.h.onRecv!(null, new Uint8Array(3)); // odd bytes carry over
     pre.h.onRecv!(null, new Uint8Array(1));
-    pre.h.onRecv!({ type: 'Flushed' }, undefined);
-    expect(pre.closed).toBe(true);
+    pre.h.onClose!(null);
     expect(h.out).toEqual([]);
     h.llm(1000, 'start');
     h.send(1000, 'text', { type: 'opener.say', rid: 'r0', text: 'Hmm, let me think. ', line: 'Hmm, let me think.' });
@@ -115,12 +115,12 @@ describe('streaming TTS (Kyutai on the GPU box)', () => {
     expect(h.out.at(-2)).toMatchObject({ type: 'tts.segment_start', seg: 1 });
   });
 
-  it('renders a canned line again once when its socket closes early', () => {
+  it('renders a canned line again once when it fails', () => {
     const h = kyutai();
     h.send(0, 'text', { type: 'bc.lines', lines: ['Mm-hmm.'] });
-    h.ios[0].h.onClose!({ error: 'websocket closed (1006)' });
+    h.ios[0].h.onClose!({ error: 'tts closed before the line was rendered' });
     expect(h.ios).toHaveLength(2);
-    expect(h.ios[1].sent[0]).toEqual({ type: 'Speak', text: 'Mm-hmm.' });
+    expect(h.ios[1].request).toMatchObject({ text: 'Mm-hmm.' });
     h.ios[1].h.onClose!({ error: 'websocket closed (1006)' });
     expect(h.ios).toHaveLength(2);
   });
@@ -136,24 +136,18 @@ describe('streaming TTS (Kyutai on the GPU box)', () => {
     expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.cancelled']);
   });
 
-  it('renders canned lines one socket at a time, and holds them while a reply speaks', () => {
+  it("renders canned lines one at a time, and doesn't hold them while a reply speaks (the box does)", () => {
     const h = kyutai();
     h.send(0, 'text', { type: 'opener.lines', lines: ['Hmm.', 'Right.', 'Okay.'] });
-    // One at a time: the GPU box renders one utterance at a time anyway.
-    expect(h.ios.map((x) => x.sent)).toEqual([[{ type: 'Speak', text: 'Hmm.' }, { type: 'Flush' }, { type: 'Close' }]]);
+    expect(h.ios.map((x) => x.request)).toEqual([{ text: 'Hmm.', voice: '', sampleRate: 24000 }]);
     h.ios[0].h.onRecv!(null, h.pcm(10));
-    h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
-    expect(h.ios[0].closed).toBe(true);
-    expect(h.ios[1].sent).toEqual([{ type: 'Speak', text: 'Right.' }, { type: 'Flush' }, { type: 'Close' }]);
-    // A reply starts while a line renders: the next line waits until the reply is done.
+    h.ios[0].h.onClose!(null);
+    expect(h.ios[1].request).toMatchObject({ text: 'Right.' });
+    // A reply starts while a line renders: the next line goes out anyway, as a background job.
     h.llm(10, 'start');
-    h.ios[1].h.onRecv!({ type: 'Flushed' }, undefined);
-    expect(h.ios).toHaveLength(3);
-    h.llm(20, 'delta', 'Hi.');
-    h.llm(30, 'end');
-    h.ios[2].h.onRecv!(null, h.pcm(10));
-    h.ios[2].h.onRecv!({ type: 'Flushed' }, undefined);
-    h.ios[2].h.onClose!(null);
-    expect(h.ios[3].sent).toEqual([{ type: 'Speak', text: 'Okay.' }, { type: 'Flush' }, { type: 'Close' }]);
+    h.ios[1].h.onRecv!(null, h.pcm(10));
+    h.ios[1].h.onClose!(null);
+    expect(h.ios[3].request).toMatchObject({ text: 'Okay.' });
+    expect(h.ios[2].request).toEqual({ path: '/v1/tts', query: {} });
   });
 });

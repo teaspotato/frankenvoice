@@ -3,7 +3,7 @@
 - `WS /v1/asr`: streaming ASR on top of a local sglang-omni server (Qwen3-ASR-1.7B, FP8) that only
   does whole-utterance transcriptions. This process keeps the per-connection segment buffer, the
   energy gate, partial re-decodes, and times final words with Qwen3-ForcedAligner-0.6B (loaded here).
-- `WS /v1/tts`: relayed to the Kyutai TTS worker (kyutai_tts.py, its own venv) on localhost.
+- `WS /v1/tts`, `GET /v1/tts/config`: relayed to the Kyutai TTS worker (kyutai_tts.py, its own venv) on localhost.
 - `POST /v1/chat/completions`, `GET /v1/models`: passed through (streaming) to the local OpenAI-compatible
   LLM server (llama-server with Gemma 4 12B on LLM_URL). Closing the client connection stops generation.
 - `GET /health`.
@@ -412,6 +412,15 @@ async def tts_ws(ws: WebSocket):
             await ws.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+@app.get("/v1/tts/config")
+async def tts_config():
+    try:
+        r = await http.get(re.sub(r"^ws", "http", TTS_URL) + "/config", timeout=5)
+        return JSONResponse(r.json(), status_code=r.status_code)
+    except (httpx.HTTPError, ValueError) as e:
+        return JSONResponse({"error": f"tts backend unavailable: {e}"}, status_code=502)
 
 
 # ---------------------------------------------------------------- LLM pass-through

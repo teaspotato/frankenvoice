@@ -21,6 +21,8 @@ export interface LiveOptions {
   upstreams: Upstreams;
   sessionsDir(): string;
   modelsDir: string;
+  /** Canned lines' audio, rendered once per box (default: tts-cache in modelsDir's folder). */
+  cannedDir?: string;
   log?: (msg: string) => void;
 }
 
@@ -77,7 +79,7 @@ export class LiveHub {
   private drivers: DriverRegistry;
 
   constructor(private o: LiveOptions) {
-    this.drivers = { ...serverDrivers(o.upstreams, { modelsDir: o.modelsDir }), mic: this.mic, speaker: this.speaker };
+    this.drivers = { ...serverDrivers(o.upstreams, { modelsDir: o.modelsDir, cannedDir: o.cannedDir ?? join(o.modelsDir, '..', 'fv-tts-cache') }), mic: this.mic, speaker: this.speaker };
   }
 
   private log(m: string) {
