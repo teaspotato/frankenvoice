@@ -13,6 +13,7 @@ import {
   newCell,
   parseAction,
   promptHead,
+  timed,
   tapePrompt,
   transcript,
   type Cell,
@@ -22,6 +23,7 @@ import {
 
 interface TapeParams {
   cellMs: number;
+  timeScale: number;
   prompt: string;
   system: string;
   example: string;
@@ -100,7 +102,14 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     { name: 'text', type: 'text', description: 'The agent’s words (llm.start / llm.delta / llm.end) and backchannel cues (bc.lines, bc.say), to TTS' },
   ],
   params: [
-    { key: 'cellMs', label: 'Cell (ms)', type: 'number', default: 640, description: 'One decision per cell. The prompt says 0.64 s.' },
+    { key: 'cellMs', label: 'Cell (ms)', type: 'number', default: 640, description: 'One decision per cell, in real time.' },
+    {
+      key: 'timeScale',
+      label: 'Tape time scale',
+      type: 'number',
+      default: 1,
+      description: 'Stretches the time written on the tape: each cell reads as cell × this seconds, in the timestamps, the example and the prompt’s cell length. Above 1, a model that waits a fixed number of seconds waits fewer cells.',
+    },
     { key: 'prompt', label: 'Prompt', type: 'select', options: ['base', 'eager', 'custom'], default: 'base', description: 'base: the pilot’s. eager: turn-end rules rewritten against dead air. custom: the text below.' },
     { key: 'system', label: 'Custom instructions', type: 'text', default: PROMPTS.base, when: { prompt: ['custom'] } },
     { key: 'example', label: 'Example tape', type: 'text', default: EXAMPLE_TAPE, description: 'Shown as the user turn, so the live tape reads as the model’s own continuation.' },
@@ -141,8 +150,12 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
   create(ctx) {
     const p = ctx.params;
     const cellMs = Math.max(50, Number(p.cellMs) || 640);
-    const system = p.prompt === 'custom' ? String(p.system) : (PROMPTS[p.prompt] ?? PROMPTS.base);
-    const example = String(p.example).replace(/\s+$/, '');
+    const timeScale = Number(p.timeScale) > 0 ? Number(p.timeScale) : 1;
+    const { system, example } = timed(
+      p.prompt === 'custom' ? String(p.system) : (PROMPTS[p.prompt] ?? PROMPTS.base),
+      String(p.example).replace(/\s+$/, ''),
+      (cellMs * timeScale) / 1000,
+    );
     let head = promptHead(system, example);
     let earlier: string[] = [];
 
@@ -193,7 +206,7 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     let spec: Spec | null = null;
     let specNo = 0;
 
-    const tOf = (n: number) => Math.round(n * cellMs) / 1000;
+    const tOf = (n: number) => Math.round(n * cellMs * timeScale) / 1000;
     const setFloor = () => {
       ctx.setState('state', live.state);
       ctx.setState('floor', live.state === 'speaking' || live.reply?.playing ? 'speaking' : 'listening');

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EXAMPLE_TAPE, PROMPTS, cutTape, grammar, headroom, line, newCell, parseAction, promptHead, tapePrompt, type Cell, type TapeState } from '../src/nodes/tape';
+import { EXAMPLE_TAPE, PROMPTS, cutTape, grammar, headroom, line, newCell, parseAction, promptHead, tapePrompt, timed, type Cell, type TapeState } from '../src/nodes/tape';
 import { noPeriods, tapeTurnNode } from '../src/nodes/turn-tape';
 import { harness } from './node-harness';
 import type { Json, Msg } from '../src/core/types';
@@ -90,6 +90,16 @@ describe('the tape format', () => {
     expect(prompt).toContain('finish "closed on Sundays."\n\nNow the live call. Continue the tape with the agent\'s action on each new line.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>  0.64 |');
     expect(prompt.endsWith(' 11.52 | user: "car?" (silent) | agent (cut off): listen\n 12.16 | user: (silent) | agent (cut off):')).toBe(true);
     expect(promptHead(PROMPTS.base, EXAMPLE_TAPE, 'user: hi')).toContain('Now the live call. What was said before the tape below:\n\nuser: hi\n\nContinue the tape');
+  });
+
+  it('stretches the time on the tape: the cell length in the prompt and the example follow the scale', () => {
+    expect(timed(PROMPTS.eager, EXAMPLE_TAPE, 0.64)).toEqual({ system: PROMPTS.eager, example: EXAMPLE_TAPE });
+    const { system, example } = timed(PROMPTS.eager, EXAMPLE_TAPE, 0.96);
+    expect(system).toContain('Time runs in cells of 0.96 seconds');
+    expect(system).toContain('Every cell you wait is 0.96 s of silence');
+    expect(system).toContain('spoken aloud 0.4 s after');
+    expect(example.split('\n')[0]).toBe('  0.96 | user: (silent) | agent (silent): listen');
+    expect(example.split('\n').at(-1)).toBe(' 27.84 | user: (silent) | agent (speaking): finish "closed on Sundays."');
   });
 });
 

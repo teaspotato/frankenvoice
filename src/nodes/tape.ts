@@ -201,6 +201,21 @@ export const EXAMPLE_TAPE = `  0.64 | user: (silent) | agent (silent): listen
  17.92 | user: (silent) | agent (speaking): continue "one is"
  18.56 | user: (silent) | agent (speaking): finish "closed on Sundays."`;
 
+/** Seconds as the prompt writes them: 0.64, 0.96, 1.2, 1. */
+const secs = (x: number) => String(Number(x.toFixed(2)));
+
+/**
+ * The prompt's cell length follows the tape's time: the instructions' "0.64 seconds" / "0.64 s" become
+ * `cellS`, and the example tape (written on 0.64 s cells) has its timestamps stretched to match.
+ */
+export function timed(system: string, example: string, cellS: number): { system: string; example: string } {
+  const k = cellS / 0.64;
+  return {
+    system: system.replace(/\b0\.64(?= s\b| seconds\b)/g, secs(cellS)),
+    example: example.replace(/^( *)(\d+\.\d+)(?= \|)/gm, (_m, _sp, t: string) => (Number(t) * k).toFixed(2).padStart(6)),
+  };
+}
+
 /**
  * The prompt's fixed head, in Gemma 4's chat format: instructions as the system turn, the example tape
  * as the user turn, then the model's own turn with thinking off. `earlier`: what was said before the
