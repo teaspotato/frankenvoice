@@ -223,6 +223,8 @@ async function serveStatic(p: string, res: ServerResponse) {
 }
 
 const DROP_REQ = new Set(['host', 'connection', 'content-length', 'x-api-key', 'authorization', 'origin', 'referer', 'cookie', 'anthropic-dangerous-direct-browser-access']);
+// Added by a tunnel or reverse proxy in front of a hosted proxy; providers don't need the viewer's IP.
+const DROP_REQ_PREFIX = /^(cf-|x-forwarded-|x-real-ip$|true-client-ip$|forwarded$|cdn-loop$|via$)/;
 const DROP_RES = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection']);
 
 function json(res: ServerResponse, status: number, body: unknown) {
@@ -244,7 +246,7 @@ async function forward(name: string, rest: string, req: IncomingMessage, res: Se
   if (!upBase) return json(res, 500, { error: `no base URL configured for "${name}" (${up.baseVar}; set it in Settings)` });
   if (!key && !up.keyOptional) return json(res, 500, { error: `${up.keyVar} is not set (set it in Settings)` });
   const headers: Record<string, string> = {};
-  for (const [k, v] of Object.entries(req.headers)) if (!DROP_REQ.has(k) && typeof v === 'string') headers[k] = v;
+  for (const [k, v] of Object.entries(req.headers)) if (!DROP_REQ.has(k) && !DROP_REQ_PREFIX.test(k) && typeof v === 'string') headers[k] = v;
   Object.assign(headers, up.headers(key));
   const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : new Uint8Array(await readBody(req));
   const ac = new AbortController();
