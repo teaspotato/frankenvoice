@@ -44,7 +44,7 @@ let llmPort = 0;
 /** The live session limit the hub uses (ms; 0: none), set per test. */
 let limitMs = 0;
 let livePort = 0;
-const seen = { asr: 0, tts: 0, llm: 0, auth: [] as string[], ttsQueries: [] as string[] };
+const seen = { asr: 0, tts: 0, llm: 0, auth: [] as string[], ttsQueries: [] as string[], llmBodies: [] as { messages?: { role: string; content: unknown }[] }[] };
 const sessions = mkdtempSync(join(tmpdir(), 'fv-sessions-'));
 
 beforeAll(async () => {
@@ -69,6 +69,7 @@ beforeAll(async () => {
     for await (const c of req) chunks.push(c as Buffer);
     if (req.url !== '/v1/chat/completions') return res.writeHead(404).end();
     seen.llm++;
+    seen.llmBodies.push(JSON.parse(Buffer.concat(chunks).toString()) as { messages?: { role: string; content: unknown }[] });
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     fakeDrivers.openai({ body: JSON.parse(Buffer.concat(chunks).toString()) as Json }, {
       recv: (e) => res.write(`data: ${(e as { $done?: boolean }).$done ? '[DONE]' : JSON.stringify(e)}\n\n`),
@@ -179,6 +180,9 @@ describe('the pipeline in the server', () => {
     const open = msgs.findIndex((m) => m.type === 'asr.open');
     expect(open).toBeGreaterThanOrEqual(0);
     expect(msgs.findIndex((m) => m.type === 'bc.say' && m.why === 'greeting')).toBeGreaterThan(open);
+    // And its line opens the LLM transcript.
+    const reply = seen.llmBodies.find((b) => b.messages?.some((m) => m.role === 'user'))!;
+    expect(reply.messages!.filter((m) => m.role !== 'system')[0]).toMatchObject({ role: 'assistant', content: expect.stringContaining("What's on your mind?") });
     expect(traj.events.some((e) => e.kind === 'io.recv' && (e.data as { payload?: { type?: string } }).payload?.type === 'late')).toBe(got.lateSent > 0);
     expect(traj.events.filter((e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toEqual([]);
     // The server's recording replays exactly, like one made in the page.

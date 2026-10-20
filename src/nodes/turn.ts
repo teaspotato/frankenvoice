@@ -477,7 +477,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       label: 'Opening line',
       type: 'string',
       default: "Hi! What's on your mind?",
-      description: 'What the agent says first, as soon as the ASR is connected (so the user can answer). Kept out of the LLM transcript, like openers. Empty: wait for the user. Needs a TTS that plays canned lines (Kyutai).',
+      description: 'What the agent says first, as soon as the ASR is connected (so the user can answer). It opens the LLM transcript. Empty: wait for the user. Needs a TTS that plays canned lines (Kyutai).',
     },
     {
       key: 'backoffAfter',
@@ -1320,6 +1320,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         if (greeted || !line) return;
         greeted = true;
         decide('greet', { why: 'ASR connected' });
+        ctx.emit('turn', { type: 'turn.greet', text: line });
         ctx.emit('text', { type: 'bc.say', id: `${ctx.id}-greet`, line, take: line, tailMs: 150, why: 'greeting' });
         return;
       }

@@ -812,6 +812,14 @@ export const llmNode: NodeDef = {
           );
           return;
         }
+        if (msg.type === "turn.greet") {
+          // The agent spoke first: its line opens the transcript, tagged like a reply when replies are.
+          const text = String(msg.text ?? "").trim();
+          if (text && !history.length)
+            history.push({ role: "assistant", text: tagged ? `[i1g1] ${text}` : text });
+          ctx.setState("turns", history.length);
+          return;
+        }
         if (msg.type !== "turn.user") return;
         if (!reqParams.model) {
           ctx.log("error", "set a model for the LLM");
