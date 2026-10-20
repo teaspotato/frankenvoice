@@ -129,7 +129,7 @@ start_ui() {  # the Frankenvoice proxy, serving the built UI behind the gpubox t
       spawn ui node_modules/.bin/tsx server/index.ts)
   wait_http ui "http://127.0.0.1:$UI_PORT/index.html?token=$TOKEN" 60 || return 1
   if [ -z "${NO_TUNNEL:-}" ] && ! alive ui-tunnel; then
-    spawn ui-tunnel "$ROOT/cloudflared" tunnel --no-autoupdate --url http://localhost:$UI_PORT
+    spawn ui-tunnel "$ROOT/cloudflared" tunnel --no-autoupdate --protocol http2 --url http://localhost:$UI_PORT
     for _ in $(seq 1 60); do grep -qo 'https://[a-z0-9-]*\.trycloudflare\.com' "$ROOT/logs/ui-tunnel.log" && break; sleep 1; done
   fi
 }
@@ -193,7 +193,8 @@ start() {
       spawn gateway "$ROOT/v-gw/bin/python" "$SRC/server.py" --port $GW_PORT
   wait_http gateway "http://127.0.0.1:$GW_PORT/health?token=$TOKEN" 600 || return 1
   if [ -z "${NO_TUNNEL:-}" ] && ! alive tunnel; then
-    spawn tunnel "$ROOT/cloudflared" tunnel --no-autoupdate --url http://localhost:$GW_PORT
+    # --protocol http2: over QUIC a quick tunnel moved ~110 KB/s (2.3 MB in 20 s); over HTTP/2, 3.4 MB/s
+    spawn tunnel "$ROOT/cloudflared" tunnel --no-autoupdate --protocol http2 --url http://localhost:$GW_PORT
     for _ in $(seq 1 60); do grep -qo 'https://[a-z0-9-]*\.trycloudflare\.com' "$ROOT/logs/tunnel.log" && break; sleep 1; done
   fi
   start_ui
