@@ -120,7 +120,10 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
         : s.id === 'llm'
           ? // The workers stage decides whether the LLM can delegate, and how it hears back.
             { ...stageParams(c, 'llm'), delegate: delegation(c) }
-          : stageParams(c, s.id),
+          : s.id === 'tts' && stageType(c, 'tts') === 'tts.stream' && !speakerWantsWords(c)
+            ? // Word timings cost a Deepgram ASR stream; only a speaker that resumes from a word's start uses them.
+              { ...stageParams(c, 'tts'), alignWords: false }
+            : stageParams(c, s.id),
     ui: { x: COLUMN[s.id][0], y: COLUMN[s.id][1] },
   }));
   const hasSpeaker = stages.some((s) => s.id === 'speaker');
@@ -166,6 +169,12 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
       : []),
   ];
   return { format: GRAPH_FORMAT, formatVersion: GRAPH_FORMAT_VERSION, name: 'Cascade', nodes, edges };
+}
+
+/** Whether the speaker resumes a cut-off reply from the start of a word (needs tts.words). */
+function speakerWantsWords(c: PipelineConfig): boolean {
+  if (!activeStages(c).some((s) => s.id === 'speaker')) return false;
+  return resolveParams(registry[stageType(c, 'speaker')], stageParams(c, 'speaker')).resumeFrom === 'word';
 }
 
 /** What the LLM needs to delegate to workers, or null when the stage is off. */

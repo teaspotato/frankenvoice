@@ -1,5 +1,6 @@
 import type { NodeDef } from '../../core/node';
 import type { Json, JsonObject, Msg } from '../../core/types';
+import { int16BytesFromF32 } from '../audio';
 import { addTail } from './tail';
 
 interface StreamParams {
@@ -7,6 +8,14 @@ interface StreamParams {
   sampleRate: number;
   firstClauseChars: number;
   maxFlushesPerMin: number;
+  alignWords: boolean;
+}
+
+/** A word of a reply's audio, in samples of its media track. */
+export interface SpokenWord {
+  word: string;
+  start: number;
+  end: number;
 }
 
 /** Where to cut `buf` for the next segment, or -1 to wait for more text. */
@@ -57,8 +66,18 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
       description: 'Start speaking at the first comma, colon or dash this far into a reply instead of waiting for the end of its first sentence (0 = whole sentences only).',
     },
     { key: 'maxFlushesPerMin', label: 'Max flushes per minute', type: 'number', default: 20, description: 'Deepgram’s limit.' },
+    {
+      key: 'alignWords',
+      label: 'Find word timings',
+      type: 'boolean',
+      default: true,
+      description: 'Transcribe the reply’s own audio (Deepgram nova-3) for word timings, so a cut-off reply resumes from the start of the word it stopped in.',
+    },
   ],
-  channels: [{ name: 'deepgram-tts-ws', description: 'Deepgram /v1/speak WebSocket: Speak/Flush out, raw 16-bit PCM and Flushed in' }],
+  channels: [
+    { name: 'deepgram-tts-ws', description: 'Deepgram /v1/speak WebSocket: Speak/Flush out, raw 16-bit PCM and Flushed in' },
+    { name: 'deepgram', description: 'Deepgram /v1/listen WebSocket on the reply’s own audio, for word timings (tts.words)' },
+  ],
   requires: () => ['deepgram'],
   create(ctx) {
     const p = ctx.params;
@@ -73,7 +92,13 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
       segNo: number;
       remainder: Uint8Array;
       llmDone: boolean;
+      align?: Aligner;
     };
+    /**
+     * The reply's audio streamed to Deepgram ASR. Its times count from the reply's first sample, and
+     * `pieces` maps them back to the media track (backchannels share the track, so it has gaps).
+     */
+    type Aligner = { io: ReturnType<typeof ctx.io.open>; sent: number; pieces: { a: number; m: number; n: number }[] };
     let reply: Reply | undefined;
     /** When recent flushes went out, for Deepgram's per-minute limit. */
     let flushes: number[] = [];
@@ -152,6 +177,41 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
       if (!samples.length) return;
       const ref = ctx.media.append('audio', samples, p.sampleRate);
       ctx.emit('audio', { type: 'audio', ...ref, sampleRate: p.sampleRate, samples, rid: r.rid, seg: s.seg });
+      // Opened with the reply's first audio: Deepgram closes a socket that gets none for 10 s.
+      if (p.alignWords && !r.align) r.align = align(r.rid);
+      const a = r.align;
+      if (a && !a.io.closed) {
+        a.pieces.push({ a: a.sent, m: ref.start, n: samples.length });
+        a.sent += samples.length;
+        a.io.send(null, { bin: int16BytesFromF32(samples), media: { track: ref.track, start: ref.start, end: ref.end }, logBin: false });
+      }
+    };
+
+    const align = (rid: string): Aligner => {
+      const a: Aligner = { sent: 0, pieces: [], io: undefined as never };
+      /** Reply-audio seconds to a media track sample. */
+      const toMedia = (sec: number) => {
+        const x = Math.round(sec * p.sampleRate);
+        const piece = a.pieces.findLast((q) => q.a <= x) ?? a.pieces[0];
+        return piece ? piece.m + Math.min(x - piece.a, piece.n) : x;
+      };
+      a.io = ctx.io.open(
+        'deepgram',
+        { path: '/v1/listen', query: { model: 'nova-3', language: 'en', encoding: 'linear16', sample_rate: p.sampleRate, channels: 1, smart_format: false } },
+        {
+          onRecv(data: Json) {
+            const m = (data ?? {}) as JsonObject;
+            if (m.type !== 'Results' || !m.is_final) return;
+            const alt = ((m.channel as JsonObject | undefined)?.alternatives as JsonObject[] | undefined)?.[0];
+            const words = ((alt?.words ?? []) as { word: string; start: number; end: number }[]).map((w) => ({ word: w.word, start: toMedia(w.start), end: toMedia(w.end) }));
+            if (words.length) ctx.emit('audio', { type: 'tts.words', rid, words: words as unknown as Json });
+          },
+          onClose(data) {
+            if (data && (data as { error?: unknown }).error) ctx.log('warn', 'word timings unavailable: Deepgram ASR on the reply failed', data);
+          },
+        },
+      );
+      return a;
     };
 
     const finish = (r: Reply) => {
@@ -161,6 +221,8 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
         r.io.send({ type: 'Close' });
         r.io.close();
       }
+      // Deepgram sends the last words and then closes; they're still wanted while the reply plays.
+      if (r.align && !r.align.io.closed) r.align.io.send({ type: 'CloseStream' });
       ctx.emit('audio', { type: 'tts.response_end', rid: r.rid });
       ctx.setState('status', 'idle');
     };
@@ -251,6 +313,7 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
                 if (!s.started) emitAudio(r, s, new Float32Array());
                 ctx.emit('audio', { type: 'tts.segment_end', rid: r.rid, seg: s.seg });
               }
+              if (r.align && !r.align.io.closed) r.align.io.send({ type: 'Finalize' });
               if (r.llmDone && !r.segs.length && !r.buf) finish(r);
             } else if (m.type === 'Warning' || m.type === 'Error') ctx.log('warn', `Deepgram TTS ${String(m.type)}`, m);
           },
@@ -272,6 +335,8 @@ export const streamingTtsNode: NodeDef<StreamParams> = {
       if (!r) return;
       reply = undefined;
       r.io.close({ status: 'cancelled' });
+      // The reply may still be finishing its last sound; its words up to here have come back.
+      if (r.align && !r.align.io.closed) r.align.io.close({ status: 'cancelled' });
       ctx.emit('audio', { type: 'tts.cancelled', rid: r.rid });
       ctx.setState('status', 'idle');
     };
