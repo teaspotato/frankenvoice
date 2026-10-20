@@ -4,11 +4,14 @@
   does whole-utterance transcriptions. This process keeps the per-connection segment buffer, the
   energy gate, partial re-decodes, and times final words with Qwen3-ForcedAligner-0.6B (loaded here).
 - `WS /v1/tts`: relayed to the Kyutai TTS worker (kyutai_tts.py, its own venv) on localhost.
+- `POST /v1/chat/completions`, `GET /v1/models`: passed through (streaming) to the local OpenAI-compatible
+  LLM server (llama-server with Gemma 4 12B on LLM_URL). Closing the client connection stops generation.
 - `GET /health`.
 Every route needs `Authorization: Bearer $GPUBOX_TOKEN` (or `?token=`).
 
 Env: GPUBOX_TOKEN (required), ASR_URL (http://127.0.0.1:8101), TTS_URL (ws://127.0.0.1:8102),
-ASR_MODEL, ALIGN_MODEL, TTS_MODEL, NO_ALIGNER=1 (skip the aligner: final words spread evenly).
+LLM_URL (http://127.0.0.1:8103), ASR_MODEL, ALIGN_MODEL, TTS_MODEL, LLM_MODEL,
+NO_ALIGNER=1 (skip the aligner: final words spread evenly).
 """
 import argparse
 import asyncio
@@ -29,7 +32,7 @@ import numpy as np
 import uvicorn
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 log = logging.getLogger("gpubox")
 
@@ -39,6 +42,8 @@ TTS_URL = os.environ.get("TTS_URL", "ws://127.0.0.1:8102")
 ASR_MODEL = os.environ.get("ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
 ALIGN_MODEL = os.environ.get("ALIGN_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
 TTS_MODEL = os.environ.get("TTS_MODEL", "kyutai/tts-1.6b-en_fr")
+LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:8103")
+LLM_MODEL = os.environ.get("LLM_MODEL", "")
 
 SR = 16000
 FRAME = 320                 # 20 ms energy-gate frames
@@ -78,7 +83,7 @@ async def auth_mw(request: Request, call_next):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "asr": ASR_MODEL, "tts": TTS_MODEL, "aligner": ALIGN_MODEL if aligner else None,
+    return {"ok": True, "asr": ASR_MODEL, "tts": TTS_MODEL, "llm": LLM_MODEL or None, "aligner": ALIGN_MODEL if aligner else None,
             "align_ms_p50": _p50(align_stats)}
 
 
@@ -408,6 +413,46 @@ async def tts_ws(ws: WebSocket):
             await ws.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---------------------------------------------------------------- LLM pass-through
+LLM_TIMEOUT = httpx.Timeout(600, connect=5)
+_HOP = {"content-length", "transfer-encoding", "connection", "keep-alive", "content-encoding"}
+
+
+async def _llm_proxy(request: Request, path: str):
+    body = await request.body() if request.method == "POST" else None
+    headers = {"content-type": request.headers.get("content-type", "application/json")}
+    try:
+        up = await http.send(http.build_request(request.method, LLM_URL + path, content=body, headers=headers,
+                                                timeout=LLM_TIMEOUT), stream=True)
+    except httpx.HTTPError as e:
+        return JSONResponse({"error": f"llm unavailable: {e}"}, status_code=502)
+    out_headers = {k: v for k, v in up.headers.items() if k.lower() not in _HOP}
+    if "text/event-stream" not in up.headers.get("content-type", ""):
+        data = await up.aread()
+        await up.aclose()
+        return Response(data, status_code=up.status_code, headers=out_headers)
+
+    async def relay():
+        try:  # cancelled when the client goes away -> closing upstream makes llama-server stop generating
+            async for chunk in up.aiter_raw():
+                yield chunk
+        finally:
+            await up.aclose()
+    out_headers["cache-control"] = "no-cache"
+    out_headers["x-accel-buffering"] = "no"
+    return StreamingResponse(relay(), status_code=up.status_code, headers=out_headers)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    return await _llm_proxy(request, "/v1/chat/completions")
+
+
+@app.get("/v1/models")
+async def models(request: Request):
+    return await _llm_proxy(request, "/v1/models")
 
 
 @app.on_event("startup")
