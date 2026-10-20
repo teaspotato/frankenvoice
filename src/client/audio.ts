@@ -5,6 +5,16 @@ import captureWorkletUrl from './capture-worklet.js?url';
 import type { LiveDriver } from '../core/world';
 import type { Json } from '../core/types';
 import { toJson } from '../core/json';
+import { level as loudness, soundEnd, type Span } from '../nodes/cutpoint';
+import { sustain } from '../nodes/tts/tail';
+
+/** How the server's speaker cuts the reply off; the page gate cuts the same way. */
+export interface CutParams {
+  cutoff: 'syllable' | 'hard' | string;
+  maxFinishMs: number;
+  tailMs: number;
+  releaseMs: number;
+}
 
 export interface MicRequest {
   sampleRate: number;
@@ -134,6 +144,8 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
   let fade: GainNode | null = null;
   /** When each source plays: context time, and session time when it was given one. */
   const when = new WeakMap<AudioBufferSourceNode, { t: number; at?: number; dur: number }>();
+  /** Timed chunks scheduled lately (session time), for the page gate to find where the sound ends. */
+  let recent: { at: number; samples: Float32Array; sampleRate: number }[] = [];
   /** Timed chunks that arrived while a replay was skipping ahead (needs `clock`). */
   let held: { samples: Float32Array<ArrayBuffer>; sampleRate: number; at: number }[] = [];
   const release = () => {
@@ -184,6 +196,7 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
     playing.clear();
     nextAt = NaN;
     held = [];
+    recent = [];
   };
   /**
    * Play `samples`; at session time `at` (ms, with the session clock `now`), or else right after the previous chunk.
@@ -229,13 +242,53 @@ function pcmOutput(which: 'agent' | 'mic', clock?: () => number) {
     else t = Math.max(ctx.currentTime, ctx.currentTime + (at - now!) / 1000);
     src.start(t);
     when.set(src, { t, at, dur: buf.duration });
+    if (at !== undefined) {
+      recent = recent.filter((c) => c.sampleRate === sampleRate && c.at + (c.samples.length / sampleRate) * 1000 > now! - 2000);
+      recent.push({ at, samples, sampleRate });
+    }
     next = t + buf.duration;
     nextAt = at === undefined ? NaN : at + buf.duration * 1000;
     return at !== undefined && idle ? { lateMs: Math.max(0, now! - at) } : undefined;
   }
+  /** The scheduled audio over [t0, t1) of session time, silence where there is none. */
+  const spanOf = (t0: number, t1: number): Span | null => {
+    const rate = recent[0]?.sampleRate;
+    if (!rate) return null;
+    const samples = new Float32Array(Math.max(0, Math.round(((t1 - t0) / 1000) * rate)));
+    for (const c of recent) {
+      const o = Math.round(((c.at - t0) / 1000) * rate);
+      for (let i = Math.max(0, -o); i < c.samples.length && o + i < samples.length; i++) samples[o + i] = c.samples[i];
+    }
+    return { at: t0, sampleRate: rate, samples };
+  };
+  /**
+   * Cut off at session time `now` as the server's speaker would (see its cutPoint and flushAt):
+   * finish the sound playing, then sustain its end over a tail or fade over the release.
+   * Returns where the sound stops (what was heard ends there) and when it is silent.
+   */
+  function cut(now: number, p: CutParams): { stop: number; silent: number } {
+    const a = spanOf(now - 1500, now + p.maxFinishMs + 50);
+    if (!a || loudness(a, now, now + 10) < 1e-3) {
+      stop();
+      return { stop: now, silent: now };
+    }
+    const end = p.cutoff === 'syllable' ? soundEnd(a, now, p.maxFinishMs) : now;
+    const release = p.cutoff === 'hard' ? 0 : Math.max(0, p.releaseMs);
+    const t0 = Math.max(now + 5, end - 90);
+    if (p.cutoff === 'syllable' && p.tailMs > 0 && end - t0 >= 65) {
+      const i0 = Math.round(((t0 - a.at) / 1000) * a.sampleRate);
+      const i1 = Math.round(((end - a.at) / 1000) * a.sampleRate);
+      const samples = sustain(a.samples.subarray(i0, i1), a.sampleRate, p.tailMs);
+      stop(t0, now, release, { samples, sampleRate: a.sampleRate, stop: end });
+      return { stop: end, silent: t0 + (samples.length / a.sampleRate) * 1000 };
+    }
+    stop(end, now, release);
+    return { stop: end, silent: end + release };
+  }
   return {
     play,
     stop,
+    cut,
     /** Fade to `g` (linear) over a few tens of ms, so the step doesn't click. */
     setGain(g: number) {
       level = g;
@@ -280,10 +333,10 @@ export function speakerOutputs(clock?: () => number) {
       if (d.cmd === 'gain') return void out.setGain(d.gain ?? 1);
       if (d.cmd === 'play' && bin) return out.play(new Float32Array(bin.slice().buffer), d.sampleRate!, d.at!, now);
     },
-    /** The page gate heard the user: stop the reply now (session time `now`), fading over `releaseMs`. */
-    gateCut(now: number, releaseMs: number) {
-      out.stop(now, now, releaseMs);
+    /** The page gate heard the user at session time `now`: cut the reply off as the server would. */
+    gateCut(now: number, p: CutParams) {
       gated = true;
+      return out.cut(now, p);
     },
     close() {
       out.close();

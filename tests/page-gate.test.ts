@@ -148,11 +148,20 @@ describe('page gate: speaker', () => {
     return { ...h, play, plays };
   };
 
-  it('passes the arm on to the page with its release', () => {
+  it('passes the arm on to the page with how to cut off', () => {
     const s = speaker();
     s.play(0);
     s.send(0, 'control', { type: 'gate', until: 1000 });
-    expect(s.sent.at(-1)).toEqual({ cmd: 'gate', until: 1000, releaseMs: 40 });
+    expect(s.sent.at(-1)).toEqual({ cmd: 'gate', until: 1000, cutoff: 'syllable', maxFinishMs: 300, tailMs: 60, releaseMs: 40 });
+  });
+
+  it("takes the page's cut-off: heard up to the syllable's end, silent after the tail", () => {
+    const s = speaker();
+    s.play(0);
+    s.play(0);
+    s.recv(190, { type: 'gate', at: 150, pos: 2000, stop: 210, silent: 270 });
+    expect(s.of('playback.paused')).toEqual([{ type: 'playback.paused', rid: 'r0', at: 270, from: 150, gate: true, cut: 210, pos: 2000 }]);
+    expect(s.of('played.flush')).toEqual([{ type: 'played.flush', at: 270 }]);
   });
 
   it("takes the page's stop as a pause where the page stopped, acks it, and reports what was heard up to there", () => {

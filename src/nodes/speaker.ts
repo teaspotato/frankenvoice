@@ -275,19 +275,23 @@ export const speakerNode: NodeDef<SpeakerParams> = {
     };
     /** Where the page stopped playback on its own (gate), while paused so: what was heard ends there. */
     let gateStop: number | null = null;
-    /** The page heard the user start and stopped playback at `at`, fading out over the release it was armed with. */
-    const pageStop = (d: { at: number; pos?: number }) => {
+    /**
+     * The page heard the user start at `at` and cut playback off as this speaker would: the sound
+     * ended at `stop` (the syllable's end) and was silent at `silent`, after the tail or release.
+     */
+    const pageStop = (d: { at: number; pos?: number; stop?: number | null; silent?: number | null }) => {
       // The page drops what it is sent after stopping, until this.
       io?.send({ cmd: 'flush' });
       if (!playing || paused !== null) return void ctx.log('debug', 'the page stopped playback, nothing playing here', d as unknown as Json);
       const at = Math.min(d.at, ctx.now());
-      const from = Math.min(cutPoint(at).from, at);
-      const silent = at + Math.max(0, p.releaseMs);
+      const stop = typeof d.stop === 'number' ? Math.max(at, d.stop) : at;
+      const silent = typeof d.silent === 'number' ? Math.max(stop, d.silent) : at + Math.max(0, p.releaseMs);
+      const from = Math.min(cutPoint(at).from, stop);
       silentAt = Math.max(silentAt, silent);
       holdFrom(from);
-      gateStop = at;
+      gateStop = stop;
       flushPlayed(silent);
-      ctx.emit('playback', { type: 'playback.paused', rid, at: silent, from, gate: true, cut: at, ...(typeof d.pos === 'number' ? { pos: d.pos } : {}) });
+      ctx.emit('playback', { type: 'playback.paused', rid, at: silent, from, gate: true, cut: stop, ...(typeof d.pos === 'number' ? { pos: d.pos } : {}) });
     };
     const resume = () => {
       const from = paused!;
@@ -363,7 +367,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
             // The page reports how late a run of playback started (its audio arrived after its time).
             const d = data as { type?: string; ms?: number; at?: number };
             if (d?.type === 'late') ctx.setState('lateMs', d.ms ?? null);
-            else if (d?.type === 'gate' && typeof d.at === 'number') pageStop(d as { at: number });
+            else if (d?.type === 'gate' && typeof d.at === 'number') pageStop(d as { at: number; stop?: number | null; silent?: number | null });
             else ctx.setState('device', data);
           },
         });
@@ -374,7 +378,8 @@ export const speakerNode: NodeDef<SpeakerParams> = {
           else if (msg.type === 'unduck') setGain(1);
           if (msg.type === 'pause' && playing && paused === null) pause();
           else if (msg.type === 'resume' && paused !== null) resume();
-          if (msg.type === 'gate') io?.send({ cmd: 'gate', until: (msg.until as number | null) ?? null, releaseMs: p.releaseMs });
+          if (msg.type === 'gate')
+            io?.send({ cmd: 'gate', until: (msg.until as number | null) ?? null, cutoff: p.cutoff, maxFinishMs: p.maxFinishMs, tailMs: p.tailMs, releaseMs: p.releaseMs });
           if (msg.type === 'cancel') setGain(1);
           if (msg.type === 'cancel' && playing) {
             const wasPaused = paused !== null;

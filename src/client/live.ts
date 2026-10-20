@@ -5,7 +5,7 @@ import { Trajectory, type TrajectoryMeta } from '../core/trajectory';
 import type { GraphSpec } from '../core/graph';
 import type { Json, TrajEvent } from '../core/types';
 import { f32Of, frame, unframe } from '../live-protocol';
-import { captureMic, speakerOutputs, type MicRequest } from './audio';
+import { captureMic, speakerOutputs, type CutParams, type MicRequest } from './audio';
 import { PageGate } from './gate';
 import { resolveParams } from '../core/node';
 import { duplexTurnNode } from '../nodes/turn';
@@ -46,7 +46,7 @@ export class LiveClient {
   private stopMic: (() => void) | null = null;
   private speakers = new Map<number, ReturnType<typeof speakerOutputs>>();
   /** Speakers the server lets the page stop on its own VAD, until a session time, with the fade to use. */
-  private gateArms = new Map<number, { until: number; releaseMs: number }>();
+  private gateArms = new Map<number, { until: number } & CutParams>();
   /** The mic the page gate listens to: 16 kHz with browser echo cancellation (else it would hear the agent). */
   private gateMic: { frameSamples: number } | null = null;
   private gate = new PageGate((pos) => this.gateOnset(pos));
@@ -188,7 +188,13 @@ export class LiveClient {
       if (h.cmd === 'gate') {
         if (typeof h.until !== 'number') return void this.gateArms.delete(id);
         this.gate.load();
-        return void this.gateArms.set(id, { until: h.until, releaseMs: (h.releaseMs as number) ?? 40 });
+        return void this.gateArms.set(id, {
+          until: h.until,
+          cutoff: (h.cutoff as string) ?? 'fade',
+          maxFinishMs: (h.maxFinishMs as number) ?? 0,
+          tailMs: (h.tailMs as number) ?? 0,
+          releaseMs: (h.releaseMs as number) ?? 40,
+        });
       }
       let s = this.speakers.get(id);
       if (!s) this.speakers.set(id, (s = speakerOutputs(this.now)));
@@ -206,8 +212,8 @@ export class LiveClient {
     for (const [id, arm] of this.gateArms) {
       this.gateArms.delete(id);
       if (now >= arm.until) continue;
-      this.speakers.get(id)?.gateCut(now, arm.releaseMs);
-      this.send({ type: 'speaker.gate', id, at: now, pos });
+      const c = this.speakers.get(id)?.gateCut(now, arm);
+      this.send({ type: 'speaker.gate', id, at: now, pos, ...(c ? { stop: c.stop, silent: c.silent } : {}) });
     }
   }
 

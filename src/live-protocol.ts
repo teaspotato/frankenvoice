@@ -10,7 +10,8 @@
 //   {type:'stop'} {type:'pause'} {type:'resume'}
 //   {type:'mic.ready', ...device} {type:'mic.error', error}
 //   {type:'speaker.late', id, at, ms}          a playback run started `ms` after its session time `at`
-//   {type:'speaker.gate', id, at, pos}         the page gate stopped playback at session time `at`, on user speech from mic sample `pos`
+//   {type:'speaker.gate', id, at, pos, stop, silent}  the page gate cut playback at session time `at`, on user speech from mic
+//                                              sample `pos`; the sound ended at `stop` (syllable end) and was silent at `silent`
 //   bin {k:'mic', frame, ctxTime} + f32 PCM    a capture frame
 //   bin {k:'replay', graph?, liveChannels, audible} + session bundle   replay it on the server
 // Server -> page
