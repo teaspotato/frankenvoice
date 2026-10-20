@@ -55,6 +55,15 @@ export function stretch(x: Float32Array, outLen: number, rate: number): Float32A
   return y.subarray(0, outLen);
 }
 
+/** `seg` played as is and then sustained for `tailMs` more, fading to silence over the sustain. */
+export function sustain(seg: Float32Array, rate: number, tailMs: number): Float32Array<ArrayBuffer> {
+  const tail = Math.round((tailMs / 1000) * rate);
+  const ext = stretch(seg, seg.length + tail, rate);
+  const out = new Float32Array(ext.length);
+  for (let i = 0; i < ext.length; i++) out[i] = ext[i] * (i < seg.length ? 1 : 0.5 + 0.5 * Math.cos((Math.PI * (i - seg.length)) / tail));
+  return out;
+}
+
 export function addTail(y: Float32Array, rate: number, tailMs: number): Float32Array<ArrayBuffer> {
   const tail = Math.round((tailMs / 1000) * rate);
   if (tail > 0 && y.length > rate * 0.08) {

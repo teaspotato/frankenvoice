@@ -10,7 +10,7 @@ function harness(params: Record<string, unknown> = {}) {
   let media = 0;
   const ctx: NodeContext = {
     id: 'tts',
-    params: resolveParams(streamingTtsNode, params as never),
+    params: resolveParams(streamingTtsNode, { alignWords: false, ...params } as never),
     now: () => now,
     cause: undefined,
     emit: (_port, msg) => (out.push(msg), out.length),
@@ -126,5 +126,37 @@ describe('streaming TTS (Deepgram WebSocket)', () => {
       { type: 'Speak', text: 'Two. Three.' },
       { type: 'Flush' },
     ]);
+  });
+
+  it('transcribes the reply’s own audio for word timings, in samples of the media track', () => {
+    const h = harness({ alignWords: true });
+    h.send(0, 'text', { type: 'bc.say', id: 'b0', line: 'x', take: 'x' }); // not rendered: no audio
+    h.llm(0, 'start');
+    h.llm(10, 'delta', 'Hello there. ');
+    // Opened with the first audio, not before: Deepgram drops a socket that idles for 10 s.
+    expect(h.ios).toHaveLength(1);
+    const [tts] = h.ios;
+    tts.h.onRecv!(null, h.pcm(24000));
+    expect(h.ios.map((x) => (x.request as { path: string }).path)).toEqual(['/v1/speak', '/v1/listen']);
+    const asr = h.ios[1];
+    expect(asr.sent).toHaveLength(1);
+    tts.h.onRecv!({ type: 'Flushed' }, undefined);
+    expect(asr.sent.at(-1)).toEqual({ type: 'Finalize' });
+    asr.h.onRecv!({ type: 'Results', is_final: true, channel: { alternatives: [{ words: [{ word: 'hello', start: 0.1, end: 0.5 }] }] } } as never, undefined);
+    expect(h.out.find((m) => m.type === 'tts.words')).toEqual({ type: 'tts.words', rid: 'r0', words: [{ word: 'hello', start: 2400, end: 12000 }] });
+    h.llm(20, 'end');
+    expect(asr.sent.at(-1)).toEqual({ type: 'CloseStream' });
+  });
+});
+
+describe('word timings in the pipeline', () => {
+  it('are only asked for when the speaker resumes from a word', async () => {
+    const { buildGraph, defaultConfig } = await import('../src/pipeline');
+    const c = defaultConfig();
+    c.tts.variant = 'deepgram-stream';
+    const tts = (g: ReturnType<typeof buildGraph>) => g.nodes.find((n) => n.id === 'tts')!.params as Record<string, unknown>;
+    expect(tts(buildGraph(c)).alignWords).toBeUndefined();
+    c.speaker.params.speaker = { resumeFrom: 'cut' };
+    expect(tts(buildGraph(c)).alignWords).toBe(false);
   });
 });

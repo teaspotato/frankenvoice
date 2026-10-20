@@ -4,13 +4,13 @@ import { resolveParams, type NodeContext } from '../src/core/node';
 import type { Json, Msg } from '../src/core/types';
 
 describe('speaker pause and resume', () => {
-  function speaker() {
+  function speaker(params: Record<string, unknown> = {}) {
     let now = 0;
     const out: Msg[] = [];
     const sent: Json[] = [];
     const ctx = {
       id: 'speaker',
-      params: resolveParams(speakerNode, {}),
+      params: resolveParams(speakerNode, params as never),
       now: () => now,
       emit: (_port: string, msg: Msg) => (out.push(msg), out.length),
       setState() {},
@@ -22,11 +22,12 @@ describe('speaker pause and resume', () => {
     node.start?.();
     let pos = 0;
     /** 100 ms of audio at 24 kHz. */
-    const play = (t: number, seg = 0) => {
+    const play = (t: number, seg = 0, samples = new Float32Array(2400)) => {
       now = t;
-      node.onInput?.('audio', { type: 'audio', track: 'tts.audio', start: pos, end: pos + 2400, sampleRate: 24000, samples: new Float32Array(2400), rid: 'r0', seg } as never);
-      pos += 2400;
+      node.onInput?.('audio', { type: 'audio', track: 'tts.audio', start: pos, end: pos + samples.length, sampleRate: 24000, samples, rid: 'r0', seg } as never);
+      pos += samples.length;
     };
+    const input = (t: number, msg: Msg) => ((now = t), node.onInput?.('audio', msg));
     const segment = (t: number, seg: number, text: string) => ((now = t), node.onInput?.('audio', { type: 'tts.segment_start', rid: 'r0', seg, text }));
     const control = (t: number, msg: Msg) => ((now = t), node.onInput?.('control', msg));
     const plays = () =>
@@ -35,7 +36,7 @@ describe('speaker pause and resume', () => {
         return [p.at, p.media.start, p.media.end];
       });
     const of = (type: string) => out.filter((m) => m.type === type);
-    return { play, segment, control, plays, sent, of, out };
+    return { play, segment, control, plays, sent, of, out, input };
   }
 
   it('stops at once and plays the rest from where it stopped, later by the pause', () => {
@@ -113,5 +114,80 @@ describe('speaker pause and resume', () => {
     s.control(50, { type: 'cancel' });
     const types = s.out.map((m) => m.type).filter((t) => t === 'playback.interrupted' || t === 'played.flush');
     expect(types).toEqual(['playback.interrupted', 'played.flush']);
+  });
+
+  /** "Words": 300 ms of tone, 40 ms of silence, 300 ms of tone. */
+  const speech = () => {
+    const x = new Float32Array(Math.round(0.64 * 24000));
+    for (let i = 0; i < x.length; i++) if (i < 7200 || i >= 8160) x[i] = 0.3 * Math.sin((2 * Math.PI * 150 * i) / 24000);
+    return x;
+  };
+
+  it('finishes the sound playing and trails off with a sustained tail, instead of stopping mid-sound', () => {
+    const s = speaker();
+    s.play(0, 0, speech());
+    s.control(100, { type: 'pause' });
+    // The tail takes over 90 ms before the sound ends (at 300): 90 ms sustained, then 60 ms fading.
+    const flush = s.sent.at(-1) as { cmd: string; at: number; sampleRate: number };
+    expect(flush.cmd).toBe('flush');
+    expect(flush.at).toBeGreaterThanOrEqual(205);
+    expect(flush.at).toBeLessThanOrEqual(220);
+    expect(flush.sampleRate).toBe(24000);
+    const paused = s.of('playback.paused')[0] as unknown as { at: number; from?: number };
+    expect(paused.at).toBe(flush.at + 150);
+    // The echo reference is cut where the tail takes over, and the tail is added to it.
+    expect(s.of('played.flush').at(-1)).toMatchObject({ at: flush.at });
+    expect((s.out.at(-2) as unknown as { samples: Float32Array }).samples.length).toBe(3600);
+    // No word timings: it carries on from where the sound stopped.
+    expect(paused.from).toBe(flush.at + 90);
+  });
+
+  it('fades out instead when too little of the sound is left to sustain', () => {
+    const s = speaker();
+    s.play(0, 0, speech());
+    s.control(260, { type: 'pause' }); // 40 ms before the quiet point
+    const flush = s.sent.at(-1) as { cmd: string; at: number; releaseMs: number; sampleRate?: number };
+    expect(flush.sampleRate).toBeUndefined();
+    expect(flush.at).toBeGreaterThanOrEqual(295);
+    expect(flush.releaseMs).toBe(40);
+  });
+
+  it('fades out over the release when there is no tail', () => {
+    const s = speaker({ tailMs: 0 });
+    s.play(0, 0, speech());
+    s.control(100, { type: 'pause' });
+    const flush = s.sent.at(-1) as { cmd: string; at: number; releaseMs: number };
+    expect(flush.at).toBeGreaterThanOrEqual(295);
+    expect(flush.at).toBeLessThanOrEqual(310);
+    expect(flush.releaseMs).toBe(40);
+    expect((s.of('playback.paused')[0] as unknown as { at: number }).at).toBe(flush.at + 40);
+  });
+
+  it('resumes from the start of the word it stopped in, fading in', () => {
+    const s = speaker();
+    s.play(0, 0, speech());
+    s.input(0, { type: 'tts.words', rid: 'r0', words: [{ word: 'one', start: 0, end: 7200 }, { word: 'two', start: 8160, end: 15360 }] });
+    s.control(500, { type: 'pause' }); // in the middle of "two" (340 to 640 ms)
+    const paused = s.of('playback.paused')[0] as unknown as { at: number; from: number };
+    expect(paused.at).toBe(640 + 60); // its sound ends with the audio, then the tail
+    expect(paused.from).toBeGreaterThanOrEqual(300);
+    expect(paused.from).toBeLessThanOrEqual(345);
+    s.control(1500, { type: 'resume' });
+    const [at, start] = s.plays().at(-1)!;
+    expect(at).toBe(1500);
+    expect(start).toBe(Math.round((paused.from / 1000) * 24000));
+    const replay = (s.sent.at(-1) as { cmd: string }).cmd;
+    expect(replay).toBe('play');
+  });
+
+  it('lets a cancelled reply finish its sound too, and starts the next one after it', () => {
+    const s = speaker();
+    s.play(0, 0, speech());
+    s.control(100, { type: 'cancel' });
+    const flush = s.sent.at(-1) as { cmd: string; at: number };
+    expect(flush.cmd).toBe('flush');
+    const at = (s.of('playback.interrupted')[0] as unknown as { at: number }).at;
+    expect(at).toBe(flush.at + 150);
+    expect(s.of('played.flush').at(-1)).toMatchObject({ at: flush.at });
   });
 });
