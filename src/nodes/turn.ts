@@ -794,8 +794,10 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       );
     };
 
+    /** A quick yield counts toward backing off only if the user heard some of the reply (told by playback.interrupted). */
+    let countIfHeard = false;
     /** The user takes the floor: stop the reply and start listening. */
-    const yieldFloor = (c: Candidate, why: string) => {
+    const yieldFloor = (c: Candidate, why: string, quick = false) => {
       c.timer?.clear();
       c.wait?.clear();
       candidate = null;
@@ -803,7 +805,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       held = false;
       const wasThinking = state === 'thinking+user';
       decide(wasThinking ? 'continue' : 'interrupt', { why, ms: ctx.now() - c.since, text: c.text });
-      if (!wasThinking && p.backoffAfter > 0 && ++interrupts >= p.backoffAfter) enterBackoff();
+      if (!wasThinking && quick) countIfHeard = p.backoffAfter > 0;
+      else if (!wasThinking && p.backoffAfter > 0 && ++interrupts >= p.backoffAfter) enterBackoff();
       ctx.emit('control', { type: 'cancel' });
       if (wasThinking && last) {
         // They weren't done: resend their turn together with what they say now.
@@ -1014,6 +1017,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             if (!c) commit('aside, after the agent finished', undefined, { aside: true });
           }
         } else if (msg.type === 'playback.interrupted') {
+          // Stopped before a word of it was heard: not a fight over the floor.
+          if (countIfHeard) {
+            countIfHeard = false;
+            if (String(msg.heard ?? '').trim() && ++interrupts >= p.backoffAfter) enterBackoff();
+          }
           // What the user heard before we stopped, for the LLM's history.
           if (last) ctx.emit('turn', { type: 'turn.heard', turnId: last.id, ...(msg.rid ? { rid: msg.rid as string } : {}), text: (msg.heard as string) ?? '' });
           if (aside?.cutting) finishAside('aside');
@@ -1032,7 +1040,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           if (state === 'speaking' && p.yieldWithinMs > 0 && playingSince !== null && ctx.now() - playingSince < p.yieldWithinMs) {
             // Both started into the same silence: the agent backs off at once rather than fight over the floor.
             const c = overlap(msg.at as number, 'user speech (VAD)');
-            if (c && candidate === c) yieldFloor(c, `user spoke ${Math.round(ctx.now() - playingSince)} ms after the agent started`);
+            if (c && candidate === c) yieldFloor(c, `user spoke ${Math.round(ctx.now() - playingSince)} ms after the agent started`, true);
           } else if (state === 'thinking' || state === 'speaking') overlap(msg.at as number, 'user speech (VAD)');
           else if (candidate?.ended !== undefined) {
             // They went on before the words of the last bit came in: one stretch of speech.

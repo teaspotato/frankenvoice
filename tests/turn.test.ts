@@ -459,6 +459,23 @@ describe('backing off after repeated interruptions', () => {
   }
   const said = (h: ReturnType<typeof harness>) => h.out.filter((o) => o.port === 'text' && o.msg.type === 'bc.say').map((o) => o.msg.line);
 
+  it('counts a quick yield toward backing off only if the user heard a word of the reply', () => {
+    const h = harness({ overlap: 'classify', yieldWithinMs: 1000 });
+    const round = (t: number, rid: string, heard: string) => {
+      h.user(t, 'tell me about Tokyo');
+      h.send(t + 500, 'playback', { type: 'playback.start', rid });
+      h.send(t + 700, 'vad', { type: 'vad.speech_start', at: (t + 700) * sr });
+      h.send(t + 710, 'playback', { type: 'playback.interrupted', rid, at: t + 710, heard });
+      h.send(t + 900, 'vad', { type: 'vad.speech_end', at: (t + 900) * sr });
+    };
+    round(1000, 'r0', '');
+    round(3000, 'r1', '');
+    expect(h.decisions()).not.toContain('backoff');
+    round(5000, 'r2', 'Tokyo is');
+    round(7000, 'r3', 'Well,');
+    expect(h.decisions().at(-1)).toBe('backoff');
+  });
+
   it('renders its lines ahead', () => {
     const h = harness();
     expect(h.out.find((o) => o.msg.type === 'bc.lines')?.msg.lines).toContain('You go first.');
