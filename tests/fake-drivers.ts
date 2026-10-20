@@ -180,6 +180,35 @@ const openai: LiveDriver = (req, sink) => {
   return { send() {}, close: () => void (closed = true) };
 };
 
+/**
+ * llama.cpp /completion for the tape: reads the open line and the grammar, and answers like a
+ * plain agent: listens while words come in, responds in the first cell without new words,
+ * continues twice, then finishes. Capped at the grammar's word limit.
+ */
+const llamaCompletion: LiveDriver = (req, sink) => {
+  const { prompt, grammar } = (req as { body: { prompt: string; grammar: string } }).body;
+  const lines = prompt.slice(prompt.lastIndexOf('<channel|>') + '<channel|>'.length).split('\n');
+  const open = lines[lines.length - 1];
+  const max = Number(/\{0,(\d+)\}/.exec(grammar)?.[1] ?? 0) + 1;
+  const cap = (s: string) => `"${s.split(' ').slice(0, max).join(' ')}"`;
+  const lastAnswer = lines.findLastIndex((l) => /: (respond|resume) /.test(l));
+  const heard = lines.slice(lastAnswer + 1, -1).some((l) => /user: "/.test(l));
+  // No new words (the fake mic's noise keeps the VAD busy, so voice doesn't count).
+  const quiet = !/user: "/.test(open);
+  let content = ' listen';
+  if (grammar.includes('" continue "')) {
+    const since = lines.slice(lastAnswer + 1, -1).filter((l) => / continue "/.test(l)).length;
+    content = since >= 2 ? ` finish ${cap('That is all.')}` : ` continue ${cap('and some more words')}`;
+  } else if (heard && quiet) content = ` respond ${cap('Sure, here is an answer')}`;
+  let closed = false;
+  later(jitter(3, 4), () => {
+    if (closed) return;
+    sink.recv({ content, stop_type: 'word', timings: { prompt_n: 12, prompt_ms: 4.2, predicted_n: 6, predicted_ms: 30.1 } });
+    sink.close(null);
+  });
+  return { send() {}, close: () => void (closed = true) };
+};
+
 /** Kyutai on the GPU box: audio, word times and Flushed for each flushed segment; Done and close after Close. */
 const gpuboxTts: LiveDriver = (_req, sink) => {
   let closed = false;
@@ -298,7 +327,7 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, 'tts-canned': ttsCanned, openai, rnnoise, speaker, 'turn-model': turnModel, typesafe };
+export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, 'tts-canned': ttsCanned, openai, 'llama-completion': llamaCompletion, rnnoise, speaker, 'turn-model': turnModel, typesafe };
 
 /** The default pipeline with the turn model on (it is off by default, a big download). */
 export function testConfig(): PipelineConfig {

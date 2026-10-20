@@ -32,7 +32,7 @@ const LEGEND: Record<string, string> = {
     'Turn model scores per 80 ms frame, placed on the audio they had heard: end of turn (blue) and take the floor (orange). Solid: the user; faint: the agent. Green: the backchannel head (the agent could say mm-hmm), green circles where it fired. Dashed: the thresholds.\nDiamonds: events the model committed for the user (top: end of turn, bottom: take the floor); hollow dots: the same for the agent.',
   asr:
     'Bar: a final transcript, from its first word to its last. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the last word to when its result arrived: the ASR latency.',
-  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM. Dots: TypeSafe at a pause in the user\'s speech (green: done, committed; amber: going on, the commit waits for more silence; red: failed).\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.',
+  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM. Dots: TypeSafe at a pause in the user\'s speech (green: done, committed; amber: going on, the commit waits for more silence; red: failed).\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.\nTape mode (turn.tape): bottom row, one call per cell: grey bar from the cell’s end to Gemma’s answer (its latency), then a mark for what it wrote (dot: listen; accent: respond/resume, with the words; LLM colour: continue/finish; green: backchannel; red: dropped or failed); a tick where no call was made. Red diamond: a cut, the unheard words taken off the tape. Hover a cell for its line.',
   interject:
     'Early interjection. Dots: TypeSafe judging the user\'s words so far (grey: still going; green: they just completed something). Outlined bar: an "interrupt?" check with the LLM on those words, until it decided (grey: let them go on) or was dropped. Accent diamond: the LLM wanted to cut in (its line next to it); a line from there to where it was taken at the user\'s pause (accent tick: it took the floor and played; red tick: turn-taking refused it; grey tick: taken, but the LLM could not keep it).',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
@@ -717,6 +717,43 @@ export function Dashboard({
           seqs: b.seqs,
         });
       });
+
+      // The tape (turn.tape): each cell's call, from the cell's end to its answer, and what was written
+      const tapeColor: Record<string, string> = { respond: col.accent, resume: col.accent, continue: col.llm, finish: col.llm, backchannel: col.ok };
+      for (const c of m.tapeCells) {
+        if (c.t1! < t0 || c.t0 > t1) continue;
+        const [ly0, ly1] = laneY.turn;
+        const h = ly1 - ly0;
+        const x0 = x(c.t0);
+        const x1 = Math.max(x(c.t1!), x0 + 1);
+        const color = c.failed || c.dropped ? col.danger : (tapeColor[c.action] ?? col.muted);
+        if (c.ms !== undefined) {
+          g.globalAlpha = 0.18;
+          g.fillStyle = col.muted;
+          g.fillRect(x0, ly0 + h * 0.62, x1 - x0, h * 0.3);
+          g.globalAlpha = 1;
+          mark('turn', c.t1!, color, 0.77, c.action === 'listen' ? 'dot' : 'diamond', c.action === 'listen' ? 1.5 : 3.5);
+        } else vline('turn', c.t0, col.border, 0.66, 0.88);
+        if (c.action !== 'listen') {
+          const said = /"([^"]*)"\s*$/.exec(c.text)?.[1] ?? '';
+          const next = m.tapeCells.find((o) => o.n > c.n && o.action !== 'listen' && o.action !== 'continue');
+          label(said || c.action, x1 + 3, next ? x(next.t0) : x1 + 160, ly0 + h * 0.77, color);
+        }
+        hits.push({
+          lane: 'turn',
+          x0: Math.min(x0, x1 - 3),
+          x1: x1 + 3,
+          y0: ly0 + h * 0.6,
+          y1: ly1,
+          text: `${c.text}\n${c.ms !== undefined ? `call ${c.ms} ms${c.promptN !== undefined ? ` (prefill ${c.promptN} tokens in ${Math.round(c.promptMs ?? 0)} ms)` : ''}` : `no call: ${c.forced ?? ''}`}${c.dropped ? `\ndropped: ${c.dropped}` : ''}${c.failed ? '\ncall failed' : ''}`,
+          seqs: c.seqs,
+        });
+      }
+      for (const k of m.tapeCuts) {
+        if (k.t < t0 || k.t > t1) continue;
+        mark('turn', k.t, col.danger, 0.77, 'diamond', 4);
+        hits.push({ lane: 'turn', x0: x(k.t) - 4, x1: x(k.t) + 4, text: `cut off after “${k.text}”${k.unsaid.length ? `; never heard, off the tape: ${k.unsaid.join(' ')}` : ''}`, seqs: [k.seq] });
+      }
 
       // LLM drafts: a request started on the user's words before the turn was committed (outlined)
       for (const d of m.drafts) {

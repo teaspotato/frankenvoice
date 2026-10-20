@@ -133,6 +133,10 @@ export class TimelineModel {
   /** TypeSafe on whether the user is done at a pause (rules endpointing): p(done), and whether the commit was held. */
   eotChecks: (Marker & { p?: number; hold?: boolean; failed?: boolean; ms: number })[] = [];
   llm: LlmSpan[] = [];
+  /** The tape (turn.tape): a cell per decision, from its boundary (`t0`) to when its line was written (`t1`). */
+  tapeCells: (Span & { n: number; action: string; state: string; ms?: number; forced?: string; dropped?: string; failed?: boolean; promptN?: number; promptMs?: number })[] = [];
+  /** Cuts on the tape: words written but never heard, taken off it. */
+  tapeCuts: (Marker & { unsaid: string[] })[] = [];
   drafts: Draft[] = [];
   openers: Opener[] = [];
   /** TypeSafe's answers on whether the user's words so far end on something complete. */
@@ -404,6 +408,25 @@ export class TimelineModel {
           ...(typeof d.headStartMs === 'number' ? { headStartMs: d.headStartMs } : {}),
           ...(d.interject ? { interject: true } : {}),
         });
+        break;
+      case 'tape.cell':
+        this.tapeCells.push({
+          t0: typeof d.at === 'number' ? d.at : e.t,
+          t1: e.t,
+          n: d.n,
+          action: d.action ?? '',
+          state: d.state ?? '',
+          text: d.line ?? '',
+          seqs: [e.seq],
+          ...(typeof d.ms === 'number' ? { ms: d.ms } : {}),
+          ...(d.forced ? { forced: d.forced } : {}),
+          ...(d.dropped ? { dropped: d.dropped } : {}),
+          ...(d.failed ? { failed: true } : {}),
+          ...(typeof d.promptN === 'number' ? { promptN: d.promptN, promptMs: d.promptMs } : {}),
+        });
+        break;
+      case 'tape.cut':
+        this.tapeCuts.push({ t: e.t, text: d.heard ?? '', unsaid: d.unsaid ?? [], seq: e.seq });
         break;
       case 'turn.eot_check':
         this.eotChecks.push({ t: e.t, text: d.text ?? '', seq: e.seq, ms: d.ms ?? 0, ...(d.failed ? { failed: true } : { p: d.p, hold: !!d.hold }) });

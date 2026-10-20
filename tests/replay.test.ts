@@ -160,6 +160,28 @@ describe('record and replay', () => {
     expect(runtime.trajectory.events).toEqual(run.events);
   }, 15_000);
 
+  it('lets the tape decide each cell (llama.cpp /completion), speaks its words, and replays it exactly', async () => {
+    const c = testConfig();
+    c.turn.variant = 'tape';
+    c.turn.params.tape = { cellMs: 100 };
+    const run = await recordLive(2500, performance, buildGraph(c));
+    const msgs = run.events.filter((e) => e.kind === 'msg').map((e) => ({ node: e.node, ...(e.data as { type: string; action?: string; forced?: string }) }));
+    const cells = msgs.filter((m) => m.type === 'tape.cell');
+    expect(cells.length).toBeGreaterThan(5);
+    expect(cells.some((m) => m.action === 'respond' && !m.forced)).toBe(true);
+    expect(cells.some((m) => m.forced === 'greeting')).toBe(true);
+    // The tape speaks; the LLM stage gets no turns.
+    expect(msgs.some((m) => m.type === 'llm.start' && m.node === 'turn')).toBe(true);
+    expect(msgs.some((m) => m.type === 'llm.start' && m.node === 'llm')).toBe(false);
+    expect(msgs.some((m) => m.type === 'playback.start')).toBe(true);
+    expect(run.events.some((e) => e.kind === 'io.open' && e.node === 'turn' && (e.data as { channel: string }).channel === 'llama-completion')).toBe(true);
+    expect(count(run, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
+    const { runtime, sim } = prepareReplay(decodeBundle(encodeBundle(run)), { registry });
+    sim.runFast();
+    expect(count(runtime.trajectory, (e) => e.kind === 'io.diverge')).toBe(0);
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 15_000);
+
   it('runs the tone TTS mock in place of Kyutai, and replays it exactly', async () => {
     const c = testConfig();
     c.tts.variant = 'tone';

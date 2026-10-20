@@ -35,7 +35,7 @@ export const STAGES: StageDef[] = [
   { id: 'vad', label: 'VAD', variants: { silero: 'vad.silero', firered: 'vad.firered', energy: 'vad.energy' } },
   { id: 'turnmodel', label: 'Turn model', variants: { ssl_turn: 'turnmodel.ssl', off: 'turnmodel.off' } },
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
-  { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
+  { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex', tape: 'turn.tape' } },
   { id: 'interject', label: 'Interjection', variants: { off: 'interject.off', typesafe: 'interject' } },
   { id: 'backchannel', label: 'Backchannels', variants: { on: 'backchannel', off: 'backchannel.off' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
@@ -118,6 +118,8 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     ui: { x: COLUMN[s.id][0], y: COLUMN[s.id][1] },
   }));
   const wantsReference = registry[cleanupType].inputs.some((p) => p.name === 'ref');
+  /** The tape (turn.tape) speaks for the agent itself: the LLM stage gets no turns. */
+  const tape = stageType(c, 'turn') === 'turn.tape';
   const edges = [
     e('mic', 'audio', 'cleanup', 'audio'),
     e('cleanup', 'audio', 'vad', 'audio'),
@@ -140,9 +142,10 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('turnmodel', 'scores', 'backchannel', 'scores'),
     e('turn', 'turn', 'backchannel', 'turn'),
     e('asr', 'transcript', 'backchannel', 'transcript'),
-    e('backchannel', 'text', 'tts', 'text'),
+    // The tape writes its own backchannels: the stage's lines don't reach TTS.
+    ...(tape ? [] : [e('backchannel', 'text', 'tts', 'text')]),
     // Generated backchannels: the LLM writes the line from the conversation so far, on its own slot.
-    ...(registry[stageType(c, 'llm')].inputs.some((p) => p.name === 'bc') && registry[stageType(c, 'backchannel')].outputs.some((p) => p.name === 'ask')
+    ...(!tape && registry[stageType(c, 'llm')].inputs.some((p) => p.name === 'bc') && registry[stageType(c, 'backchannel')].outputs.some((p) => p.name === 'ask')
       ? [e('backchannel', 'ask', 'llm', 'bc'), e('llm', 'text', 'backchannel', 'llm')]
       : []),
     e('llm', 'text', 'tts', 'text'),

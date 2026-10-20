@@ -172,6 +172,29 @@ const openai =
     return { send() {}, close: () => ac.abort() };
   };
 
+/**
+ * llama.cpp's own /completion (the tape: a raw prompt under a grammar), on the server root of the `llm`
+ * upstream (its base ends in /v1). One JSON answer, recorded whole.
+ */
+const completion =
+  (up: Upstreams): LiveDriver =>
+  (req, sink) => {
+    const r = req as { body: Json };
+    const ac = new AbortController();
+    const u = up('llm');
+    (async () => {
+      const res = await post({ ...u, base: u.base?.replace(/\/v1\/?$/, '') }, '/completion', r.body, ac.signal);
+      const text = await res.text();
+      if (!res.ok) return sink.close({ error: { status: res.status, body: text.slice(0, 2000) } });
+      // The answer without the echoed prompt and settings: they would double the recording.
+      const j = JSON.parse(text) as Record<string, Json>;
+      const keep = ['content', 'stop_type', 'stopping_word', 'tokens_cached', 'tokens_evaluated', 'truncated', 'timings', 'id_slot'];
+      sink.recv(Object.fromEntries(keep.filter((k) => k in j).map((k) => [k, j[k]])));
+      sink.close(null);
+    })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
+    return { send() {}, close: () => ac.abort() };
+  };
+
 /** A short title for a finished session, from its transcript. Outside the pipeline, so not recorded. */
 export async function sessionTitle(up: Upstreams, model: string, transcript: string): Promise<string> {
   const res = await post(
@@ -245,6 +268,7 @@ export function serverDrivers(up: Upstreams, o: { modelsDir: string; cannedDir: 
     silero: sileroDriver(ort, (model) => loadModel(MODELS[model] ?? MODELS.v5)),
     firered: fireredDriver(ort, () => loadModel(MODELS.firered)),
     openai: openai(up),
+    'llama-completion': completion(up),
     'gpubox-asr': gpubox,
     'gpubox-tts': gpubox,
     'tts-canned': cannedDriver(up, o.cannedDir),

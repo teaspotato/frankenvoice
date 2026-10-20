@@ -44,7 +44,7 @@ let llmPort = 0;
 /** The live session limit the hub uses (ms; 0: none), set per test. */
 let limitMs = 0;
 let livePort = 0;
-const seen = { asr: 0, tts: 0, llm: 0, auth: [] as string[], ttsQueries: [] as string[], llmBodies: [] as { messages?: { role: string; content: unknown }[] }[] };
+const seen = { asr: 0, tts: 0, llm: 0, completions: 0, auth: [] as string[], ttsQueries: [] as string[], llmBodies: [] as { messages?: { role: string; content: unknown }[] }[] };
 const sessions = mkdtempSync(join(tmpdir(), 'fv-sessions-'));
 
 beforeAll(async () => {
@@ -67,6 +67,15 @@ beforeAll(async () => {
   const llm = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const c of req) chunks.push(c as Buffer);
+    if (req.url === '/completion') {
+      // llama.cpp's own endpoint, on the server root (the tape).
+      seen.completions++;
+      let answer: Json = null;
+      return fakeDrivers['llama-completion']({ body: JSON.parse(Buffer.concat(chunks).toString()) as Json }, {
+        recv: (e) => void (answer = e),
+        close: () => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ...(answer as object), prompt: 'echoed', generation_settings: {} })),
+      }, { now: () => 0 });
+    }
     if (req.url !== '/v1/chat/completions') return res.writeHead(404).end();
     seen.llm++;
     seen.llmBodies.push(JSON.parse(Buffer.concat(chunks).toString()) as { messages?: { role: string; content: unknown }[] });
@@ -186,6 +195,64 @@ describe('the pipeline in the server', () => {
     expect(traj.events.some((e) => e.kind === 'io.recv' && (e.data as { payload?: { type?: string } }).payload?.type === 'late')).toBe(got.lateSent > 0);
     expect(traj.events.filter((e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toEqual([]);
     // The server's recording replays exactly, like one made in the page.
+    const { runtime, sim } = prepareReplay(traj, { registry });
+    sim.runFast();
+    expect(compareTrajectories(traj, runtime.trajectory).identical).toBe(true);
+  }, 20_000);
+
+  it('runs the tape: one /completion per cell on the LLM server root, its words spoken, the recording replayable', async () => {
+    const page = new WebSocket(`ws://127.0.0.1:${livePort}/api/live`);
+    await new Promise((r) => page.once('open', r));
+    let bundle: Uint8Array | undefined;
+    let plays = 0;
+    let micTimer: ReturnType<typeof setInterval> | undefined;
+    const llmBefore = seen.llm;
+    const ended = new Promise<void>((resolve) => {
+      page.on('message', (data: Buffer, binary) => {
+        if (binary) {
+          const { header: h, payload } = unframe(new Uint8Array(data));
+          if (h.k === 'bundle') bundle = payload.slice();
+          if (h.k === 'speaker' && h.cmd === 'play') plays++;
+          return;
+        }
+        const m = JSON.parse(data.toString()) as { type: string; [k: string]: Json };
+        if (m.type === 'saved') resolve();
+        if (m.type === 'mic.open') {
+          const { frameSamples } = m.request as { frameSamples: number };
+          page.send(JSON.stringify({ type: 'mic.ready', label: 'fake page mic', contextSampleRate: 16000, settings: {} }));
+          let n = 0;
+          micTimer = setInterval(() => {
+            const s = new Float32Array(frameSamples);
+            const loud = n % 40 >= 8 && n % 40 < 24;
+            for (let i = 0; i < s.length; i++) s[i] = (Math.random() - 0.5) * (loud ? 0.6 : 0.001);
+            page.send(frame({ k: 'mic', frame: n++, ctxTime: n * 0.032 }, new Uint8Array(s.buffer)));
+          }, 4);
+        }
+        if (m.type === 'mic.close') clearInterval(micTimer);
+      });
+    });
+    const c = defaultConfig();
+    c.vad.variant = 'energy';
+    c.turn.variant = 'tape';
+    c.turn.params.tape = { cellMs: 120 };
+    page.send(JSON.stringify({ type: 'start', graph: buildGraph(c) as unknown as Json, env: {}, autosave: true, title: '' }));
+    await new Promise((r) => setTimeout(r, 2500));
+    page.send(JSON.stringify({ type: 'stop' }));
+    await ended;
+    page.close();
+
+    expect(seen.completions).toBeGreaterThan(3);
+    // The chat endpoint is only asked for the session's title, never for a reply.
+    expect(seen.llmBodies.slice(llmBefore).filter((b) => b.messages?.some((m) => m.role === 'user' && !String(m.content).includes('<transcript>')))).toEqual([]);
+    expect(plays).toBeGreaterThan(0);
+    const traj = decodeBundle(bundle!);
+    const cells = traj.events.filter((e) => e.kind === 'msg' && (e.data as { type: string }).type === 'tape.cell').map((e) => e.data as { action: string; ms?: number; promptN?: number });
+    expect(cells.some((x) => typeof x.ms === 'number' && x.promptN === 12)).toBe(true);
+    expect(cells.some((x) => x.action === 'respond')).toBe(true);
+    // The echoed prompt is not recorded.
+    const recv = traj.events.find((e) => e.kind === 'io.recv' && e.node === 'turn');
+    expect(JSON.stringify(recv?.data)).not.toContain('echoed');
+    expect(traj.events.filter((e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toEqual([]);
     const { runtime, sim } = prepareReplay(traj, { registry });
     sim.runFast();
     expect(compareTrajectories(traj, runtime.trajectory).identical).toBe(true);
