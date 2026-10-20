@@ -109,7 +109,8 @@ install_ui() {  # Node 22 + pnpm, then the app from $FV_APP: pnpm install, and p
     log "node $(node -v) in $ROOT/node"
   fi
   command -v pnpm >/dev/null || npm install -g --silent pnpm@10.28.0 > "$ROOT/logs/install-ui.log" 2>&1
-  mkdir -p "$APP"; rm -rf "$APP/dist"         # keep node_modules; dist is rebuilt or comes from the archive
+  mkdir -p "$APP"                             # keep node_modules; drop files the new archive may no longer have
+  find "$APP" -mindepth 1 -maxdepth 1 ! -name node_modules -exec rm -rf {} +
   tar xzf "$FV_APP" -C "$APP"
   log "installing the UI in $APP"
   (cd "$APP" && CI=1 pnpm install --frozen-lockfile && { [ -f dist/index.html ] || pnpm build; }) >> "$ROOT/logs/install-ui.log" 2>&1 \
