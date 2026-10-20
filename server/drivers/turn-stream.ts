@@ -53,7 +53,13 @@ export class TurnStream {
     const self = new TurnStream();
     self.ort = ort;
     self.K = o.frames;
-    const opts = { executionProviders: ['cpu'], graphOptimizationLevel: 'all' as const };
+    // A few threads, and no spin-waiting between blocks: the GPU services share this CPU.
+    const opts = {
+      executionProviders: ['cpu'],
+      graphOptimizationLevel: 'all' as const,
+      intraOpNumThreads: 4,
+      extra: { session: { intra_op: { allow_spinning: '0' }, inter_op: { allow_spinning: '0' } } },
+    };
     self.enc = await ort.InferenceSession.create(o.encoder, opts);
     self.head = await ort.InferenceSession.create(o.head, opts);
     self.reset();

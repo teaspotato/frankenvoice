@@ -30,11 +30,20 @@ const MODELS: Record<string, string> = {
   v6: asset('../../node_modules/@ricky0123/vad-web/dist/silero_vad_v6.onnx'),
   firered: asset('./firered/stream_vad.onnx'),
 };
+/**
+ * Small models run often (a VAD frame every 32 ms) next to the GPU services: one thread each, and no
+ * spin-waiting between runs (onnxruntime's default spins its pool, burning the CPU the gateway needs).
+ */
+export const quietSession = (threads = 1): ort.InferenceSession.SessionOptions => ({
+  intraOpNumThreads: threads,
+  interOpNumThreads: 1,
+  extra: { session: { intra_op: { allow_spinning: '0' }, inter_op: { allow_spinning: '0' } } },
+});
 const modelBytes = new Map<string, Promise<Uint8Array>>();
 const loadModel = (file: string) => {
   let b = modelBytes.get(file);
   if (!b) modelBytes.set(file, (b = readFile(file).then((x) => new Uint8Array(x))));
-  return b.then((x) => ort.InferenceSession.create(x));
+  return b.then((x) => ort.InferenceSession.create(x, quietSession()));
 };
 
 /** Read a fetch body as Server-Sent Events, yielding each event's data string. Comment lines are dropped. */
@@ -197,7 +206,7 @@ function encoder(model: string): Promise<Encoder> {
         fetch(`${base}/onnx/model_quantized.onnx`).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`${model}: HTTP ${r.status}`)))),
         fetch(`${base}/vocab.txt`).then((r) => (r.ok ? r.text() : Promise.reject(new Error(`${model} vocab: HTTP ${r.status}`)))),
       ]);
-      return loadEncoder(ort, new Uint8Array(onnx), vocab);
+      return loadEncoder(ort, new Uint8Array(onnx), vocab, quietSession());
     })();
     e.catch(() => encoders.delete(model));
     encoders.set(model, e);
