@@ -3,6 +3,7 @@
 
 import type { DriverRegistry, LiveDriver } from '../src/core/world';
 import type { Json } from '../src/core/types';
+import { defaultConfig, type PipelineConfig } from '../src/pipeline';
 
 const jitter = (base: number, spread: number) => base + Math.random() * spread;
 const later = (ms: number, fn: () => void) => setTimeout(fn, ms);
@@ -303,3 +304,13 @@ const speaker: LiveDriver = (_req, sink) => {
 };
 
 export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp, typesafe };
+
+/** The pipeline on the API providers these fakes stand in for (the defaults run on the GPU box). */
+export function apiConfig(): PipelineConfig {
+  const c = defaultConfig();
+  c.asr.params.streaming = { provider: 'deepgram' };
+  c.llm.params.api = { provider: 'anthropic' };
+  c.tts.variant = 'api';
+  c.workers.variant = 'acp';
+  return c;
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildGraph, configFromGraph, defaultConfig } from '../src/pipeline';
+import { buildGraph, configFromGraph, defaultConfig, requiredUpstreams } from '../src/pipeline';
 import { SentenceSplitter } from '../src/nodes/segment';
 import { Framer } from '../src/nodes/audio';
 import { SimScheduler } from '../src/core/scheduler';
@@ -71,6 +71,11 @@ describe('pipeline format', () => {
     const traj = (graph: typeof g) => new Trajectory({ format: TRAJECTORY_FORMAT, formatVersion: 1, id: 't', createdAt: '', mode: 'live', graph, graphHash: '' });
     expect(decodeBundle(encodeBundle(traj(g))).meta.graph).toEqual(g);
     expect(() => decodeBundle(encodeBundle(traj({ ...g, formatVersion: 7 })))).toThrow(/recorded with pipeline format 7/);
+  });
+
+  it('runs on the GPU box by default, with only TypeSafe going out', () => {
+    expect(requiredUpstreams(defaultConfig()).sort()).toEqual(['gpubox', 'openai/custom', 'typesafe']);
+    expect(buildGraph(defaultConfig()).nodes.find((n) => n.id === 'tts')?.type).toBe('tts.kyutai');
   });
 
   it('runs the opener stage between the LLM and TTS', () => {

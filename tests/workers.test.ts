@@ -3,7 +3,8 @@ import { llmNode, cutToHeard } from '../src/nodes/llm';
 import { mockWorkersNode, workersNode } from '../src/nodes/workers';
 import { FLOOR, halfDuplexTurnNode } from '../src/nodes/turn';
 import { DEFAULT_DELEGATE_PROMPT } from '../src/nodes/llm/delegate';
-import { buildGraph, defaultConfig } from '../src/pipeline';
+import { buildGraph } from '../src/pipeline';
+import { apiConfig } from './fake-drivers';
 import { resolveParams, type IOHandlers, type NodeContext, type NodeDef } from '../src/core/node';
 import type { Json, JsonObject, Msg } from '../src/core/types';
 import type { ChatTurn } from '../src/nodes/llm/types';
@@ -483,7 +484,7 @@ describe('mock workers', () => {
 
 describe('wiring', () => {
   it('gives the LLM delegation only while the workers stage is on', () => {
-    const c = defaultConfig();
+    const c = apiConfig();
     const llm = (g: ReturnType<typeof buildGraph>) => g.nodes.find((n) => n.id === 'llm')!.params.delegate;
     expect(llm(buildGraph(c))).toMatchObject({ progress: 'context', quietMs: 800, maxWorkers: 4 });
     expect(buildGraph(c).edges).toContainEqual({ from: { node: 'llm', port: 'workers' }, to: { node: 'workers', port: 'workers' } });

@@ -58,9 +58,13 @@ export const CONFIG_FORMAT = 'frankenvoice-pipeline';
 export function defaultConfig(): PipelineConfig {
   const c = {} as PipelineConfig;
   for (const s of STAGES) c[s.id] = { variant: Object.keys(s.variants)[0], params: {} };
-  c.asr.params.streaming = { provider: 'deepgram' };
-  c.llm.params.api = { provider: 'anthropic' };
+  // Defaults run on the GPU box (Qwen3-ASR, Gemma through its OpenAI-compatible endpoint, Kyutai);
+  // only the TypeSafe stages go out. Delegation needs Anthropic, so workers start off.
+  c.asr.params.streaming = { provider: 'gpubox' };
+  c.llm.params.api = { provider: 'openai-compatible', endpoint: 'custom', model: 'gemma-4-12b-it' };
+  c.tts.variant = 'kyutai-gpubox';
   c.tts.params.api = { provider: 'cartesia' };
+  c.workers.variant = 'off';
   return c;
 }
 

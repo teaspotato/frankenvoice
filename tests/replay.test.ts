@@ -5,14 +5,14 @@ import { LiveWorld, type Delivery } from '../src/core/world';
 import { prepareReplay } from '../src/core/replay';
 import { decodeBundle, encodeBundle } from '../src/core/bundle';
 import { registry } from '../src/nodes';
-import { buildGraph, defaultConfig } from '../src/pipeline';
+import { buildGraph } from '../src/pipeline';
 import type { Trajectory } from '../src/core/trajectory';
 import { GRAPH_FORMAT, GRAPH_FORMAT_VERSION, type GraphSpec } from '../src/core/graph';
 import type { NodeDef } from '../src/core/node';
-import { fakeDrivers } from './fake-drivers';
+import { apiConfig, fakeDrivers } from './fake-drivers';
 
 function testGraph(): GraphSpec {
-  const g = buildGraph(defaultConfig());
+  const g = buildGraph(apiConfig());
   // Also run the deterministic energy VAD alongside Silero.
   g.nodes.push({ id: 'vad2', type: 'vad.energy', params: {} });
   g.edges.push({ from: { node: 'mic', port: 'audio' }, to: { node: 'vad2', port: 'audio' } });
@@ -126,7 +126,7 @@ describe('record and replay', () => {
   }, 10_000);
 
   it('runs early interjection (TypeSafe gate, LLM check, take) and replays it exactly', async () => {
-    const c = defaultConfig();
+    const c = apiConfig();
     c.interject.variant = 'typesafe';
     // From the first word, so the gate runs before the fake session's first turn is committed.
     c.interject.params.typesafe = { minWords: 1 };
@@ -155,7 +155,7 @@ describe('record and replay', () => {
   }, 10_000);
 
   it('runs the browser speech-synthesis node in place of tts + speaker, and replays it exactly', async () => {
-    const c = defaultConfig();
+    const c = apiConfig();
     c.tts.variant = 'browser';
     const g = buildGraph(c);
     expect(g.nodes.some((n) => n.id === 'speaker')).toBe(false);
@@ -173,7 +173,7 @@ describe('record and replay', () => {
 
   for (const variant of ['aec', 'rnnoise'] as const) {
     it(`runs the ${variant} cleanup stage and replays it exactly`, async () => {
-      const c = defaultConfig();
+      const c = apiConfig();
       c.cleanup.variant = variant;
       const g = buildGraph(c);
       expect(g.nodes.find((n) => n.id === 'mic')!.params).toMatchObject({ noiseSuppression: false, autoGainControl: false });
