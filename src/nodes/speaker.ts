@@ -213,8 +213,9 @@ export const speakerNode: NodeDef<Record<string, never>> = {
           if (msg.type === 'cancel') setGain(1);
           if (msg.type === 'cancel' && playing) {
             const at = ctx.now();
-            // Paused, the user heard up to the pause.
-            const heard = heardText(segs.get(rid) ?? [], clock());
+            // Paused, the user heard up to the pause. `heardAt`: keep the reply only up to then (where the user's aside over it started).
+            const until = clock();
+            const heard = heardText(segs.get(rid) ?? [], typeof msg.heardAt === 'number' ? Math.min(msg.heardAt, until) : until);
             if (paused === null) io?.send({ cmd: 'flush' });
             endTimer?.clear();
             endTimer = undefined;

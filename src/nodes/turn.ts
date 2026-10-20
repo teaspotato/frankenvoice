@@ -134,7 +134,7 @@ export const FLOOR: Record<FloorState, Partial<Record<FloorEvent, FloorState>>> 
   // playback_start: the agent speaks unprompted (a background task's result).
   listening: { commit: 'thinking', playback_start: 'speaking' },
   thinking: { playback_start: 'speaking', user_start: 'thinking+user' },
-  // aside: the agent finished the sentence the user spoke over, and stops to take in what they said.
+  // aside: the agent stopped to answer what the user said over it.
   speaking: { playback_end: 'listening', user_start: 'speaking+user', aside: 'listening' },
   'thinking+user': { playback_start: 'speaking+user', backchannel: 'thinking', take_floor: 'listening' },
   'speaking+user': { playback_end: 'listening', backchannel: 'speaking', take_floor: 'listening' },
@@ -198,8 +198,10 @@ export const draftKey = (s: string) =>
  * `maxBackchannelMs`, or on the model's take-the-floor. When the speech ends,
  * its words decide: nothing (noise) or only backchannel words are dropped and
  * the agent goes on from where it stopped; anything else is an aside (a
- * confirmation, a quick addition): the agent goes on to the end of its
- * sentence, stops there and gets the aside as the user's turn. `overlap: legacy` is the earlier rule set:
+ * confirmation, a quick addition): the agent stops at once and the aside is
+ * the user's turn, answered right away. The reply stays in the history only up
+ * to where the user started the aside, so the aside follows the words it was
+ * said over, not the ones the agent said after. `overlap: legacy` is the earlier rule set:
  * `minSpeechMs` of speech that isn't only backchannel words stops the agent.
  *
  * Backing off: after `backoffAfter` interruptions in a row (replies cut off
@@ -296,7 +298,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       key: 'backchannels',
       label: 'Backchannel words',
       type: 'string',
-      default: 'yeah, yes, yep, uh-huh, uh huh, mhm, mm, hmm, ok, okay, right, alright, all right, sure, i see, got it, cool, nice, wow',
+      default: 'yeah, yes, yep, uh-huh, uh huh, mhm, mm, hmm, ok, okay, right, alright, all right, sure, i see, i hear you, i hear that, got it, cool, nice, wow',
       description: 'Without the model: if what the ASR heard so far is only these, keep talking (up to the max below)',
       when: { bargeIn: [true] },
     },
@@ -331,7 +333,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       options: ['classify', 'legacy'],
       default: 'classify',
       description:
-        'classify: cut the agent off, then decide from the words: floor take (drop the reply), aside (go on to the end of the sentence, then answer it) or backchannel/noise (go on). legacy: stop after min speech unless it is only backchannel words.',
+        'classify: cut the agent off, then decide from the words: floor take (drop the reply), aside (stop and answer it at once) or backchannel/noise (go on). legacy: stop after min speech unless it is only backchannel words.',
       when: { bargeIn: [true] },
     },
     {
@@ -375,7 +377,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       type: 'boolean',
       default: true,
       description:
-        'Short speech over the agent with real words (not backchannel words) is an aside: the agent finishes its sentence, then stops and answers it. Off: it is ignored like a backchannel.',
+        'Short speech over the agent with real words (not backchannel words) is an aside: the agent stops and answers it at once. Off: it is ignored like a backchannel.',
       when: { bargeIn: [true], overlap: ['classify'] },
     },
     {
@@ -491,9 +493,6 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let held = false;
     /** Words said over the agent that it should take in, held until its current sentence ends. */
     let aside: { text: string; from: number; to: number; timer?: TimerHandle; cutting?: boolean } | null = null;
-    /** When each sentence of the reply playing now starts (session time), from the speaker. */
-    let segRid: string | null = null;
-    let segStarts: number[] = [];
     const useModel = () => p.useModel && model;
     /** Speech over the agent's voice is judged by its words (classify mode); over its thinking, by the rules. */
     const classifies = () => p.bargeIn && p.overlap === 'classify' && holder(state) === 'speaking';
@@ -821,7 +820,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       aside = null;
       collect(a.text, a.from, a.to);
     };
-    /** The agent stopped at the end of its sentence (or finished): the aside is the user's turn now. */
+    /** The agent stopped (or finished): the aside is the user's turn now. */
     const finishAside = (why: string) => {
       if (!aside) return;
       if (state === 'speaking') go('aside', why);
@@ -829,28 +828,13 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       takeAside();
       commit(why, undefined, { aside: true });
     };
-    /** Stop at the start of the reply's next sentence, if it is known yet (else when the speaker announces it). */
-    const scheduleAside = () => {
-      const a = aside;
-      if (!a || a.timer || a.cutting) return;
-      const next = segStarts.find((t) => t > ctx.now());
-      if (next === undefined) return;
-      a.timer = ctx.setTimer(
-        next - ctx.now(),
-        () => {
-          a.timer = undefined;
-          if (aside !== a) return;
-          // The user is talking again: wait for the sentence after.
-          if (candidate) return scheduleAside();
-          a.cutting = true;
-          ctx.emit('control', { type: 'cancel' });
-          // The speaker answers with playback.interrupted; if it had nothing playing, go on without it.
-          a.timer = ctx.setTimer(300, () => finishAside('aside at sentence end'), 'aside');
-        },
-        'aside',
-      );
-    };
-    const holdAside = (c: Candidate) => {
+    /**
+     * Speech `c` over the agent is an aside: stop the reply now and answer it. The reply is
+     * kept as heard up to where the aside started (`heardAt`), so the history has the aside
+     * where it was said. The speaker answers with playback.interrupted; if it had nothing
+     * playing, go on without it.
+     */
+    const cutForAside = (c: Candidate) => {
       const fin = c.finals.length ? c.finals : null;
       const text = fin ? fin.map((f) => f.text).join(' ') : c.text;
       const span = fin ? { from: fin[0].start, to: fin[fin.length - 1].end } : { from: -1, to: -1 };
@@ -859,7 +843,13 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         if (aside.from < 0) aside.from = span.from;
         if (span.to >= 0) aside.to = span.to;
       } else aside = { text, ...span };
-      scheduleAside();
+      if (aside.cutting) return;
+      const a = aside;
+      a.cutting = true;
+      // Cancelling drops the held audio; the speaker restores its volume for the next reply.
+      held = false;
+      ctx.emit('control', { type: 'cancel', heardAt: c.since });
+      a.timer = ctx.setTimer(300, () => finishAside('aside'), 'aside');
     };
 
     /** Speech over the agent ended and its words are in (or late): decide what it was. */
@@ -869,11 +859,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       c.timer?.clear();
       c.wait?.clear();
       candidate = null;
-      release();
       const kind = !words(c.text).length ? 'noise' : isBackchannel(c.text) || !p.asides ? 'backchannel' : 'aside';
+      if (kind !== 'aside') release();
       decide(kind, { ms: (c.ended ?? ctx.now()) - c.since, text: c.text, why });
-      go('backchannel', kind === 'aside' ? 'aside: held until the end of the sentence' : why);
-      if (kind === 'aside') holdAside(c);
+      go('backchannel', kind === 'aside' ? 'aside: answered at once' : why);
+      if (kind === 'aside') cutForAside(c);
     };
 
     /** Rules without the model: enough speech that isn't only backchannel words. */
@@ -994,20 +984,6 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           go('playback_start', 'playback started');
           // They started talking while it was thinking: don't talk over them while their words are judged.
           if (candidate) holdWhenSustained(candidate);
-        } else if (msg.type === 'playback.segment') {
-          if (msg.rid !== segRid) {
-            segRid = (msg.rid as string) ?? null;
-            segStarts = [];
-          }
-          segStarts.push(msg.at as number);
-          scheduleAside();
-        } else if (msg.type === 'playback.paused') {
-          // The sentences still to come are announced again, with their new times, on resume.
-          segStarts = segStarts.filter((t) => t < (msg.at as number));
-          if (aside?.timer) {
-            aside.timer.clear();
-            aside.timer = undefined;
-          }
         } else if (msg.type === 'playback.end') {
           const c = candidate;
           if (!go('playback_end', 'playback ended')) return;
@@ -1027,7 +1003,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         } else if (msg.type === 'playback.interrupted') {
           // What the user heard before we stopped, for the LLM's history.
           if (last) ctx.emit('turn', { type: 'turn.heard', turnId: last.id, ...(msg.rid ? { rid: msg.rid as string } : {}), text: (msg.heard as string) ?? '' });
-          if (aside?.cutting) finishAside('aside at sentence end');
+          if (aside?.cutting) finishAside('aside');
         }
         return;
       }

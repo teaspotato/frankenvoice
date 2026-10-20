@@ -343,28 +343,32 @@ describe('speech over the agent, classified by its words', () => {
     expect(h.decisions()).toEqual(['candidate', 'interrupt']);
   });
 
-  it('holds an aside until the sentence ends, then stops there and answers it', () => {
+  it('stops at once on an aside and answers it, keeping the reply up to where the aside started', () => {
     const h = speaking();
     over(h, 2000, 2700, 'The blue one.');
     expect(h.decisions()).toEqual(['candidate', 'aside']);
-    expect(controls(h)).toEqual(['pause', 'resume']);
-    h.advance(3990);
-    expect(controls(h)).toEqual(['pause', 'resume']); // still mid-sentence
-    h.advance(4000);
-    expect(controls(h)).toEqual(['pause', 'resume', 'cancel']);
-    h.send(4010, 'playback', { type: 'playback.interrupted', heard: 'Tokyo is big.' });
-    expect(h.out.filter((o) => o.msg.type === 'turn.heard').at(-1)?.msg).toEqual({ type: 'turn.heard', turnId: 'turn-u0', text: 'Tokyo is big.' });
+    // No resume: the paused reply is cancelled, cut back to what was heard before the aside.
+    expect(controls(h)).toEqual(['pause', 'cancel']);
+    expect(h.out.filter((o) => o.msg.type === 'cancel').at(-1)?.msg).toEqual({ type: 'cancel', heardAt: 2000 });
+    h.send(2860, 'playback', { type: 'playback.interrupted', heard: 'Tokyo is' });
+    expect(h.out.filter((o) => o.msg.type === 'turn.heard').at(-1)?.msg).toEqual({ type: 'turn.heard', turnId: 'turn-u0', text: 'Tokyo is' });
     expect(h.last('turn.user')).toMatchObject({ text: 'The blue one.', aside: true });
     expect(h.states().slice(-3)).toEqual(['speaking', 'listening', 'thinking']);
   });
 
-  it('answers an aside when the reply ends before the next sentence', () => {
-    const h = speaking();
+  it('answers an aside even when the speaker reports nothing playing', () => {
+    const h = speaking({});
     over(h, 7500, 8000, 'And Kyoto too.');
     expect(h.decisions()).toEqual(['candidate', 'aside']);
-    h.send(9000, 'playback', { type: 'playback.end', rid: 'r0' });
-    expect(controls(h)).toEqual(['pause', 'resume']);
+    expect(controls(h)).toEqual(['cancel']);
+    h.advance(8500);
     expect(h.last('turn.user')).toMatchObject({ text: 'And Kyoto too.', aside: true });
+  });
+
+  it('treats "I hear that" as a backchannel', () => {
+    const h = speaking();
+    over(h, 2000, 2600, 'I hear that.');
+    expect(h.decisions()).toEqual(['candidate', 'backchannel']);
   });
 
   it('takes the floor when the speech goes on, whatever the words', () => {
@@ -399,15 +403,6 @@ describe('speech over the agent, classified by its words', () => {
     expect(h.decisions()).toEqual(['candidate', 'interrupt']);
   });
 
-  it('includes a held aside when the user then takes the floor', () => {
-    const h = speaking();
-    over(h, 2000, 2600, 'The blue one.');
-    over(h, 3000, 3300, 'Actually wait');
-    expect(h.decisions()).toEqual(['candidate', 'aside', 'candidate', 'interrupt']);
-    h.user(4500, 'make it red', true);
-    expect(h.last('turn.user')?.text).toBe('The blue one. Actually wait make it red');
-  });
-
   it('keeps the old rules for speech over the agent while it is still thinking', () => {
     const h = harness({ overlap: 'classify' });
     h.user(1000, 'how about');
@@ -416,18 +411,6 @@ describe('speech over the agent, classified by its words', () => {
     h.advance(1700);
     expect(h.decisions()).toEqual(['candidate', 'continue']);
     expect(controls(h)).toEqual(['cancel']);
-  });
-
-  it('holds the aside for the sentence after a pause, announced with its new time', () => {
-    const h = speaking();
-    over(h, 2000, 2700, 'The blue one.');
-    // The speaker paused at 2000 and resumed at 2850: the sentence at 4000 now starts at 4850.
-    h.send(2850, 'playback', { type: 'playback.paused', rid: 'r0', at: 2000 });
-    h.send(2850, 'playback', { type: 'playback.segment', rid: 'r0', seg: 1, at: 4850 });
-    h.advance(4500);
-    expect(controls(h)).toEqual(['pause', 'resume']);
-    h.advance(4850);
-    expect(controls(h)).toEqual(['pause', 'resume', 'cancel']);
   });
 
   it('ducks instead with onset: duck, and talks on with onset: none', () => {
