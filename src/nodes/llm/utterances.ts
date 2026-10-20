@@ -20,9 +20,9 @@ export const DEFAULT_FLAGS: UtteranceFlags = { interruptible: true, gate: true }
 
 /** Told to the model once, in the system prompt. */
 export const TAG_INSTRUCTIONS =
-  'Write your reply as lines, one per sentence or clause, each starting with a tag: [i1g1] text. ' +
-  'i: 1 if the listener may cut this line off by talking, 0 if it must be heard to the end (a number, a warning, a very short answer). ' +
-  'g: 1 if you should stop when the listener starts talking right as you begin, 0 to say it regardless (a short acknowledgement).';
+  'Write your reply as lines, one per sentence or clause, each starting with a tag of two flags: [i1g1] text. Almost every line is [i1g1]. ' +
+  "i0: the listener can't cut this line off by talking (only for something they must hear whole, like a number, a code or a safety warning). " +
+  'g0: say this line even if the listener starts talking just as you begin (only for a one or two word acknowledgement, like "Sure." or "Got it.").';
 
 /** Written for the model at the start of each reply: the first tag's opening, so it only writes the flags. */
 export const TAG_PREFILL = '[i';
