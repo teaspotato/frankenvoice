@@ -140,6 +140,24 @@ describe('record and replay', () => {
     expect(runtime.trajectory.events).toEqual(run.events);
   }, 15_000);
 
+  it('says backchannels the LLM writes (own slot, own TTS socket) and replays them exactly', async () => {
+    const c = testConfig();
+    // TypeSafe says whether (the fake one always says yes), the LLM what; the fake user's words come just after each pause.
+    c.backchannel.params.on = { decide: 'typesafe', gapMs: 0, pauseMs: 40 };
+    const run = await recordLive(2500, performance, buildGraph(c));
+    const msgs = run.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; gen?: boolean });
+    expect(msgs.map((m) => m.type)).toContain('llm.bc');
+    expect(msgs.some((m) => m.type === 'bc.say' && m.gen)).toBe(true);
+    const asks = run.events.filter((e) => e.kind === 'io.open' && e.node === 'llm' && (e.data as { request: { body: { id_slot?: number } } }).request.body.id_slot === 1);
+    expect(asks.length).toBeGreaterThan(0);
+    expect(msgs.some((m) => m.type === 'playback.cue')).toBe(true);
+    expect(count(run, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
+    const { runtime, sim } = prepareReplay(decodeBundle(encodeBundle(run)), { registry });
+    sim.runFast();
+    expect(count(runtime.trajectory, (e) => e.kind === 'io.diverge')).toBe(0);
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 15_000);
+
   it('runs the tone TTS mock in place of Kyutai, and replays it exactly', async () => {
     const c = testConfig();
     c.tts.variant = 'tone';

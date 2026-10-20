@@ -52,7 +52,7 @@ function harness(def: NodeDef<never>, params: Record<string, unknown> = {}) {
   return { send, advance, out, of, ios };
 }
 
-const bc = (params: Record<string, unknown> = {}) => harness(backchannelNode as NodeDef<never>, { lines: 'Mm-hmm.\nYeah.', source: 'turn model', ...params });
+const bc = (params: Record<string, unknown> = {}) => harness(backchannelNode as NodeDef<never>, { say: 'canned', lines: 'Mm-hmm.\nYeah.', source: 'turn model', ...params });
 const talk = (h: ReturnType<typeof bc>, from: number, to: number) => {
   h.send(from, 'vad', { type: 'vad.speech_start' });
   h.send(to, 'vad', { type: 'vad.speech_end' });
@@ -220,7 +220,7 @@ describe('backchannel defaults', () => {
 describe('backchannels decided by TypeSafe', () => {
   const answer = (choice: string, confidence: number) => ({ answers: { pick: { type: 'choice', choice, confidence, probabilities: { [choice]: confidence } } } });
   const ts = (params: Record<string, unknown> = {}) =>
-    harness(backchannelNode as NodeDef<never>, { decide: 'typesafe', source: 'pause', options: 'Mm-hmm. | Yeah. = continuer\nOh no. = bad news\n- = nothing', ...params });
+    harness(backchannelNode as NodeDef<never>, { say: 'canned', decide: 'typesafe', source: 'pause', options: 'Mm-hmm. | Yeah. = continuer\nOh no. = bad news\n- = nothing', ...params });
 
   it('asks with the turn\'s ASR words at a pause and says the picked line, taking the lines of an option in turn', () => {
     const h = ts({ gapMs: 0 });

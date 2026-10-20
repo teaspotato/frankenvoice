@@ -154,9 +154,10 @@ const openai: LiveDriver = (req, sink) => {
   const msgs = r.body.messages;
   const prefill = msgs.at(-1)?.role === 'assistant' ? msgs.at(-1)!.content : '';
   const users = msgs.filter((m) => m.role !== 'assistant').length;
-  let tokens: string[] = `Reply number ${users}. This is a second sentence! And a third?`.match(/\S+\s*/g)!;
+  // A request with a grammar is a backchannel's.
+  let tokens: string[] = (r.body as { grammar?: string }).grammar ? ['Oh,', ' okay.'] : `Reply number ${users}. This is a second sentence! And a third?`.match(/\S+\s*/g)!;
   let skip = 0;
-  while (prefill && skip < tokens.length && tokens.slice(0, skip).join('').trimEnd() !== prefill) skip++;
+  while (prefill && !(r.body as { grammar?: string }).grammar && skip < tokens.length && tokens.slice(0, skip).join('').trimEnd() !== prefill) skip++;
   tokens = tokens.slice(skip);
   const cut = r.body.max_tokens !== undefined && tokens.length > r.body.max_tokens;
   if (cut) tokens = tokens.slice(0, r.body.max_tokens);

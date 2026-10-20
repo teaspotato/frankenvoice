@@ -147,7 +147,7 @@ export class TimelineModel {
   /** The page gate stopped playback on its own VAD: when, and when the user's speech started (mic). */
   gateStops: (Marker & { onset?: number })[] = [];
   /** Backchannels the agent said while the user talked, and proposals that were gated off. */
-  backchannels: (Span & { id: string; why?: string })[] = [];
+  backchannels: (Span & { id: string; why?: string; gen?: boolean; askedAt?: number; llmMs?: number; firstAudio?: number; fallback?: string; dropped?: string })[] = [];
   bcSkips: (Marker & { why: string })[] = [];
   agentAudio: AudioBlock[] = [];
   errors: (Marker & { node: string })[] = [];
@@ -493,16 +493,33 @@ export class TimelineModel {
         break;
       }
       case 'bc.say':
-        this.backchannels.push({ t0: e.t, text: d.line ?? '', id: d.id ?? '', why: d.why, seqs: [e.seq] });
+        this.backchannels.push({
+          t0: e.t,
+          text: d.line ?? '',
+          id: d.id ?? '',
+          why: d.why,
+          seqs: [e.seq],
+          ...(d.gen ? { gen: true, askedAt: d.askedAt, llmMs: d.ms } : {}),
+          ...(d.fallback ? { fallback: d.fallback } : {}),
+        });
         break;
+      case 'tts.cue_dropped': {
+        const b = this.backchannels.find((x) => x.id === d.rid);
+        if (b) {
+          b.dropped = d.why ?? 'dropped';
+          b.seqs.push(e.seq);
+        }
+        break;
+      }
       case 'bc.skip':
         this.bcSkips.push({ t: e.t, text: d.reason ?? '', why: d.why ?? '', seq: e.seq });
         break;
       case 'playback.cue': {
         const b = this.backchannels.find((x) => x.id === d.rid);
         if (b) {
-          b.t0 = d.at ?? b.t0;
-          b.t1 = d.end;
+          // A streamed line plays in pieces: it starts with the first.
+          if (b.firstAudio === undefined) b.t0 = b.firstAudio = d.at ?? b.t0;
+          b.t1 = Math.max(b.t1 ?? 0, d.end ?? 0);
           b.seqs.push(e.seq);
         }
         break;

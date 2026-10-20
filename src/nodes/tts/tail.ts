@@ -78,3 +78,32 @@ export function addTail(y: Float32Array, rate: number, tailMs: number): Float32A
   }
   return Float32Array.from(y);
 }
+
+/**
+ * A tail for audio that has already gone out (a streamed backchannel): `last` is its final 80 ms or
+ * more; returns only what follows it, its last sound sustained over `tailMs` and faded out. The
+ * sustained sound is spliced in where its waveform best continues the end of `last`.
+ */
+export function tailAfter(last: Float32Array, rate: number, tailMs: number): Float32Array<ArrayBuffer> {
+  const tail = Math.round((tailMs / 1000) * rate);
+  const seg = Math.round(rate * 0.08);
+  if (tail <= 0 || last.length < seg) return new Float32Array(0);
+  const src = last.subarray(last.length - seg);
+  const ext = stretch(src, seg + tail, rate);
+  // Where in the stretched sound the end of `src` is best continued: compare the last few ms.
+  const L = Math.round(rate * 0.004);
+  let best = seg;
+  let bestErr = Infinity;
+  for (let k = Math.max(L, seg >> 1); k <= seg; k++) {
+    let err = 0;
+    for (let i = 0; i < L; i++) {
+      const d = ext[k - L + i] - src[seg - L + i];
+      err += d * d;
+    }
+    if (err < bestErr) [bestErr, best] = [err, k];
+  }
+  const n = Math.min(tail, ext.length - best);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = ext[best + i] * (0.5 + 0.5 * Math.cos((Math.PI * i) / n));
+  return out;
+}

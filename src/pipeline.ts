@@ -141,6 +141,10 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('turn', 'turn', 'backchannel', 'turn'),
     e('asr', 'transcript', 'backchannel', 'transcript'),
     e('backchannel', 'text', 'tts', 'text'),
+    // Generated backchannels: the LLM writes the line from the conversation so far, on its own slot.
+    ...(registry[stageType(c, 'llm')].inputs.some((p) => p.name === 'bc') && registry[stageType(c, 'backchannel')].outputs.some((p) => p.name === 'ask')
+      ? [e('backchannel', 'ask', 'llm', 'bc'), e('llm', 'text', 'backchannel', 'llm')]
+      : []),
     e('llm', 'text', 'tts', 'text'),
     e('llm', 'text', 'opener', 'text'),
     // The opener may pick its line from the user's words.

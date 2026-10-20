@@ -76,6 +76,12 @@ const DEFAULT_SYSTEM =
  * a kept draft is kept; the history records the committed words, marked as
  * cut off, without the prompt.
  *
+ * A `bc.ask` (from the backchannel stage) has the model write a backchannel now: the history as a
+ * reply would send it, then the user's words so far with the ask's prompt as the last user turn,
+ * and its prefill as the start of the answer, on its own llama.cpp slot (`bcSlot`; replies run on
+ * `slot`), so the reply's cached prefix stays. Neither the ask nor the answer goes into the history.
+ * The answer comes back whole as `llm.bc`; `bc.drop` cancels it.
+ *
  * Paced (the scheduler's `sched.config` says so): a reply, and a draft, first asks for `firstTokens`
  * tokens. A request that stops at its token limit leaves the reply open (`llm.chunk`), and each
  * `sched.grant` continues it: the same messages plus the text so far as the assistant's turn, which
@@ -91,6 +97,7 @@ export const llmNode: NodeDef = {
     { name: 'control', type: 'control' },
     { name: 'interject', type: 'interject', description: 'interject.check / interject.drop: whether to cut in on the words so far' },
     { name: 'sched', type: 'control', description: 'The scheduler: sched.config, sched.grant (write this many more tokens)' },
+    { name: 'bc', type: 'backchannel', description: 'bc.ask / bc.drop: write a backchannel from the conversation so far' },
   ],
   outputs: [{ name: 'text', type: 'text' }],
   params: [
@@ -98,12 +105,21 @@ export const llmNode: NodeDef = {
     { key: 'maxTokens', label: 'Max tokens', type: 'number', default: 4096 },
     { key: 'extraBody', label: 'Extra request body (JSON)', type: 'text', default: '', description: 'Merged into the request, e.g. {"temperature":0.7}' },
     { key: 'system', label: 'System prompt', type: 'text', default: DEFAULT_SYSTEM },
+    {
+      key: 'slot',
+      label: 'Reply slot',
+      type: 'number',
+      default: 0,
+      description: 'llama.cpp slot (id_slot) for replies and drafts, so backchannels never evict their prompt cache. -1: any.',
+    },
+    { key: 'bcSlot', label: 'Backchannel slot', type: 'number', default: 1, description: 'llama.cpp slot for backchannels. -1: any.' },
   ],
   channels: [{ name: 'openai', description: 'Chat Completions SSE (parsed data lines)' }],
   requires: () => ['llm'],
   create(ctx) {
     const p = ctx.params as JsonObject;
-    const reqParams: JsonObject = { ...p };
+    /** Replies and drafts run on their slot; interjection checks on any. */
+    const reqParams: JsonObject = { ...p, idSlot: Number(p.slot ?? -1) };
     const history: ChatTurn[] = [];
     let n = 0;
     type Io = ReturnType<typeof ctx.io.open>;
@@ -273,7 +289,7 @@ export const llmNode: NodeDef = {
       ctx.emit('text', { type: 'llm.check', rid: r.rid, checkId: r.checkId!, text });
       check = r;
       // A check is a reflex: a short answer.
-      send(r, historyFor(user, msg.replaces), { ...reqParams, maxTokens: Math.min(Number(reqParams.maxTokens) || CHECK_MAX_TOKENS, CHECK_MAX_TOKENS) });
+      send(r, historyFor(user, msg.replaces), { ...reqParams, idSlot: -1, maxTokens: Math.min(Number(reqParams.maxTokens) || CHECK_MAX_TOKENS, CHECK_MAX_TOKENS) });
     };
     const dropDraft = (why: string) => {
       if (!draft) return;
@@ -366,8 +382,68 @@ export const llmNode: NodeDef = {
       send(r, [...history, { role: 'assistant', text: prefix }], reqParams, tokens);
     };
 
+    /** The backchannel being written, if any. */
+    let bc: { id: string; io: Io; t0: number; text: string; first?: number; done?: boolean } | undefined;
+    const dropBc = (why: string) => {
+      const b = bc;
+      if (!b) return;
+      bc = undefined;
+      if (!b.io.closed) b.io.close({ status: 'cancelled' });
+      ctx.log('debug', 'backchannel request dropped', { id: b.id, why });
+    };
+    const askBc = (msg: Msg) => {
+      dropBc('asked again');
+      const user: ChatTurn = { role: 'user', text: `${String(msg.text ?? '')}\n\n${String(msg.prompt ?? '')}`.trim() };
+      const prefill = String(msg.prefill ?? '');
+      // The history exactly as a reply would send it, so the prefix matches the reply's.
+      const turns: ChatTurn[] = [...history, user, ...(prefill ? [{ role: 'assistant' as const, text: prefill }] : [])];
+      let request: Json;
+      try {
+        const built = adapter.buildRequest(turns, { ...reqParams, idSlot: Number(p.bcSlot ?? -1) }) as JsonObject;
+        request = { ...built, body: { ...(built.body as JsonObject), ...((msg.body as JsonObject) ?? {}) } };
+      } catch (e) {
+        ctx.emit('text', { type: 'llm.bc', id: msg.id as string, status: 'error', text: '', error: String(e) });
+        return;
+      }
+      const parser = adapter.parser();
+      const b: NonNullable<typeof bc> = { id: msg.id as string, t0: ctx.now(), text: '', io: undefined as unknown as Io };
+      bc = b;
+      const route = (events: Events) => {
+        for (const ev of events) {
+          if (bc !== b || b.done) return;
+          if (ev.type === 'delta') {
+            b.first ??= ctx.now();
+            b.text += ev.text;
+          } else if (ev.type === 'end' || ev.type === 'error') {
+            b.done = true;
+            bc = undefined;
+            if (!b.io.closed) b.io.close({ status: 'done' });
+            const status = ev.type === 'end' ? 'done' : 'error';
+            ctx.emit('text', {
+              type: 'llm.bc',
+              id: b.id,
+              status,
+              text: b.text,
+              ms: Math.round(ctx.now() - b.t0),
+              firstMs: b.first === undefined ? null : Math.round(b.first - b.t0),
+              ...(ev.type === 'error' ? { error: ev.error } : { stopReason: ev.stopReason }),
+            });
+          }
+        }
+      };
+      b.io = ctx.io.open(adapter.channel, request, {
+        onRecv: (data) => route(parser.recv(data)),
+        onClose: (data) => route(parser.close(data)),
+      });
+    };
+
     return {
       onInput(port, msg) {
+        if (port === 'bc') {
+          if (msg.type === 'bc.ask') askBc(msg);
+          else if (msg.type === 'bc.drop' && bc?.id === msg.id) dropBc(String(msg.why ?? 'dropped'));
+          return;
+        }
         if (port === 'control') {
           if (msg.type === 'cancel') {
             dropDraft('cancelled');
@@ -421,6 +497,7 @@ export const llmNode: NodeDef = {
         commitTurn(msg);
       },
       stop() {
+        dropBc('stopped');
         dropDraft('stopped');
         endCheck('dropped', 'stopped');
         finish('cancelled');

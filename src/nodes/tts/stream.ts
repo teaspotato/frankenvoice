@@ -1,6 +1,6 @@
 import type { NodeDef } from '../../core/node';
 import type { Json, JsonObject, Msg } from '../../core/types';
-import { addTail } from './tail';
+import { addTail, tailAfter } from './tail';
 
 interface StreamParams {
   voice: string;
@@ -277,6 +277,59 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       ctx.emit('audio', { type: 'tts.cue_end', rid: id, text });
     };
 
+    /**
+     * Generated backchannels, by id: a socket of their own (not the reply's), opened while the LLM
+     * writes the line. Their audio plays as a cue as it arrives, and the line's last sound is
+     * sustained and faded over `tailMs` at its end. Nothing stops one once its audio has started.
+     */
+    type GenCue = { id: string; io: ReturnType<typeof ctx.io.open>; decode: (b: Uint8Array) => Float32Array; last: Float32Array; tailMs: number; started: boolean; text?: string };
+    const genCues = new Map<string, GenCue>();
+    const prepCue = (id: string) => {
+      if (genCues.has(id)) return genCues.get(id)!;
+      let c!: GenCue;
+      const io = ctx.io.open(CHANNEL, request(), {
+        onRecv(_data: Json, bin) {
+          if (!bin || genCues.get(id) !== c) return;
+          const out = c.decode(bin);
+          if (!out.length) return;
+          c.started = true;
+          // The last 80 ms seen, for the tail.
+          const keep = Math.round(p.sampleRate * 0.08);
+          const all = new Float32Array(c.last.length + out.length);
+          all.set(c.last);
+          all.set(out, c.last.length);
+          c.last = all.slice(Math.max(0, all.length - keep));
+          const ref = ctx.media.append('audio', out, p.sampleRate);
+          ctx.emit('audio', { type: 'audio', ...ref, sampleRate: p.sampleRate, samples: out, rid: id, cue: true });
+        },
+        onClose(data) {
+          if (genCues.get(id) !== c) return;
+          genCues.delete(id);
+          if (data && (data as { error?: unknown }).error) ctx.log('warn', 'backchannel TTS failed', data);
+          if (c.started && c.tailMs > 0) {
+            // Only the sustained part: the line's own audio already went out.
+            const ext = tailAfter(c.last, p.sampleRate, c.tailMs);
+            if (ext.length) {
+              const ref = ctx.media.append('audio', ext, p.sampleRate);
+              ctx.emit('audio', { type: 'audio', ...ref, sampleRate: p.sampleRate, samples: ext, rid: id, cue: true });
+            }
+          }
+          ctx.emit('audio', { type: 'tts.cue_end', rid: id, text: c.text ?? '', ...(c.started ? {} : { silent: true }) });
+        },
+      });
+      c = { id, io, decode: decoder(), last: new Float32Array(), tailMs: 0, started: false };
+      genCues.set(id, c);
+      return c;
+    };
+    /** Close a generated backchannel's socket; with `unheard`, only if none of its audio has played. */
+    const dropCue = (id: string, unheard: boolean, why: string) => {
+      const c = genCues.get(id);
+      if (!c || (unheard && c.started)) return;
+      genCues.delete(id);
+      if (!c.io.closed) c.io.close({ status: 'cancelled' });
+      ctx.emit('audio', { type: 'tts.cue_dropped', rid: id, why });
+    };
+
     const start = (rid: string) => {
       // Set right after the socket opens; its handlers only run later.
       let r!: Reply;
@@ -363,10 +416,26 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
           case 'bc.lines':
             prerender(msg.lines as string[]);
             break;
-          case 'bc.say':
+          case 'bc.prep':
+            prepCue(msg.id as string);
+            break;
+          case 'bc.drop':
+            dropCue(msg.id as string, !!msg.unheard, String(msg.why ?? 'dropped'));
+            break;
+          case 'bc.say': {
+            if (msg.gen) {
+              const c = prepCue(msg.id as string);
+              c.text = String(msg.line);
+              c.tailMs = Number(msg.tailMs ?? 0);
+              c.io.send({ type: 'Speak', text: c.text });
+              c.io.send({ type: 'Close' });
+              break;
+            }
+            dropCue(msg.id as string, false, 'canned line said instead');
             // The take, or else the line itself if that take never rendered.
             playCue(msg.id as string, (canned.has(msg.take as string) ? msg.take : msg.line) as string, Number(msg.tailMs ?? 0));
             break;
+          }
           case 'opener.say':
           case 'llm.delta': {
             if (!r || r.rid !== msg.rid) return;
@@ -387,6 +456,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       },
       stop() {
         cancel();
+        for (const id of [...genCues.keys()]) dropCue(id, false, 'stopped');
       },
     };
   },

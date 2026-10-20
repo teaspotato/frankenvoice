@@ -203,6 +203,8 @@ export const speakerNode: NodeDef<SpeakerParams> = {
 
     /** Backchannels playing or recently played; they play on their own output, which a flush doesn't stop. */
     let cues: Chunk[] = [];
+    /** When each backchannel's audio so far ends, so its next piece follows on. */
+    const cueEnd = new Map<string, number>();
     /** The reply's output was flushed at `at`: cut the echo reference there, but put back the cues still sounding. */
     const flushPlayed = (at: number) => {
       ctx.emit('played', { type: 'played.flush', at });
@@ -436,8 +438,10 @@ export const speakerNode: NodeDef<SpeakerParams> = {
         }
         if (!isAudioMsg(msg)) return;
         if (msg.cue) {
-          // A backchannel: plays now, over whatever is playing, and starts no reply.
-          const at = ctx.now();
+          // A backchannel: plays now, over whatever is playing, and starts no reply; nothing stops it.
+          // A streamed one (generated) comes in pieces: each plays right after the one before.
+          const prev = cueEnd.get(msg.rid as string);
+          const at = Math.max(ctx.now(), prev ?? -Infinity);
           io?.send({ cmd: 'cue', at, sampleRate: msg.sampleRate }, {
             bin: bytesFromF32(msg.samples),
             media: { track: msg.track, start: msg.start, end: msg.end },
@@ -445,7 +449,10 @@ export const speakerNode: NodeDef<SpeakerParams> = {
           });
           ctx.emit('played', { type: 'audio', track: msg.track, start: msg.start, end: msg.end, sampleRate: msg.sampleRate, samples: msg.samples, at, cue: true });
           cues = [...cues.filter((c) => c.at + (c.samples.length / c.sampleRate) * 1000 > at), { at, track: msg.track, start: msg.start, end: msg.end, sampleRate: msg.sampleRate, samples: msg.samples }];
-          ctx.emit('playback', { type: 'playback.cue', rid: msg.rid as Json, at, end: at + (msg.samples.length / msg.sampleRate) * 1000 });
+          const end = at + (msg.samples.length / msg.sampleRate) * 1000;
+          for (const [k, t] of cueEnd) if (t < at - 5000) cueEnd.delete(k);
+          cueEnd.set(msg.rid as string, end);
+          ctx.emit('playback', { type: 'playback.cue', rid: msg.rid as Json, at, end, ...(prev !== undefined ? { more: true } : {}) });
           return;
         }
         const r = (msg.rid as string) ?? null;

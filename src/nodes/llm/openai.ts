@@ -25,6 +25,8 @@ export const openaiCompatAdapter: LlmAdapter = {
         messages,
         stream: true,
         ...(p.maxTokens ? { max_tokens: p.maxTokens } : {}),
+        // llama.cpp: run on this slot (its prompt cache), so other requests don't evict it.
+        ...(typeof p.idSlot === 'number' && p.idSlot >= 0 ? { id_slot: p.idSlot } : {}),
         ...extra,
       },
     };
