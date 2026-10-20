@@ -65,6 +65,8 @@ export function defaultConfig(): PipelineConfig {
   c.tts.variant = 'kyutai-gpubox';
   c.tts.params.api = { provider: 'cartesia' };
   c.workers.variant = 'off';
+  // The turn model is a big download; it loads only once picked.
+  c.turnmodel.variant = 'off';
   return c;
 }
 

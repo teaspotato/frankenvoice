@@ -305,12 +305,13 @@ const speaker: LiveDriver = (_req, sink) => {
 
 export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp, typesafe };
 
-/** The pipeline on the API providers these fakes stand in for (the defaults run on the GPU box). */
+/** The pipeline on the API providers these fakes stand in for, with the turn model (the defaults run on the GPU box without it). */
 export function apiConfig(): PipelineConfig {
   const c = defaultConfig();
   c.asr.params.streaming = { provider: 'deepgram' };
   c.llm.params.api = { provider: 'anthropic' };
   c.tts.variant = 'api';
   c.workers.variant = 'acp';
+  c.turnmodel.variant = 'ssl_turn';
   return c;
 }
