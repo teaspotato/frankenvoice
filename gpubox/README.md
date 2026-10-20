@@ -10,7 +10,7 @@ is in [PROTOCOL.md](PROTOCOL.md); the LLM is plain OpenAI `POST /v1/chat/complet
 | Process | Venv | Port | What it does |
 |---|---|---|---|
 | `asr` | `v-asr` (sglang-omni 0.1.8) | 127.0.0.1:8101 | `sgl-omni serve` Qwen3-ASR-1.7B (or `ASR_MODEL`) with FP8 weights, `mem_fraction_static 0.15`, `max_running_requests 8` |
-| `llm` | none (prebuilt llama.cpp `b11753`, CUDA) | 127.0.0.1:8103 | `llama-server`: `google/gemma-4-12B-it-qat-q4_0-gguf` (official QAT Q4_0) + MTP draft head from `ggml-org/gemma-4-12B-it-GGUF`, 4 slots x 8k context, q8_0 KV cache, thinking off |
+| `llm` | none (prebuilt llama.cpp `b11753`, CUDA) | 127.0.0.1:8103 | `llama-server`: `google/gemma-4-12B-it-qat-q4_0-gguf` (official QAT Q4_0) + MTP draft head from `ggml-org/gemma-4-12B-it-GGUF`, 2 slots x 4k context, q8_0 KV cache with a full-size sliding-window cache (`--swa-full`, so a diverging prompt reuses its prefix), thinking off |
 | `tts` | `v-tts` (moshi 0.2.13) | 127.0.0.1:8102 | `kyutai_tts.py`: Kyutai streaming generation, one reply at a time |
 | `gateway` | `v-gw` (qwen-asr 0.0.6, FastAPI) | 0.0.0.0:8000 | `server.py`: auth, ASR segmenting/partials/finals, Qwen3-ForcedAligner-0.6B, relays `/v1/tts`, passes `/v1/chat/completions` and `/v1/models` through to `llm` |
 | `tunnel` | none | none | `cloudflared tunnel --url http://localhost:8000` (quick tunnel, random `*.trycloudflare.com`) |
@@ -49,7 +49,7 @@ The tunnel keeps its URL as long as the `tunnel` process lives.
 
 Environment variables: `GPUBOX_ROOT` (venvs, logs, pid files; default `/content` if it exists, else `~/gpubox`),
 `GPUBOX_TOKEN` (default: random, saved in `$ROOT/gpubox.token`), `ASR_MODEL` (`Qwen/Qwen3-ASR-1.7B`, or
-`Qwen/Qwen3-ASR-0.6B`), `ASR_MEM` (0.15), `NO_LLM=1`, `LLM_CTX` (32768, shared by the slots), `LLM_SLOTS` (4),
+`Qwen/Qwen3-ASR-0.6B`), `ASR_MEM` (0.15), `NO_LLM=1`, `LLM_CTX` (8192, shared by the slots), `LLM_SLOTS` (2), `LLM_SWA_FULL` (1; at 32k it needs 5.4 GB),
 `LLM_MTP` (1), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
 `NO_UI=1`, `FV_APP` (app archive, default `$ROOT/frankenvoice.tar.gz`).
 Logs are in `$ROOT/logs/{asr,llm,tts,gateway,tunnel,ui,ui-tunnel}.log`. Model files for the LLM are in `$ROOT/models`, llama.cpp

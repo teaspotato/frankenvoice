@@ -14,7 +14,7 @@
 #   ASR_MODEL     Qwen/Qwen3-ASR-1.7B (default) or Qwen/Qwen3-ASR-0.6B
 #   ASR_MEM       sglang mem_fraction_static (default 0.15). It is a fraction of the GPU memory that is FREE
 #                 when ASR starts, which is why ASR starts first.
-#   NO_LLM=1      skip the LLM;  LLM_CTX (32768 tokens, shared by the slots), LLM_SLOTS (4), LLM_MTP (1 = MTP
+#   NO_LLM=1      skip the LLM;  LLM_CTX (8192 tokens, shared by the slots), LLM_SLOTS (2), LLM_SWA_FULL (1), LLM_MTP (1 = MTP
 #                 speculative decoding on)
 #   NO_TUNNEL=1   skip cloudflared
 #   NO_UI=1       skip the hosted Frankenvoice UI (proxy on :8787 + its own tunnel). The app comes from
@@ -41,7 +41,7 @@ LLM_MMPROJ=mmproj-gemma-4-12b-it-qat-q4_0.gguf
 LLM_MTP_REPO=ggml-org/gemma-4-12B-it-GGUF          # MTP draft head for speculative decoding
 LLM_MTP_FILE=mtp-gemma-4-12B-it-Q4_0.gguf
 LLM_NAME=gemma-4-12b-it
-LLM_CTX=${LLM_CTX:-32768}; LLM_SLOTS=${LLM_SLOTS:-4}; LLM_MTP=${LLM_MTP:-1}
+LLM_CTX=${LLM_CTX:-8192}; LLM_SLOTS=${LLM_SLOTS:-2}; LLM_MTP=${LLM_MTP:-1}; LLM_SWA_FULL=${LLM_SWA_FULL:-1}
 
 log() { echo "[setup $(date +%H:%M:%S)] $*"; }
 
@@ -176,9 +176,12 @@ start() {
     # (an edited last turn), and checkpoints cost ~400 ms per request; --cache-ram 0: no host-RAM copy per request
     local d; d=$(llama_dir)
     local mtp=(); [ "$LLM_MTP" = 1 ] && mtp=(--spec-type draft-mtp -md "$ROOT/models/$LLM_MTP_FILE")
+    # --swa-full: a full-size sliding-window cache, so a prompt that diverges from the slot's cached
+    # tokens (a cancelled draft, a new user turn after a reply) reuses the shared prefix instead of re-reading it all
+    local swa=(); [ "$LLM_SWA_FULL" = 1 ] && swa=(--swa-full)
     LD_LIBRARY_PATH="$d:${LD_LIBRARY_PATH:-}" spawn llm "$d/llama-server" -m "$ROOT/models/$LLM_FILE" \
         --mmproj "$ROOT/models/$LLM_MMPROJ" --alias $LLM_NAME --host 127.0.0.1 --port $LLM_PORT \
-        -ngl 999 -fa on -c "$LLM_CTX" -np "$LLM_SLOTS" -ctk q8_0 -ctv q8_0 --ctx-checkpoints 0 --cache-ram 0 \
+        -ngl 999 -fa on -c "$LLM_CTX" -np "$LLM_SLOTS" -ctk q8_0 -ctv q8_0 --ctx-checkpoints 0 --cache-ram 0 "${swa[@]}" \
         --jinja --reasoning off "${mtp[@]}"
     wait_http llm "http://127.0.0.1:$LLM_PORT/health" 600 || return 1
   fi
