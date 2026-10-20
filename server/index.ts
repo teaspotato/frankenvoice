@@ -4,12 +4,13 @@
 // session bundles and the settings edited in the web UI (keys, base URLs).
 
 import { spawn } from 'node:child_process';
+import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, extname, join, resolve, sep } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 
 try {
@@ -19,6 +20,13 @@ try {
 }
 
 const PORT = Number(process.env.FV_PROXY_PORT ?? 8787);
+/**
+ * Hosted mode (e.g. on the GPU box, behind a tunnel): the proxy also serves the built UI from
+ * FV_STATIC_DIR, and instead of local-only access every request needs FV_HOST_TOKEN, given once as
+ * `?token=` and kept in a cookie.
+ */
+const HOST_TOKEN = process.env.FV_HOST_TOKEN || '';
+const STATIC_DIR = process.env.FV_STATIC_DIR ? resolve(process.env.FV_STATIC_DIR) : '';
 
 /**
  * Every setting can come from three places, highest first: the web UI (saved
@@ -169,6 +177,51 @@ function localOnly(req: IncomingMessage): boolean {
   }
 }
 
+const sameToken = (got: string) => {
+  const a = Buffer.from(got);
+  const b = Buffer.from(HOST_TOKEN);
+  return a.length === b.length && timingSafeEqual(a, b);
+};
+const cookieToken = (req: IncomingMessage) => /(?:^|;\s*)fv_token=([^;]*)/.exec(req.headers.cookie ?? '')?.[1] ?? '';
+
+/** Hosted mode: same-origin requests carrying the token cookie. Otherwise only the local UI. */
+function allowed(req: IncomingMessage): boolean {
+  if (!HOST_TOKEN) return localOnly(req);
+  const origin = req.headers.origin;
+  if (origin) {
+    try {
+      if (new URL(origin).host !== req.headers.host) return false;
+    } catch {
+      return false;
+    }
+  }
+  return sameToken(decodeURIComponent(cookieToken(req)));
+}
+
+const TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript',
+  '.mjs': 'text/javascript',
+  '.css': 'text/css',
+  '.wasm': 'application/wasm',
+  '.json': 'application/json',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.onnx': 'application/octet-stream',
+};
+
+/** The built UI; unknown paths get index.html. */
+async function serveStatic(p: string, res: ServerResponse) {
+  let file = resolve(STATIC_DIR, '.' + decodeURIComponent(p));
+  if (file !== STATIC_DIR && !file.startsWith(STATIC_DIR + sep)) return json(res, 400, { error: 'bad path' });
+  if (!(await stat(file).catch(() => null))?.isFile()) file = join(STATIC_DIR, 'index.html');
+  res.writeHead(200, {
+    'content-type': TYPES[extname(file)] ?? 'application/octet-stream',
+    'cache-control': file.includes(`${sep}assets${sep}`) ? 'public, max-age=31536000, immutable' : 'no-cache',
+  });
+  res.end(await readFile(file));
+}
+
 const DROP_REQ = new Set(['host', 'connection', 'content-length', 'x-api-key', 'authorization', 'origin', 'referer', 'cookie', 'anthropic-dangerous-direct-browser-access']);
 const DROP_RES = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection']);
 
@@ -258,7 +311,20 @@ async function sessions(req: IncomingMessage, res: ServerResponse, id: string | 
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://local');
   const p = url.pathname;
-  if (!localOnly(req)) return json(res, 403, { error: 'the proxy only accepts requests from the local UI' });
+  // Hosted mode: `?token=` on a page load sets the cookie, then the token is dropped from the URL.
+  const given = url.searchParams.get('token');
+  if (HOST_TOKEN && given !== null && req.method === 'GET' && !p.startsWith('/api/')) {
+    if (!sameToken(given)) return json(res, 403, { error: 'wrong token' });
+    url.searchParams.delete('token');
+    res.writeHead(302, {
+      'set-cookie': `fv_token=${encodeURIComponent(given)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`,
+      location: url.pathname + url.search,
+    });
+    return res.end();
+  }
+  if (!allowed(req)) {
+    return json(res, 403, { error: HOST_TOKEN ? 'open this page with ?token=<FV_HOST_TOKEN> first' : 'the proxy only accepts requests from the local UI' });
+  }
   const handle = async () => {
     if (p === '/api/settings') {
       if (req.method === 'PUT') {
@@ -277,6 +343,7 @@ const server = createServer((req, res) => {
     if (m) return forward(m[1], m[2] + url.search, req, res);
     m = /^\/api\/sessions(?:\/([^/]+))?$/.exec(p);
     if (m) return sessions(req, res, m[1] && decodeURIComponent(m[1]));
+    if (STATIC_DIR && !p.startsWith('/api/') && (req.method === 'GET' || req.method === 'HEAD')) return serveStatic(p, res);
     json(res, 404, { error: 'not found' });
   };
   handle().catch((e) => {
@@ -290,11 +357,11 @@ const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');
   if (url.pathname === '/api/acp') {
-    if (!localOnly(req)) return socket.destroy();
+    if (!allowed(req)) return socket.destroy();
     return wss.handleUpgrade(req, socket, head, (client) => void acp(client).catch((e: unknown) => client.close(1011, String(e).slice(0, 120))));
   }
   const m = /^\/api\/(deepgram|gpubox)(\/.*)$/.exec(url.pathname);
-  if (!m || !localOnly(req)) return socket.destroy();
+  if (!m || !allowed(req)) return socket.destroy();
   const name = m[1];
   wss.handleUpgrade(req, socket, head, (client) => {
     const up = upstreams[name];
@@ -398,5 +465,6 @@ server.listen(PORT, '127.0.0.1', () => {
   const keys = Object.entries(upstreams)
     .map(([k, u]) => `${k}:${configured(u) ? 'ok' : 'off'}`)
     .join(' ');
-  console.log(`frankenvoice proxy on http://127.0.0.1:${PORT}  [${keys}]  sessions -> ${sessionsDir()}  settings -> ${SETTINGS_FILE}`);
+  const mode = HOST_TOKEN ? `  hosted (token)${STATIC_DIR ? `, UI from ${STATIC_DIR}` : ''}` : '';
+  console.log(`frankenvoice proxy on http://127.0.0.1:${PORT}${mode}  [${keys}]  sessions -> ${sessionsDir()}  settings -> ${SETTINGS_FILE}`);
 });
