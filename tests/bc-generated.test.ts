@@ -99,21 +99,6 @@ describe('generated backchannels: the LLM request', () => {
     expect(h.of('llm.start')).toHaveLength(2);
   });
 
-  it('warms the backchannel slot with the words so far, asking for no answer', () => {
-    const h = llm();
-    exchange(h);
-    h.send(500, 'bc', { type: 'bc.warm', text: 'so my laptop', prompt: '(Backchannel.)' });
-    h.send(600, 'bc', { type: 'bc.warm', text: 'so my laptop died', prompt: '(Backchannel.)' }); // one at a time
-    expect(h.ios).toHaveLength(2);
-    const warm = body(h.ios[1]);
-    expect(warm).toMatchObject({ max_tokens: 0, id_slot: 1 });
-    expect((warm.messages as JsonObject[]).at(-1)).toEqual({ role: 'user', content: '(Backchannel.)\n\nso my laptop' });
-    h.ios[1].h.onClose?.(null);
-    h.send(700, 'bc', { type: 'bc.warm', text: 'so my laptop died', prompt: '(Backchannel.)' });
-    expect(h.ios).toHaveLength(3);
-    expect(h.of('llm.bc')).toEqual([]);
-  });
-
   it('cancels the request on bc.drop, and never touches a reply', () => {
     const h = llm();
     h.send(0, 'bc', { type: 'bc.ask', id: 'b0', text: 'hmm', prompt: '', prefill: '' });
@@ -126,7 +111,7 @@ describe('generated backchannels: the LLM request', () => {
 });
 
 describe('generated backchannels: the stage', () => {
-  const stage = (params: Record<string, unknown> = {}) => harness(backchannelNode, { source: 'pause', minTurnMs: 0, ...params }, 'bc');
+  const stage = (params: Record<string, unknown> = {}) => harness(backchannelNode, { source: 'pause', minTurnMs: 0, speculate: false, ...params }, 'bc');
   const pauseAfter = (h: ReturnType<typeof stage>, words: string, t = 1000) => {
     h.send(t - 900, 'vad', { type: 'vad.speech_start' });
     h.send(t - 100, 'transcript', { type: 'asr.final', text: words });
@@ -134,13 +119,48 @@ describe('generated backchannels: the stage', () => {
     h.advance(t);
   };
 
-  it('warms the slot as the words come, at most every 300 ms', () => {
-    const h = stage();
+  it('writes lines ahead as the words come, one at a time, and says a fitting one at once', () => {
+    const h = stage({ speculate: true });
     h.send(0, 'vad', { type: 'vad.speech_start' });
-    h.send(100, 'transcript', { type: 'asr.partial', text: 'so I' });
-    h.send(250, 'transcript', { type: 'asr.partial', text: 'so I went' });
-    h.send(450, 'transcript', { type: 'asr.partial', text: 'so I went to' });
-    expect(h.of('bc.warm').map((m) => m.text)).toEqual(['so I', 'so I went to']);
+    h.send(100, 'transcript', { type: 'asr.partial', text: 'so my laptop' });
+    h.send(250, 'transcript', { type: 'asr.partial', text: 'so my laptop just' }); // one in flight
+    const asks = () => h.of('bc.ask');
+    expect(asks().map((m) => [m.id, m.text, m.draft])).toEqual([['bc-d0', 'so my laptop', true]]);
+    h.send(400, 'llm', { type: 'llm.bc', id: 'bc-d0', status: 'done', text: 'Oh.' });
+    // Done, and the words moved on: written again from them.
+    expect(asks().map((m) => m.text)).toEqual(['so my laptop', 'so my laptop just']);
+    h.send(500, 'llm', { type: 'llm.bc', id: 'bc-d1', status: 'done', text: 'Oh no' });
+    h.send(700, 'transcript', { type: 'asr.partial', text: 'so my laptop just died' });
+    expect(asks()).toHaveLength(3);
+    h.send(750, 'llm', { type: 'llm.bc', id: 'bc-d2', status: 'done', text: 'Oh no.' });
+    h.send(800, 'vad', { type: 'vad.speech_end' });
+    h.advance(800);
+    // Written from the same words: said at once, no new request.
+    expect(asks()).toHaveLength(3);
+    expect(h.of('bc.say')).toMatchObject([{ line: 'Oh no.', gen: true, ms: 0, draft: { text: 'so my laptop just died', ms: 50 } }]);
+    expect(h.of('bc.prep')).toHaveLength(1);
+  });
+
+  it('waits for a line being written from the same words, and asks afresh when the words moved on', () => {
+    const h = stage({ minGapMs: 0, speculate: true });
+    h.send(0, 'vad', { type: 'vad.speech_start' });
+    h.send(100, 'transcript', { type: 'asr.partial', text: 'we drove along the coast' });
+    h.send(200, 'vad', { type: 'vad.speech_end' });
+    h.advance(200);
+    expect(h.of('bc.ask')).toHaveLength(1);
+    expect(h.of('bc.prep')).toEqual([{ type: 'bc.prep', id: 'bc-d0' }]);
+    h.send(260, 'llm', { type: 'llm.bc', id: 'bc-d0', status: 'done', text: 'Nice.' });
+    expect(h.of('bc.say')).toMatchObject([{ id: 'bc-d0', line: 'Nice.', ms: 60 }]);
+    h.send(1000, 'vad', { type: 'vad.speech_start' });
+    h.send(1100, 'transcript', { type: 'asr.final', text: 'we drove along the coast and the view was absolutely incredible' });
+    h.send(1150, 'llm', { type: 'llm.bc', id: 'bc-d1', status: 'done', text: 'Wow.' });
+    h.send(1200, 'transcript', { type: 'asr.partial', text: 'and then we stopped at a little town for lunch' });
+    h.send(1300, 'vad', { type: 'vad.speech_end' });
+    h.advance(1300);
+    // The draft in flight is from older words: a new request, which drops it.
+    const ask = h.of('bc.ask').at(-1)!;
+    expect(ask.draft).toBeUndefined();
+    expect(ask.text).toMatch(/lunch$/);
   });
 
   it('asks the LLM at the moment, opens a TTS socket, and says what it wrote', () => {

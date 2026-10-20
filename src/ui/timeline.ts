@@ -147,7 +147,7 @@ export class TimelineModel {
   /** The page gate stopped playback on its own VAD: when, and when the user's speech started (mic). */
   gateStops: (Marker & { onset?: number })[] = [];
   /** Backchannels the agent said while the user talked, and proposals that were gated off. */
-  backchannels: (Span & { id: string; why?: string; gen?: boolean; askedAt?: number; llmMs?: number; firstAudio?: number; fallback?: string; dropped?: string })[] = [];
+  backchannels: (Span & { id: string; why?: string; gen?: boolean; ahead?: boolean; askedAt?: number; llmMs?: number; firstAudio?: number; fallback?: string; dropped?: string })[] = [];
   bcSkips: (Marker & { why: string })[] = [];
   agentAudio: AudioBlock[] = [];
   errors: (Marker & { node: string })[] = [];
@@ -499,7 +499,7 @@ export class TimelineModel {
           id: d.id ?? '',
           why: d.why,
           seqs: [e.seq],
-          ...(d.gen ? { gen: true, askedAt: d.askedAt, llmMs: d.ms } : {}),
+          ...(d.gen ? { gen: true, ahead: !!d.draft, askedAt: d.askedAt, llmMs: d.ms } : {}),
           ...(d.fallback ? { fallback: d.fallback } : {}),
         });
         break;

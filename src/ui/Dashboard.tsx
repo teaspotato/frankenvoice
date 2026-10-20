@@ -939,7 +939,7 @@ export function Dashboard({
         if (end < t0 || b.t0 > t1) continue;
         span('speaker', b.t0, end, col.accent, 0.3, b.text, 0.3, 0.7);
         const how = b.gen
-          ? `written by the LLM in ${b.llmMs ?? '?'} ms${b.firstAudio !== undefined && b.askedAt !== undefined ? `, first audio ${Math.round(b.firstAudio - b.askedAt)} ms after the decision` : ''}`
+          ? `${b.ahead ? 'written ahead by the LLM' : `written by the LLM in ${b.llmMs ?? '?'} ms`}${b.firstAudio !== undefined && b.askedAt !== undefined ? `, first audio ${Math.round(b.firstAudio - b.askedAt)} ms after the decision` : ''}`
           : b.fallback
             ? `canned: ${b.fallback}`
             : 'canned';

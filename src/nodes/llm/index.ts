@@ -80,8 +80,7 @@ const DEFAULT_SYSTEM =
  * reply would send it, then the user's words so far with the ask's prompt as the last user turn,
  * and its prefill as the start of the answer, on its own llama.cpp slot (`bcSlot`; replies run on
  * `slot`), so the reply's cached prefix stays. Neither the ask nor the answer goes into the history.
- * The answer comes back whole as `llm.bc`; `bc.drop` cancels it. A `bc.warm` sends the same
- * request up to the user's words with no answer asked for (max_tokens 0), so the slot has them cached.
+ * The answer comes back whole as `llm.bc`; `bc.drop` cancels it.
  *
  * Paced (the scheduler's `sched.config` says so): a reply, and a draft, first asks for `firstTokens`
  * tokens. A request that stops at its token limit leaves the reply open (`llm.chunk`), and each
@@ -394,23 +393,6 @@ export const llmNode: NodeDef = {
     };
     /** The instruction first (it stays cached), then the words so far. */
     const bcTurn = (msg: Msg): ChatTurn => ({ role: 'user', text: `${String(msg.prompt ?? '')}\n\n${String(msg.text ?? '')}`.trim() });
-    let warming: Io | undefined;
-    const warmBc = (msg: Msg) => {
-      if (bc || (warming && !warming.closed)) return;
-      let request: Json;
-      try {
-        const built = adapter.buildRequest([...history, bcTurn(msg)], { ...reqParams, idSlot: Number(p.bcSlot ?? -1) }) as JsonObject;
-        request = { ...built, body: { ...(built.body as JsonObject), max_tokens: 0 } };
-      } catch {
-        return;
-      }
-      const io = ctx.io.open(adapter.channel, request, {
-        onClose: () => {
-          if (warming === io) warming = undefined;
-        },
-      });
-      warming = io;
-    };
     const askBc = (msg: Msg) => {
       dropBc('asked again');
       const user = bcTurn(msg);
@@ -461,7 +443,6 @@ export const llmNode: NodeDef = {
       onInput(port, msg) {
         if (port === 'bc') {
           if (msg.type === 'bc.ask') askBc(msg);
-          else if (msg.type === 'bc.warm') warmBc(msg);
           else if (msg.type === 'bc.drop' && bc?.id === msg.id) dropBc(String(msg.why ?? 'dropped'));
           return;
         }
@@ -518,7 +499,6 @@ export const llmNode: NodeDef = {
         commitTurn(msg);
       },
       stop() {
-        if (warming && !warming.closed) warming.close({ status: 'cancelled' });
         dropBc('stopped');
         dropDraft('stopped');
         endCheck('dropped', 'stopped');

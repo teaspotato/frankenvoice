@@ -32,8 +32,8 @@ export const BC_CONTEXT_NOTE =
 
 /**
  * The last user turn of a generated backchannel's request starts with this, then the user's words so
- * far: first, so it stays in llama.cpp's prompt cache (from the last request, or a warm-up) and only
- * the newest words need a prefill.
+ * far: first, so it stays in llama.cpp's prompt cache (from the last request) and only the newest
+ * words need a prefill.
  */
 export const DEFAULT_BC_PROMPT =
   "(They're still talking. Reply with only a brief backchannel, one to three words, that fits what they just said. No question.)";
@@ -144,7 +144,7 @@ interface BackchannelParams {
   say: string;
   prompt: string;
   prefill: string;
-  warm: boolean;
+  speculate: boolean;
   maxWords: number;
   temperature: number;
   waitMs: number;
@@ -240,12 +240,13 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       description: "The start of the LLM's answer, written for it: the utterance tag (not interruptible, not gated), so it writes only the words.",
     },
     {
-      key: 'warm',
-      label: 'Warm the cache',
+      key: 'speculate',
+      label: 'Write ahead',
       type: 'boolean',
       default: true,
       when: { say: ['generated'] },
-      description: "While the user talks, send their words so far to the backchannel slot without asking for an answer (bc.warm), so when it's time only the last words need a prefill.",
+      description:
+        "While the user talks, have the LLM write a line from their words so far (one at a time, at most every 300 ms, on the backchannel slot). When it's time, a line written from the same words (but for the last two) is said at once, without waiting for the LLM.",
     },
     { key: 'maxWords', label: 'Max words', type: 'number', default: 4, when: { say: ['generated'] }, description: 'A grammar caps the line at this many words (and no question).' },
     { key: 'temperature', label: 'Temperature', type: 'number', default: 0.3, when: { say: ['generated'] } },
@@ -488,14 +489,48 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
 
     /** The user's words so far, for the LLM. */
     const userWords = () => `${finals} ${partial}`.trim().split(/\s+/).slice(-80).join(' ');
-    let lastWarm = -Infinity;
-    /** Prefill the backchannel slot with the words so far (at most every 300 ms), ahead of a line. */
-    const warm = () => {
-      if (!gen || !p.warm || pending || floor !== 'listening' || ctx.now() - lastWarm < 300) return;
+    const maxWords = () => Math.max(1, Math.round(Number(p.maxWords) || 3));
+    const askFor = (id: string, text: string, draft: boolean) =>
+      ctx.emit('ask', {
+        type: 'bc.ask',
+        id,
+        text,
+        prompt: String(p.prompt),
+        prefill: String(p.prefill),
+        // A word is a token or two, and the grammar ends it.
+        body: { max_tokens: maxWords() * 3 + 3, temperature: Number(p.temperature), grammar: bcGrammar(maxWords()) },
+        ...(draft ? { draft: true } : {}),
+      });
+    /**
+     * A line written ahead from the words so far (`speculate`): its words, and the line once written
+     * (null: not a backchannel). At the moment, it is said at once if the words haven't moved on.
+     */
+    let draft: { id: string; text: string; inFlight: boolean; t0: number; line?: string | null; raw?: string; ms?: number } | undefined;
+    let draftNo = 0;
+    /** The draft was written from (nearly) these words: at most 2 words fewer, the rest the same but for the last 2. */
+    const fits = (d: { text: string }, text: string) => {
+      const a = words(d.text);
+      const b = words(text);
+      const k = Math.max(0, a.length - 2);
+      return b.length - a.length <= 2 && b.length >= a.length - 1 && a.slice(0, k).join(' ') === b.slice(0, k).join(' ');
+    };
+    /** Write a line ahead from the words so far: one at a time, at most every 300 ms. */
+    const speculate = () => {
+      if (!gen || !p.speculate || pending || floor !== 'listening' || turnStart === null) return;
+      if (draft && (draft.inFlight || ctx.now() - draft.t0 < 300)) return;
       const text = userWords();
-      if (!text) return;
-      lastWarm = ctx.now();
-      ctx.emit('ask', { type: 'bc.warm', text, prompt: String(p.prompt) });
+      if (!text || text === draft?.text) return;
+      draft = { id: `${ctx.id}-d${draftNo++}`, text, inFlight: true, t0: ctx.now() };
+      askFor(draft.id, text, true);
+    };
+    const drafted = (msg: JsonObject) => {
+      if (msg.id !== draft?.id) return;
+      draft.inFlight = false;
+      draft.raw = String(msg.text ?? '');
+      draft.ms = Math.round(ctx.now() - draft.t0);
+      draft.line = msg.status === 'done' ? cleanBackchannel(draft.raw, maxWords()) : null;
+      // The user talked on meanwhile: write again from where they are.
+      speculate();
     };
 
     /** Have the LLM write the line now, while TTS opens a socket for it. */
@@ -506,18 +541,20 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
         return void ctx.emit('text', { type: 'bc.skip', why, reason: 'no words yet', ...data });
       }
       dropPending('asked again');
-      const id = `${ctx.id}-bc${n++}`;
-      const maxWords = Math.max(1, Math.round(Number(p.maxWords) || 3));
+      const d = draft;
+      draft = undefined;
+      if (d && fits(d, text) && !d.inFlight && d.line) {
+        // Written ahead from these words: say it now.
+        const id = `${ctx.id}-bc${n++}`;
+        ctx.emit('text', { type: 'bc.prep', id });
+        said.add(id);
+        return say(d.line, why, { ...data, gen: true, raw: d.raw ?? '', ms: 0, draft: { text: d.text, ms: d.ms ?? null }, askedAt: ctx.now() }, id);
+      }
+      // Being written from these words: wait for it. Else write it now.
+      const ahead = d && fits(d, text) && d.inFlight;
+      const id = ahead ? d.id : `${ctx.id}-bc${n++}`;
       ctx.emit('text', { type: 'bc.prep', id });
-      ctx.emit('ask', {
-        type: 'bc.ask',
-        id,
-        text,
-        prompt: String(p.prompt),
-        prefill: String(p.prefill),
-        // A word is a token or two, and the grammar ends it.
-        body: { max_tokens: maxWords * 3 + 3, temperature: Number(p.temperature), grammar: bcGrammar(maxWords) },
-      });
+      if (!ahead) askFor(id, text, false);
       const timer = ctx.setTimer(Math.max(0, Number(p.waitMs)), () => fallback(`the LLM took over ${p.waitMs} ms`), 'bc-wait');
       pending = { id, why, data, t0: ctx.now(), prevBc, timer };
     };
@@ -545,7 +582,7 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       if (!q || msg.id !== q.id) return;
       const raw = String(msg.text ?? '');
       const ms = Math.round(ctx.now() - q.t0);
-      const line = msg.status === 'done' ? cleanBackchannel(raw, Math.max(1, Math.round(Number(p.maxWords) || 3))) : null;
+      const line = msg.status === 'done' ? cleanBackchannel(raw, maxWords()) : null;
       if (!line) return fallback(msg.status === 'done' ? `not a backchannel: "${raw}"` : `the LLM failed (${String(msg.status)})`, { raw, ms });
       pending = undefined;
       q.timer.clear();
@@ -563,6 +600,8 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       // Said, but not heard yet: too late now.
       for (const id of said) ctx.emit('text', { type: 'bc.drop', id, why: 'the turn ended', unheard: true });
       said.clear();
+      if (draft?.inFlight) ctx.emit('ask', { type: 'bc.drop', id: draft.id, why: 'the turn ended' });
+      draft = undefined;
       turnNo++;
       turnStart = null;
       silentSince = null;
@@ -629,7 +668,10 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
           return;
         }
         if (port === 'llm') {
-          if (msg.type === 'llm.bc') written(msg as JsonObject);
+          if (msg.type === 'llm.bc') {
+            if (msg.id === draft?.id) drafted(msg as JsonObject);
+            else written(msg as JsonObject);
+          }
           return;
         }
         if (port === 'transcript' && turnStart !== null) {
@@ -637,10 +679,10 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
             finals = `${finals} ${String(msg.text ?? '')}`.trim();
             partial = '';
             if (msg.speechFinal && silentSince !== null) asrDone = true;
-            warm();
+            speculate();
           } else if (msg.type === 'asr.partial') {
             partial = String(msg.text ?? '');
-            warm();
+            speculate();
           }
         }
       },
