@@ -92,8 +92,8 @@ const openai = { provider: ['openai-compatible'] };
  * the words, its stream held back. As soon as the reply is clearly not the
  * pass reply, `llm.check_verdict` says `interject` (else `pass`, and the check
  * ends). A committed turn that names the check (`interject`) keeps it the way
- * a kept draft is kept; the history records the user's words, marked as cut
- * off, without the prompt.
+ * a kept draft is kept; the history records the committed words, marked as
+ * cut off, without the prompt.
  */
 export const llmNode: NodeDef = {
   type: 'llm',
@@ -217,8 +217,6 @@ export const llmNode: NodeDef = {
       checkId?: string;
       pass?: string;
       verdict?: 'interject' | 'pass';
-      /** What the history records for the user if this reply is kept, when not `user` itself. */
-      record?: ChatTurn;
     }
     let active: Reply | undefined;
     let draft: Reply | undefined;
@@ -382,8 +380,8 @@ export const llmNode: NodeDef = {
         judgeCheck(r);
       }
     };
-    /** Pass replies, compared without case or spaces. */
-    const squash = (s: string) => s.toLowerCase().replace(/\s+/g, '');
+    /** Pass replies, compared without case, spaces or wrapping quotes and emphasis. */
+    const squash = (s: string) => s.toLowerCase().replace(/\s+/g, '').replace(/^["'`*_“‘]+/, '');
     /** Decide a check as soon as its reply is clearly the pass reply or not; a pass ends it. */
     const judgeCheck = (r: Reply) => {
       if (r.verdict) return;
@@ -392,10 +390,13 @@ export const llmNode: NodeDef = {
       const pass = squash(r.pass ?? '');
       const ended = r.held.some((e) => e.type === 'end' || e.type === 'error');
       const passing = !said || (pass && (pass.startsWith(said) || said.startsWith(pass)));
-      // Calls a tool instead of saying anything: not an interjection.
-      const tool = r.held.some((e) => e.type === 'end' && e.stopReason === 'tool_use');
       if (!ended && passing) return;
-      r.verdict = ended && (passing || tool) ? 'pass' : 'interject';
+      const error = r.held.find((e) => e.type === 'error');
+      if (error && passing) {
+        ctx.log('warn', 'interjection check failed', error.error);
+        return endCheck('error', 'request failed');
+      }
+      r.verdict = ended && passing ? 'pass' : 'interject';
       ctx.emit('text', { type: 'llm.check_verdict', rid: r.rid, checkId: r.checkId!, verdict: r.verdict, text: text.trim(), ms: Math.round(ctx.now() - r.t0) });
       if (r.verdict === 'pass') endCheck('pass');
     };
@@ -413,7 +414,6 @@ export const llmNode: NodeDef = {
       const r = reply(user, {
         checkId: msg.checkId as string,
         pass: String(msg.pass ?? ''),
-        record: { role: 'user', text: `${text}—` },
         ...(msg.replaces ? { replaces: msg.replaces as string } : {}),
       });
       ctx.emit('text', { type: 'llm.check', rid: r.rid, checkId: r.checkId!, text });
@@ -486,11 +486,11 @@ export const llmNode: NodeDef = {
       // A kept draft's request went out without the workers' progress notes: those wait for the next request.
       if (!kept) flushNotes();
       if (kept) {
-        // The draft's words stand: keep its reply. The history records what the request said
-        // (for an interjection, the words without the check's prompt).
+        // The draft's words stand: keep its reply. The history records what the request said;
+        // for an interjection, all the words committed (some may have come after the check), cut off.
         if (cut) check = undefined;
         else draft = undefined;
-        history.push({ ...(kept.record ?? kept.user), turnId });
+        history.push(cut ? { role: 'user', text: `${String(msg.text)}—`, turnId } : { ...kept.user, turnId });
         const held = kept.held;
         kept.held = [];
         const chunks = held.filter((e) => e.type === 'delta').length;
@@ -510,7 +510,8 @@ export const llmNode: NodeDef = {
         handle(held);
         return;
       }
-      const user: ChatTurn = { role: 'user', text: msg.text as string, turnId };
+      // Committed early for an interjection that couldn't be kept: the words are still cut off.
+      const user: ChatTurn = { role: 'user', text: msg.interject ? `${String(msg.text)}—` : (msg.text as string), turnId };
       history.push(user);
       const r = reply(user, { turnId });
       ctx.emit('text', { type: 'llm.start', rid: r.rid, turnId: turnId ?? null });

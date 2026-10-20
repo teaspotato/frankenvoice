@@ -112,6 +112,25 @@ describe('the interjection gate', () => {
     expect(h.of('interject.take')).toHaveLength(0);
   });
 
+  it('drops an interjection the user already talked past when the verdict comes', () => {
+    const h = harness(interjectNode, { maxExtraWords: 3 });
+    h.send(100, 'turn', words('The Eiffel Tower is in Berlin.'));
+    h.ios[0].h.onRecv!(gateAnswer('complete'), undefined);
+    h.send(500, 'turn', words('The Eiffel Tower is in Berlin. No wait, I mean Paris.'));
+    h.send(800, 'text', { type: 'llm.check_verdict', checkId: 'interject-c0', verdict: 'interject', text: 'Paris, actually.' });
+    expect(h.of('interject.take')).toHaveLength(0);
+    expect(h.of('interject.drop')).toMatchObject([{ checkId: 'interject-c0' }]);
+  });
+
+  it("ignores a TypeSafe answer about an earlier turn's words", () => {
+    const h = harness(interjectNode);
+    h.send(100, 'turn', words('The Eiffel Tower is in Berlin.'));
+    h.send(200, 'turn', words(''));
+    h.send(300, 'turn', words('And another thing'));
+    h.ios[0].h.onRecv!(gateAnswer('complete'), undefined);
+    expect(h.of('interject.check')).toHaveLength(0);
+  });
+
   it('waits at most maxWaitMs for a pause', () => {
     const h = harness(interjectNode, { maxWaitMs: 1000 });
     h.send(0, 'vad', { type: 'vad.speech_start' });
@@ -155,9 +174,28 @@ describe('the LLM on interjection checks', () => {
     h.ios[0].h.onRecv!(tok(' actually.'), undefined);
     h.ios[0].h.onRecv!({ $done: true }, undefined);
     expect(h.of('llm.end')).toMatchObject([{ status: 'done', text: 'Paris, actually.' }]);
-    // The history has the words the LLM saw, cut off, without the prompt.
     h.send(3000, 'turn', { type: 'turn.user', turnId: 'u1', text: 'Oh right.' });
-    expect(messages(h.ios[1].request)).toEqual(['sys', 'The tower is in Berlin.—', 'Paris, actually.', 'Oh right.']);
+    // The history has all the committed words, cut off, without the prompt.
+    expect(messages(h.ios[1].request)).toEqual(['sys', 'The tower is in Berlin. And—', 'Paris, actually.', 'Oh right.']);
+  });
+
+  it('takes a quoted pass reply as a pass, and a failed request as an error, not a pass', () => {
+    const h = harness(llmNode, params);
+    h.send(0, 'interject', check('The tower is in Berlin.'));
+    h.ios[0].h.onRecv!(tok('"[listen]"'), undefined);
+    h.ios[0].h.onRecv!({ $done: true }, undefined);
+    expect(h.of('llm.check_verdict')).toMatchObject([{ verdict: 'pass' }]);
+    h.send(500, 'interject', { ...check('The tower is in Berlin. It is tall.'), checkId: 'c1' });
+    h.ios[1].h.onClose!({ error: 'HTTP 500' });
+    expect(h.of('llm.check_verdict')).toHaveLength(1);
+    expect(h.of('llm.check_end').at(-1)).toMatchObject({ checkId: 'c1', status: 'error' });
+  });
+
+  it('marks words committed for an interjection it could not keep as cut off', () => {
+    const h = harness(llmNode, params);
+    h.send(0, 'interject', check('The tower is in Berlin.'));
+    h.send(500, 'turn', { type: 'turn.user', turnId: 'u0', text: 'The tower is in Berlin.', interject: 'c0' });
+    expect(messages(h.ios[1].request)).toEqual(['sys', 'The tower is in Berlin.—']);
   });
 
   it('drops a check the turn does not keep, leaving no trace in the history', () => {
@@ -189,7 +227,7 @@ describe('turn-taking on an interjection', () => {
     expect(h.of('turn.words').at(-1)).toMatchObject({ text: '' });
   });
 
-  it('refuses a take while a draft is out', () => {
+  it('takes the floor over a draft that went out at the same pause', () => {
     const h = harness(duplexTurnNode, { useModel: false });
     h.send(0, 'vad', { type: 'vad.speech_start', at: 0 });
     h.send(800, 'transcript', asr(false, 800, 'what about'));
@@ -197,7 +235,21 @@ describe('turn-taking on an interjection', () => {
     h.send(1200, 'transcript', asr(false, 1200, 'What about Osaka?'));
     expect(h.of('turn.draft')).toHaveLength(1);
     h.send(1300, 'interject', { type: 'interject.take', checkId: 'c0' });
-    expect(h.of('turn.interject')).toMatchObject([{ taken: false, why: 'a draft is already out' }]);
-    expect(h.of('turn.user')).toHaveLength(0);
+    expect(h.of('turn.interject')).toMatchObject([{ taken: true }]);
+    expect(h.of('turn.draft_drop')).toMatchObject([{ why: 'early interjection' }]);
+    expect(h.of('turn.user')).toMatchObject([{ text: 'What about Osaka?', interject: 'c0' }]);
+    expect(h.of('turn.user')[0].draft).toBeUndefined();
+  });
+
+  it('tells the words are gone when a timer commits the turn', () => {
+    const h = harness(duplexTurnNode, { useModel: false, maxSilenceMs: 500 });
+    h.send(0, 'vad', { type: 'vad.speech_start', at: 0 });
+    h.send(800, 'transcript', asr(true, 800, 'The tower is in Berlin', ));
+    // A Finalize'd final while still speaking is held; the silence timer commits it.
+    h.send(900, 'transcript', { ...asr(true, 900, 'and'), fromFinalize: true });
+    h.send(1000, 'vad', { type: 'vad.speech_end', at: 1000 * sr });
+    h.advance(2000);
+    expect(h.of('turn.user')).toHaveLength(1);
+    expect(h.of('turn.words').at(-1)).toMatchObject({ text: '' });
   });
 });

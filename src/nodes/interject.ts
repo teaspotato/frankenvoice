@@ -83,6 +83,8 @@ export const interjectNode: NodeDef = {
     let draftOut = false;
     let speaking = false;
     let n = 0;
+    /** Counts turns, so a TypeSafe answer about an earlier turn's words is ignored. */
+    let gen = 0;
     /** The check with the LLM in flight, or the interjection waiting for a pause. */
     let check: { id: string; key: string; interject?: string; taken?: boolean; wait?: TimerHandle } | null = null;
 
@@ -126,6 +128,7 @@ export const interjectNode: NodeDef = {
       asking = true;
       const text = words;
       const t0 = ctx.now();
+      const g = gen;
       askChoice(ctx, choiceRequest(text, opts, String(p.instructions ?? ''), String(p.model ?? 'jev-latest')), (res) => {
         asking = false;
         const got = res === null ? null : readChoice(res, opts, Number(p.minConfidence));
@@ -136,8 +139,8 @@ export const interjectNode: NodeDef = {
           ms: Math.round(ctx.now() - t0),
           ...(got ? { choice: got.choice, confidence: got.confidence, probabilities: got.probabilities, go } : { failed: true }),
         });
-        // The words it judged were complete: check with the words as they are now.
-        if (go && words) startCheck();
+        // The words it judged were complete: check with the words as they are now (if still the same turn).
+        if (go && words && g === gen) startCheck();
         gate();
       });
     };
@@ -161,6 +164,8 @@ export const interjectNode: NodeDef = {
             return;
           }
           c.interject = String(msg.text ?? '');
+          // The user talked on while the LLM was deciding.
+          if (count(draftKey(words)) - count(c.key) > Number(p.maxExtraWords)) return drop(`the user said more than ${Number(p.maxExtraWords)} words past it`);
           if (!speaking) take('the user was already silent');
           else
             c.wait = ctx.setTimer(
@@ -179,6 +184,7 @@ export const interjectNode: NodeDef = {
             if (!words) {
               // Committed, or gone: start over with the next words.
               asked = checked = '';
+              gen++;
               if (!check?.taken) drop('the turn ended');
               return;
             }

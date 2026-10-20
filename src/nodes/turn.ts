@@ -208,8 +208,9 @@ export const draftKey = (s: string) =>
  *
  * Early interjection: the user's uncommitted words are emitted as `turn.words`
  * whenever they change while listening. An `interject.take` commits them at
- * once (its turn names the check in `interject`), unless the agent has the
- * floor or a draft is already out; `turn.interject` says which.
+ * once (its turn names the check in `interject`, and a draft out at the same
+ * pause is dropped), unless the agent has the floor or it is backed off and
+ * the words aren't coherent; `turn.interject` says which.
  */
 export const duplexTurnNode: NodeDef<DuplexParams> = {
   type: 'turn.duplex',
@@ -646,6 +647,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       from = to = -1;
       ctx.setState('pending', '');
       go('commit', why);
+      // Commits from timers too: the words are gone.
+      syncWords();
     };
     /** The model says the user's turn is over: commit once ASR has the words. */
     const endOfTurn = (why: string) => {
@@ -844,10 +847,18 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       if (port === 'interject') {
         if (msg.type !== 'interject.take') return;
         const why =
-          state !== 'listening' ? 'the agent has the floor' : draft ? 'a draft is already out' : !parts.length && !partial?.text ? 'no words to commit' : null;
+          state !== 'listening'
+            ? 'the agent has the floor'
+            : !pendingText()
+              ? 'no words to commit'
+              : backoff && !coherent(pendingText())
+                ? 'backed off: waiting for coherent speech'
+                : null;
         ctx.emit('turn', { type: 'turn.interject', checkId: msg.checkId as string, taken: !why, ...(why ? { why } : {}) });
         if (why) return;
         eotHeld = null;
+        // A draft goes out at the same pause: the interjection wins, the LLM drops the draft.
+        dropDraft('early interjection');
         // A partial's final may still come: it stays the turn's tail, as at the model's end of turn.
         const tail = partial ?? undefined;
         if (partial) collect(partial.text, partial.start, partial.end);

@@ -35,7 +35,7 @@ const LEGEND: Record<string, string> = {
     'Bar: a final transcript, from its first word to its last. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the last word to when its result arrived: the ASR latency.',
   turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM.\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.',
   interject:
-    'Early interjection. Dots: TypeSafe judging the user\'s words so far (grey: still going; green: they just completed something). Outlined bar: an "interrupt?" check with the LLM on those words, until it decided (grey: let them go on) or was dropped. Accent diamond: the LLM wanted to cut in (its line next to it); a line from there to where it was taken at the user\'s pause (solid accent tick: it took the floor; red tick: turn-taking refused it).',
+    'Early interjection. Dots: TypeSafe judging the user\'s words so far (grey: still going; green: they just completed something). Outlined bar: an "interrupt?" check with the LLM on those words, until it decided (grey: let them go on) or was dropped. Accent diamond: the LLM wanted to cut in (its line next to it); a line from there to where it was taken at the user\'s pause (accent tick: it took the floor and played; red tick: turn-taking refused it; grey tick: taken, but the LLM could not keep it).',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
   opener:
     'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
@@ -768,7 +768,7 @@ export function Dashboard({
             g.moveTo(x1, ly0 + h * 0.63 + 0.5);
             g.lineTo(xt, ly0 + h * 0.63 + 0.5);
             g.stroke();
-            if (c.taken !== undefined) vline('interject', c.takeAt, c.taken ? col.accent : col.danger, 0.4, 0.9);
+            if (c.taken !== undefined) vline('interject', c.takeAt, c.taken === false ? col.danger : c.status === 'kept' ? col.accent : col.muted, 0.4, 0.9);
           }
           const next = m.interjectChecks[i + 1];
           const lx = Math.max(x1, c.takeAt !== undefined ? x(c.takeAt) : x1) + 6;

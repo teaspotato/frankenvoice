@@ -36,7 +36,7 @@ export const STAGES: StageDef[] = [
   { id: 'turnmodel', label: 'Turn model', variants: { ssl_turn: 'turnmodel.ssl', off: 'turnmodel.off' } },
   { id: 'asr', label: 'ASR', variants: { streaming: 'asr' } },
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
-  { id: 'interject', label: 'Early interjection', variants: { off: 'interject.off', 'typesafe + llm': 'interject' } },
+  { id: 'interject', label: 'Interjection', variants: { off: 'interject.off', typesafe: 'interject' } },
   { id: 'backchannel', label: 'Backchannels', variants: { on: 'backchannel', off: 'backchannel.off' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' }, managed: ['delegate'], managedNote: 'Delegation (the worker tools) is set by the Workers stage.' },
   { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', typesafe: 'opener.choice', off: 'opener.off' } },
@@ -140,8 +140,7 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     // Early interjection: TypeSafe gates the words so far, the LLM is asked whether to cut in, turn-taking commits at the next pause.
     e('turn', 'turn', 'interject', 'turn'),
     e('vad', 'vad', 'interject', 'vad'),
-    e('interject', 'check', 'llm', 'interject'),
-    e('llm', 'text', 'interject', 'text'),
+    ...(registry[stageType(c, 'llm')].inputs.some((p) => p.name === 'interject') ? [e('interject', 'check', 'llm', 'interject'), e('llm', 'text', 'interject', 'text')] : []),
     ...(registry[stageType(c, 'turn')].inputs.some((p) => p.name === 'interject') ? [e('interject', 'take', 'turn', 'interject')] : []),
     // Backchannels: when, from the user's speech and the floor; their lines are rendered and played by TTS.
     e('vad', 'vad', 'backchannel', 'vad'),

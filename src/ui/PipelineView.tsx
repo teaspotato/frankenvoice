@@ -117,8 +117,11 @@ export function PipelineView({
     edges.push({ src: 'turn.turn', d: `M${ix + 30},${ty} L${ix + 30},${iy - 2}`, label: 'words', lx: ix + 30, ly: iy - 30 });
     if (registry[stageType(config, 'turn')].inputs.some((p) => p.name === 'interject'))
       edges.push({ src: 'interject.take', d: `M${ix + 70},${iy} L${ix + 70},${ty + 2}`, label: 'take', lx: ix + 86, ly: iy - 30 });
-    const lx = POS.llm[0] + 24;
-    edges.push({ src: 'interject.check', d: `M${ix + W},${iy + H / 2} L${lx - 10},${iy + H / 2} Q${lx},${iy + H / 2} ${lx},${iy + H / 2 - 10} L${lx},${POS.llm[1] + H + 2}`, label: 'interrupt?', lx: ix + W + 28, ly: iy + H / 2 - 6 });
+    // Out of its top right and up into the LLM's bottom left, clear of the backchannel box beside it.
+    if (registry[stageType(config, 'llm')].inputs.some((p) => p.name === 'interject')) {
+      const [sx, lx, ky] = [ix + W - 20, POS.llm[0] + 20, iy - 26];
+      edges.push({ src: 'interject.check', d: `M${sx},${iy} L${sx},${ky + 8} Q${sx},${ky} ${sx + 8},${ky} L${lx - 8},${ky} Q${lx},${ky} ${lx},${ky - 8} L${lx},${POS.llm[1] + H + 2}`, label: 'interrupt?', lx: lx + 34, ly: POS.llm[1] + H + 12 });
+    }
   }
   // Delegation: tasks out of the LLM's right side, down the gap beside the opener to the workers, and their news back.
   {
