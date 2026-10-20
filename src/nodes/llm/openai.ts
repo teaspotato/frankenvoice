@@ -106,11 +106,19 @@ export const openaiResponsesAdapter: LlmAdapter = {
       ended = true;
       return [{ type: 'end', stopReason }];
     };
+    /** One error ends the reply; a later error or close adds nothing. */
+    const fail = (error: Json): LlmStreamEvent[] => {
+      if (ended) return [];
+      ended = true;
+      return [{ type: 'error', error }];
+    };
     return {
       recv(data): LlmStreamEvent[] {
         const e = data as JsonObject;
         switch (e.type) {
           case 'response.output_text.delta':
+          // A refusal is spoken like any other reply.
+          case 'response.refusal.delta':
             return typeof e.delta === 'string' && e.delta ? [{ type: 'delta', text: e.delta }] : [];
           case 'response.output_item.added':
             return (e.item as JsonObject | undefined)?.type === 'reasoning' ? [{ type: 'thinking' }] : [];
@@ -118,6 +126,7 @@ export const openaiResponsesAdapter: LlmAdapter = {
           case 'response.reasoning_summary_text.delta':
             return [{ type: 'thinking' }];
           case 'response.completed':
+          case 'response.done': // OpenRouter's documented example
             stopReason = 'completed';
             return end();
           case 'response.incomplete': {
@@ -126,17 +135,20 @@ export const openaiResponsesAdapter: LlmAdapter = {
             return end();
           }
           case 'response.failed':
-            return [{ type: 'error', error: ((e.response as JsonObject | undefined)?.error as Json) ?? e }];
+            return fail(((e.response as JsonObject | undefined)?.error as Json) ?? e);
           case 'error':
-            return [{ type: 'error', error: (e.error as Json) ?? e }];
+            return fail((e.error as Json) ?? e);
           default:
+            if (e.$done) return end();
             // Servers that answer with a bare error object instead of an event.
-            return e.error ? [{ type: 'error', error: e.error }] : [];
+            return e.error ? fail(e.error) : [];
         }
       },
       close(data) {
         const d = data as JsonObject | null;
-        return d?.error ? [{ type: 'error', error: d.error }] : end();
+        if (d?.error) return fail(d.error);
+        // A stream cut off before its terminal event (e.g. a server-side generation error) is not a finished reply.
+        return ended ? [] : fail({ message: 'stream ended without response.completed' });
       },
       native() {
         return null;

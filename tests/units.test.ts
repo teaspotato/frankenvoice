@@ -149,8 +149,16 @@ describe('openai-compatible Responses adapter', () => {
     expect(p.recv({ type: 'response.output_item.added', item: { type: 'reasoning' } })).toEqual([{ type: 'thinking' }]);
     expect(p.recv({ type: 'response.reasoning_summary_text.delta', delta: 'hm' })).toEqual([{ type: 'thinking' }]);
     expect(p.recv({ type: 'response.output_text.delta', delta: 'Hi' })).toEqual([{ type: 'delta', text: 'Hi' }]);
+    expect(p.recv({ type: 'response.refusal.delta', delta: 'No.' })).toEqual([{ type: 'delta', text: 'No.' }]);
     expect(p.recv({ type: 'response.completed', response: { status: 'completed' } })).toEqual([{ type: 'end', stopReason: 'completed' }]);
     expect(p.close(null)).toEqual([]);
+    const cut = openaiResponsesAdapter.parser();
+    cut.recv({ type: 'response.output_text.delta', delta: 'Hal' });
+    expect(cut.close(null)).toEqual([{ type: 'error', error: { message: 'stream ended without response.completed' } }]);
+    const failed = openaiResponsesAdapter.parser();
+    expect(failed.recv({ type: 'error', code: 'x', message: 'bad' })).toHaveLength(1);
+    expect(failed.recv({ type: 'response.failed', response: { error: { message: 'bad' } } })).toEqual([]);
+    expect(failed.close(null)).toEqual([]);
     const q = openaiResponsesAdapter.parser();
     expect(q.recv({ type: 'response.incomplete', response: { incomplete_details: { reason: 'max_output_tokens' } } })).toEqual([
       { type: 'end', stopReason: 'max_output_tokens' },
