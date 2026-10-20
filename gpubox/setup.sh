@@ -48,7 +48,8 @@ LLM_MTP_REPO=ggml-org/gemma-4-12B-it-GGUF          # MTP draft head for speculat
 LLM_MTP_FILE=mtp-gemma-4-12B-it-Q4_0.gguf
 LLM_NAME=gemma-4-12b-it
 CUDA_MPS=${CUDA_MPS:-1}                            # CUDA MPS: the GPU services' kernels run concurrently instead of time-sliced
-LLM_MPS_PCT=${LLM_MPS_PCT:-40}                     # cap on the LLM's share of SMs under MPS, so Kyutai keeps up (measured, issue #23)
+LLM_MPS_PRIO=${LLM_MPS_PRIO:-1}                    # MPS client priority for the LLM: 1 = below normal, so TTS kernels go first
+LLM_MPS_PCT=${LLM_MPS_PCT:-}                       # optional cap on the LLM's share of SMs (40 helped, priority alone helps more: issue #23)
 LLM_CTX=${LLM_CTX:-8192}; LLM_SLOTS=${LLM_SLOTS:-2}; LLM_MTP=${LLM_MTP:-1}; LLM_SWA_FULL=${LLM_SWA_FULL:-1}
 
 log() { echo "[setup $(date +%H:%M:%S)] $*"; }
@@ -229,7 +230,7 @@ start() {
     # --swa-full: a full-size sliding-window cache, so a prompt that diverges from the slot's cached
     # tokens (a cancelled draft, a new user turn after a reply) reuses the shared prefix instead of re-reading it all
     local swa=(); [ "$LLM_SWA_FULL" = 1 ] && swa=(--swa-full)
-    local pct=(); [ -n "$LLM_MPS_PCT" ] && pct=(env CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="$LLM_MPS_PCT")
+    local pct=(env CUDA_MPS_CLIENT_PRIORITY="$LLM_MPS_PRIO"); [ -n "$LLM_MPS_PCT" ] && pct+=(CUDA_MPS_ACTIVE_THREAD_PERCENTAGE="$LLM_MPS_PCT")
     LD_LIBRARY_PATH="$d:${LD_LIBRARY_PATH:-}" spawn llm "${pct[@]}" "$d/llama-server" -m "$DATA/models/$LLM_FILE" \
         --mmproj "$DATA/models/$LLM_MMPROJ" --alias $LLM_NAME --host 127.0.0.1 --port $LLM_PORT \
         -ngl 999 -fa on -c "$LLM_CTX" -np "$LLM_SLOTS" -ctk q8_0 -ctv q8_0 --ctx-checkpoints 0 --cache-ram 0 "${swa[@]}" \
