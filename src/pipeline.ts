@@ -9,7 +9,7 @@ import type { Json } from './core/types';
 import { registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'interject' | 'backchannel' | 'llm' | 'opener' | 'tts' | 'speaker';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'interject' | 'backchannel' | 'llm' | 'opener' | 'tts' | 'speaker' | 'sched';
 
 export interface StageDef {
   id: StageId;
@@ -42,6 +42,7 @@ export const STAGES: StageDef[] = [
   { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', typesafe: 'opener.choice', off: 'opener.off' } },
   { id: 'tts', label: 'TTS', variants: { 'kyutai-gpubox': 'tts.kyutai', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
+  { id: 'sched', label: 'Scheduler', variants: { tick: 'sched' } },
 ];
 
 export interface StageConfig {
@@ -94,13 +95,15 @@ const COLUMN: Record<StageId, [number, number]> = {
   opener: [840, 200],
   tts: [1050, 110],
   speaker: [1260, 110],
+  sched: [1050, 200],
 };
 
 const e = (from: string, fp: string, to: string, tp: string): EdgeSpec => ({ from: { node: from, port: fp }, to: { node: to, port: tp } });
 
 /**
  * The fixed topology: mic → noise/echo cleanup → VAD + turn model + ASR → turn-taking → LLM → TTS → speaker,
- * the opener watching the LLM and speaking through TTS too, with playback fed back to turn-taking and what was played to the turn model (the agent's channel).
+ * the opener watching the LLM and speaking through TTS too, with playback fed back to turn-taking and what was played to the turn model (the agent's channel),
+ * and the tick scheduler pacing the LLM by the TTS queue and playback.
  */
 export function buildGraph(c: PipelineConfig): GraphSpec {
   const cleanupType = stageType(c, 'cleanup');
@@ -146,6 +149,12 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     ...(registry[stageType(c, 'turn')].outputs.some((p) => p.name === 'text') ? [e('turn', 'text', 'tts', 'text')] : []),
     e('tts', 'audio', 'speaker', 'audio'),
     e('speaker', 'playback', 'turn', 'playback'),
+    // The tick scheduler watches the reply (LLM, TTS queue, playback, ASR) and paces the LLM.
+    e('llm', 'text', 'sched', 'text'),
+    e('tts', 'audio', 'sched', 'audio'),
+    e('speaker', 'played', 'sched', 'played'),
+    e('asr', 'transcript', 'sched', 'transcript'),
+    ...(registry[stageType(c, 'llm')].inputs.some((p) => p.name === 'sched') ? [e('sched', 'control', 'llm', 'sched')] : []),
     ...(wantsReference ? [e('speaker', 'played', 'cleanup', 'ref')] : []),
     // Barge-in: turn-taking can stop the reply in flight.
     ...(registry[stageType(c, 'turn')].outputs.some((p) => p.name === 'control')

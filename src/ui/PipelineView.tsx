@@ -26,6 +26,7 @@ const POS: Record<StageId, [number, number]> = {
   opener: [1010, 88],
   tts: [1210, 88],
   speaker: [1410, 88],
+  sched: [1210, 206],
 };
 const VIEW_W = 1570;
 const VIEW_H = 410;
@@ -92,6 +93,7 @@ export function PipelineView({
   onSelect(id: StageId | null): void;
 }) {
   const stages = STAGES;
+  const r = 10;
   const edges: Edge[] = [
     link('mic.audio', right('mic'), left('cleanup'), 'audio'),
     link('cleanup.audio', right('cleanup'), left('vad'), 'clean'),
@@ -122,10 +124,24 @@ export function PipelineView({
       edges.push({ src: 'interject.check', d: `M${sx},${iy} L${sx},${ky + 8} Q${sx},${ky} ${sx + 8},${ky} L${lx - 8},${ky} Q${lx},${ky} ${lx},${ky - 8} L${lx},${POS.llm[1] + H + 2}`, label: 'interrupt?', lx: lx + 34, ly: POS.llm[1] + H + 12 });
     }
   }
+  // The tick scheduler under TTS: the TTS queue down into it, and the pace out of its left up into the LLM.
+  {
+    const [sx, sy] = POS.sched;
+    edges.push({ src: 'tts.audio', d: `M${sx + 40},${POS.tts[1] + H} L${sx + 40},${sy - 2}`, label: 'queue', lx: sx + 20, ly: sy - 26 });
+    if (registry[stageType(config, 'llm')].inputs.some((p) => p.name === 'sched')) {
+      const [gx, ky, lx] = [POS.opener[0] - 25, CONTROL_Y - 14, POS.llm[0] + W - 20];
+      edges.push({
+        src: 'sched.control',
+        d: `M${sx},${sy + H / 2} L${gx + r},${sy + H / 2} Q${gx},${sy + H / 2} ${gx},${sy + H / 2 - r} L${gx},${ky + r} Q${gx},${ky} ${gx - r},${ky} L${lx + r},${ky} Q${lx},${ky} ${lx},${ky - r} L${lx},${POS.llm[1] + H + 2}`,
+        label: 'pace',
+        lx: gx + 22,
+        ly: sy + H / 2 - 6,
+      });
+    }
+  }
   // Playback feedback: up from the speaker, back over the row, down into turn-taking.
   const [ox, oy] = [POS.speaker[0] + W / 2, POS.speaker[1]];
   const [tx, ty] = [POS.turn[0] + W / 2, POS.turn[1]];
-  const r = 10;
   edges.push({
     src: 'speaker.playback',
     d: `M${ox},${oy} L${ox},${FEEDBACK_Y + r} Q${ox},${FEEDBACK_Y} ${ox - r},${FEEDBACK_Y} L${tx + r},${FEEDBACK_Y} Q${tx},${FEEDBACK_Y} ${tx},${FEEDBACK_Y + r} L${tx},${ty - 2}`,

@@ -216,8 +216,11 @@ class Engine:
         frames_sent = 0
         first_pcm_offset = None
         words_sent = 0
+        reported = [(0, 0)]
         g = None
         t_gen = 0.0
+        steps: list[float] = []  # seconds per model step, in order
+        audio_steps: list[float] = []  # the steps that produced audio
         t_first_audio = None
         self.state = None
 
@@ -344,8 +347,10 @@ class Engine:
                     break
                 t0 = time.perf_counter()
                 pcm = self._step(g)
-                t_gen += time.perf_counter() - t0
+                steps.append(time.perf_counter() - t0)
+                t_gen += steps[-1]
                 if pcm is not None:
+                    audio_steps.append(steps[-1])
                     if first_pcm_offset is None:
                         first_pcm_offset = self.offset
                         t_first_audio = time.perf_counter()
@@ -353,12 +358,21 @@ class Engine:
                     self._send(job, pcm16)
                     frames_sent += 1
                 emit_progress(False)
+                q = (len(self.state.transcript), len(words) - len(self.state.transcript))
+                if q != reported[0]:
+                    reported[0] = q
+                    self._send(job, {"type": "Consumed", "words": q[0], "queued": q[1]})
         if job.cancelled:
             log.info("tts cancelled after %d frames", frames_sent)
             return
         emit_progress(True)
         audio_s = frames_sent * frame_s
+        head = audio_steps[:int(3 / frame_s)]  # the first 3 s of audio, while the reply's text is still being written
+        srt = sorted(steps)
         stats = {"audio_s": round(audio_s, 3), "gen_s": round(t_gen, 3), "rtf": round(t_gen / audio_s, 3) if audio_s else None,
+                 "rtf_3s": round(sum(head) / (len(head) * frame_s), 3) if head else None,
+                 "step_ms_p90": round(srt[int(0.9 * (len(srt) - 1))] * 1000, 1) if srt else None,
+                 "step_ms_max": round(srt[-1] * 1000, 1) if srt else None,
                  "ttfa_ms": round((t_first_audio - job.t_first_speak) * 1000) if t_first_audio and job.t_first_speak else None,
                  "words": len(words)}
         if job.background:

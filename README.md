@@ -48,6 +48,8 @@ mic ─> noise/echo ─────┼─> turn model ────┼─> turn �
           └─────────────────────┴─ what was played (echo reference, agent audio)
 ```
 
+The *Scheduler* stage (below, not drawn in the sketch) watches the reply in flight and paces the LLM.
+
 The wiring lives in `src/pipeline.ts` (`STAGES` and `buildGraph`). Each stage lists the node types that can fill it; the UI only chooses among those and sets their params. To change the topology, edit that file.
 
 ## Noise / echo cancellation
@@ -77,6 +79,19 @@ The toolbar shows which settings the current config still needs; click it to ope
 The GPU box protocols are in `gpubox/PROTOCOL.md`. ASR and the LLM each have a small pure adapter (`src/nodes/asr/gpubox.ts`, `src/nodes/llm/openai.ts`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`server/drivers/index.ts`). Recordings keep the raw payloads, so replay feeds the same bytes through the same adapter.
 
 Turn-taking is full-duplex by default (`turn.duplex` in `src/nodes/turn.ts`); `half-duplex` is still selectable and ignores the user while the agent talks. The full-duplex stage is an explicit state machine (`FLOOR` in `src/nodes/turn.ts`): listening, thinking, speaking, and thinking+user / speaking+user while the user talks over the agent. Every transition is emitted as a `turn.transition` message with what triggered it.
+
+### Tick scheduler
+
+The *Scheduler* stage (`sched` in `src/nodes/sched.ts`) gives the pipeline a view of the GPU as 80 ms frames, one Kyutai frame each: TTS frame production comes first, LLM tokens and ASR partials go in the slack. While a reply is in flight (from `llm.start` until it is written, spoken and played) it ticks on an 80 ms grid from the reply's start, and logs every tick as a `sched.tick` message:
+
+| field | what |
+| --- | --- |
+| `n`, `rid`, `ms` | tick number, the reply, ms since the reply started |
+| `tts` | `audioMs` produced and `words` started during the tick, `queuedWords` (words Kyutai has been sent and not yet read: its `Consumed` count, plus words sent since), `bufferedMs` (how far the reply's audio is scheduled ahead of playback), `done` |
+| `llm` | `tokens` arrived during the tick, `pending` (granted and not arrived), `decision` (`grant`, `hold`, `busy`, `done`, `free`) and `why`, `granted` |
+| `asr` | `partials`, `finals` arrived during the tick |
+
+The backends are separate processes, so what the scheduler governs is when the LLM may write. With *Pace the LLM* on, the LLM writes a reply in chunks: its first request (a draft's too) asks for *first burst* tokens (16); a request that stops at its limit leaves the reply open (`llm.chunk`), and each `sched.grant` continues it with *chunk* tokens (8): the same messages plus the text so far as the assistant's turn, which llama.cpp continues, prefilling a token or two thanks to its prompt cache. A grant goes out on a tick when TTS has fewer than *lookahead* words (3) to read, or playback is about to run dry; before the first audio, otherwise nothing more until that audio is out (*hold until first audio*); after it, while TTS has fewer than *max words queued* (6) and its audio runs at least *min audio ahead* (300 ms) ahead of playback. Drafts are capped at the first burst and paced once kept. Off, the LLM runs free and the ticks are only logged. Grants and ticks are ordinary messages driven by recorded IO and timers, so they replay exactly; a future engine running the models in one process would take the grants over its own channel and report what it ran per tick, without changing the pipeline or replay.
 
 ### Turn model
 

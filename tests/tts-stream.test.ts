@@ -32,7 +32,7 @@ function harness(params: Record<string, unknown> = {}, def = kyutaiTtsNode) {
   const send = (t: number, port: string, msg: Msg) => ((now = t), node.onInput?.(port, msg));
   const llm = (t: number, type: string, text = '') => send(t, 'text', { type: `llm.${type}`, rid: 'r0', text });
   const pcm = (n: number) => new Uint8Array(n * 2);
-  const types = () => out.map((m) => m.type);
+  const types = () => out.map((m) => m.type).filter((t) => t !== 'tts.sent');
   return { send, llm, ios, out, pcm, types };
 }
 

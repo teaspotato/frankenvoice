@@ -63,6 +63,9 @@ Server to client:
 - binary: 16-bit little-endian mono PCM at 24 kHz, in order.
 - `{"type": "Words", "words": [{"word", "start", "end"}]}`: word timings in seconds
   from this connection's first audio sample, sent as words are spoken.
+- `{"type": "Consumed", "words": n, "queued": q}`: the model has read `n` words, and `q` whole words it
+  has been sent wait to be read. It reads a word about a second before it is heard; `q` is the text it
+  still has to go on (a client pacing its text source keeps it above the lookahead). Sent when either changes.
 - `{"type": "Flushed"}`, `{"type": "Done", "stats": {...}}`, `{"type": "Error", "message": "..."}`.
 
 The model needs the current word plus 2 words of lookahead, so it waits until 3 words are

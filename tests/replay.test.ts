@@ -47,6 +47,10 @@ describe('record and replay', () => {
     expect(types('scores')).toContain('turnmodel.eot');
     // Kyutai's word timings, placed on the agent's track.
     expect(types('audio')).toContain('tts.words');
+    // The tick scheduler paced the replies: chunks, grants, and a logged tick every 80 ms.
+    expect(types('text')).toContain('llm.chunk');
+    expect(types('control')).toContain('sched.grant');
+    expect(types('ticks')).toContain('sched.tick');
     // The turn model, not ASR endpointing, ended the user's turns.
     const commits = live.events.filter((e) => e.kind === 'msg' && (e.data as { type: string; on?: string }).on === 'commit');
     expect(commits.length).toBeGreaterThan(0);

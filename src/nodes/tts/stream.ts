@@ -218,6 +218,9 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
         }
         if (r.open) r.open.text = r.buf.slice(0, ready).trim();
         r.io.send({ type: 'Speak', text });
+        // For the scheduler: how many words TTS has been given.
+        const words = text.split(/\s+/).filter(Boolean).length;
+        if (words) ctx.emit('audio', { type: 'tts.sent', rid: r.rid, words });
         r.spoken = ready;
         ctx.setState('status', 'synthesizing');
       }
@@ -306,6 +309,11 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
                 end: placeOn(r.pieces, w.end),
               }));
               if (words.length) ctx.emit('audio', { type: 'tts.words', rid: r.rid, words: words as unknown as Json });
+              return;
+            }
+            if (m.type === 'Consumed') {
+              // For the scheduler: the words the model still has to read.
+              ctx.emit('audio', { type: 'tts.consumed', rid: r.rid, words: m.words ?? 0, queued: m.queued ?? 0 });
               return;
             }
             if (m.type === 'Flushed') {

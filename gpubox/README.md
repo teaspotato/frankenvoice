@@ -141,5 +141,5 @@ Set the local server's GPU box URL to the `GPUBOX_URL` and its token to `GPUBOX_
 - **TTS Words** times are `(text step + 19 - step of first audio frame) * 80 ms - 40 ms`. The -40 ms was calibrated
   against Qwen3-ForcedAligner on 6 renders (124 words). A word's `end` is the next word's start, so it includes any
   pause after the word.
-- **TTS Done** carries an extra `stats` object (`ttfa_ms`, `rtf`, `audio_s`, ...).
+- **TTS Done** carries an extra `stats` object (`ttfa_ms`, `rtf`, `rtf_3s` over the first 3 s of audio, `step_ms_p90`, `step_ms_max`, `audio_s`, ...).
 - A TTS socket that sends no text for 30 s without Close is treated as Closed, so it can't hold the GPU forever.
