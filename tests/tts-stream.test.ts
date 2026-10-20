@@ -1,16 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { cutAt, streamingTtsNode } from '../src/nodes/tts/stream';
+import { cutAt, kyutaiTtsNode, streamingTtsNode } from '../src/nodes/tts/stream';
 import { resolveParams, type IOHandlers, type NodeContext } from '../src/core/node';
 import type { Json, Msg } from '../src/core/types';
 
-function harness(params: Record<string, unknown> = {}) {
+function harness(params: Record<string, unknown> = {}, def = streamingTtsNode) {
   let now = 0;
   const out: Msg[] = [];
   const ios: { request: Json; h: IOHandlers; closed: boolean; sent: Json[] }[] = [];
   let media = 0;
   const ctx: NodeContext = {
     id: 'tts',
-    params: resolveParams(streamingTtsNode, { alignWords: false, ...params } as never),
+    params: resolveParams(def, { alignWords: false, ...params } as never),
     now: () => now,
     cause: undefined,
     emit: (_port, msg) => (out.push(msg), out.length),
@@ -28,7 +28,7 @@ function harness(params: Record<string, unknown> = {}) {
       append: (track, samples) => ({ track, start: media, end: (media += samples.length) }),
     },
   };
-  const node = streamingTtsNode.create(ctx as never);
+  const node = def.create(ctx as never);
   const send = (t: number, port: string, msg: Msg) => ((now = t), node.onInput?.(port, msg));
   const llm = (t: number, type: string, text = '') => send(t, 'text', { type: `llm.${type}`, rid: 'r0', text });
   const pcm = (n: number) => new Uint8Array(n * 2);
@@ -158,5 +158,61 @@ describe('word timings in the pipeline', () => {
     expect(tts(buildGraph(c)).alignWords).toBeUndefined();
     c.speaker.params.speaker = { resumeFrom: 'cut' };
     expect(tts(buildGraph(c)).alignWords).toBe(false);
+  });
+});
+
+describe('streaming TTS (Kyutai on the GPU box)', () => {
+  const kyutai = (params: Record<string, unknown> = {}) => harness(params, kyutaiTtsNode);
+
+  it('sends whole words as they come, flushes at sentence ends, and closes the text when the LLM ends', () => {
+    const h = kyutai();
+    h.llm(0, 'start');
+    expect(h.ios[0].request).toEqual({ path: '/v1/tts', query: {} });
+    h.llm(100, 'delta', 'Sure, I can he');
+    expect(h.ios[0].sent).toEqual([{ type: 'Speak', text: 'Sure, I can ' }]);
+    h.ios[0].h.onRecv!(null, h.pcm(100));
+    h.llm(150, 'delta', 'lp. Then');
+    expect(h.ios[0].sent.slice(1)).toEqual([{ type: 'Speak', text: 'help. ' }, { type: 'Flush' }]);
+    h.llm(300, 'delta', ' bye.');
+    h.llm(310, 'end');
+    expect(h.ios[0].sent.slice(3)).toEqual([{ type: 'Speak', text: 'Then ' }, { type: 'Speak', text: 'bye.' }, { type: 'Flush' }, { type: 'Close' }]);
+    h.ios[0].h.onRecv!(null, h.pcm(50));
+    h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
+    h.ios[0].h.onRecv!(null, h.pcm(30));
+    h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
+    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'audio', 'tts.segment_end', 'tts.segment_start', 'audio', 'tts.segment_end', 'tts.response_end']);
+    expect(h.out.filter((m) => m.type === 'tts.segment_start').map((m) => m.text)).toEqual(['Sure, I can help.', 'Then bye.']);
+    // Close went out with the end of the text; it is not sent again.
+    expect(h.ios[0].sent.filter((m) => (m as { type: string }).type === 'Close')).toHaveLength(1);
+    expect(h.ios[0].closed).toBe(true);
+  });
+
+  it('flushes an opener at once without ending the text, and the reply follows on the same socket', () => {
+    const h = kyutai();
+    h.llm(0, 'start');
+    h.send(100, 'text', { type: 'opener.say', rid: 'r0', text: 'Hmm, let me see ', line: 'Hmm, let me see' });
+    expect(h.ios[0].sent).toEqual([{ type: 'Speak', text: 'Hmm, let me see ' }, { type: 'Flush' }]);
+    h.llm(900, 'delta', 'It is 391.');
+    h.llm(950, 'end');
+    expect(h.ios[0].sent.slice(2)).toEqual([{ type: 'Speak', text: 'It is ' }, { type: 'Speak', text: '391.' }, { type: 'Flush' }, { type: 'Close' }]);
+  });
+
+  it('places the server’s word times on the media track', () => {
+    const h = kyutai({ alignWords: true });
+    h.llm(0, 'start');
+    h.llm(10, 'delta', 'Hello there. ');
+    h.send(20, 'text', { type: 'bc.say', id: 'b', line: 'x', take: 'x' }); // not rendered: logs only
+    h.ios[0].h.onRecv!(null, h.pcm(24000));
+    h.ios[0].h.onRecv!({ type: 'Words', words: [{ word: 'Hello', start: 0.1, end: 0.5 }] }, undefined);
+    expect(h.out.find((m) => m.type === 'tts.words')).toEqual({ type: 'tts.words', rid: 'r0', words: [{ word: 'Hello', start: 2400, end: 12000 }] });
+  });
+
+  it('renders canned lines one socket each, each closed after its line', () => {
+    const h = kyutai();
+    h.send(0, 'text', { type: 'opener.lines', lines: ['Hmm.', 'Right.'] });
+    expect(h.ios.map((x) => x.sent)).toEqual([
+      [{ type: 'Speak', text: 'Hmm.' }, { type: 'Flush' }, { type: 'Close' }],
+      [{ type: 'Speak', text: 'Right.' }, { type: 'Flush' }, { type: 'Close' }],
+    ]);
   });
 });

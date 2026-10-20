@@ -92,16 +92,17 @@ const silero: LiveDriver = (req, sink) => {
   };
 };
 
-function wsUrl(path: string, query: Record<string, Json>): string {
-  const u = new URL(`/api/deepgram${path}`, location.href);
+function wsUrl(upstream: string, path: string, query: Record<string, Json>): string {
+  const u = new URL(`/api/${upstream}${path}`, location.href);
   u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
   for (const [k, v] of Object.entries(query)) u.searchParams.set(k, String(v));
   return u.toString();
 }
 
-const deepgram: LiveDriver = (req, sink) => {
+/** A streaming WebSocket through the proxy: JSON as text frames, audio as binary frames. `$open` is synthesized on connect. */
+const proxiedSocket = (upstream: string): LiveDriver => (req, sink) => {
   const r = req as { path: string; query: Record<string, Json> };
-  const ws = new WebSocket(wsUrl(r.path, r.query));
+  const ws = new WebSocket(wsUrl(upstream, r.path, r.query));
   ws.binaryType = 'arraybuffer';
   const pending: (string | ArrayBuffer)[] = [];
   let closedByNode = false;
@@ -129,6 +130,9 @@ const deepgram: LiveDriver = (req, sink) => {
     },
   };
 };
+
+const deepgram = proxiedSocket('deepgram');
+const gpubox = proxiedSocket('gpubox');
 
 /** Workers: one ACP agent process per exchange, run by the proxy; JSON-RPC lines both ways. */
 const acp: LiveDriver = (_req, sink) => {
@@ -806,4 +810,4 @@ const embed: LiveDriver = (req, sink) => {
   };
 };
 
-export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel, embed, acp, typesafe };
+export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'gpubox-asr': gpubox, 'gpubox-tts': gpubox, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel, embed, acp, typesafe };

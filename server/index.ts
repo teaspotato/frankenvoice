@@ -48,6 +48,13 @@ const SETTINGS: SettingDef[] = [
   { name: 'CARTESIA_API_KEY', group: 'Cartesia (TTS)', label: 'API key', secret: true },
   { name: 'CARTESIA_BASE_URL', group: 'Cartesia (TTS)', label: 'Base URL', default: 'https://api.cartesia.ai' },
   { name: 'CARTESIA_VERSION', group: 'Cartesia (TTS)', label: 'API version', default: '2025-04-16' },
+  {
+    name: 'GPUBOX_BASE_URL',
+    group: 'GPU box (Qwen3-ASR, Kyutai TTS)',
+    label: 'Base URL',
+    hint: 'ws(s) URL of gpubox/server.py, e.g. wss://xyz.trycloudflare.com',
+  },
+  { name: 'GPUBOX_TOKEN', group: 'GPU box (Qwen3-ASR, Kyutai TTS)', label: 'Token', secret: true, hint: 'Printed by gpubox/setup.sh' },
   { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'API key', secret: true },
   { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
   {
@@ -131,6 +138,7 @@ const upstreams: Record<string, Upstream> = {
   },
   deepgram: { baseVar: 'DEEPGRAM_BASE_URL', keyVar: 'DEEPGRAM_API_KEY', headers: (key) => ({ authorization: `Token ${key}` }) },
   typesafe: { baseVar: 'TYPESAFE_BASE_URL', keyVar: 'TYPESAFE_API_KEY', headers: bearer },
+  gpubox: { baseVar: 'GPUBOX_BASE_URL', keyVar: 'GPUBOX_TOKEN', headers: bearer },
   // OpenAI-compatible endpoints, addressed as /api/openai/<name>/...
   'openai/openrouter': {
     baseVar: 'OPENROUTER_BASE_URL',
@@ -188,7 +196,7 @@ async function forward(name: string, rest: string, req: IncomingMessage, res: Se
   const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : new Uint8Array(await readBody(req));
   const ac = new AbortController();
   res.on('close', () => ac.abort());
-  // The Deepgram upstream is a ws(s) URL for streaming ASR; its REST endpoints (TTS) use http(s).
+  // Deepgram and the GPU box are ws(s) URLs for streaming; their REST endpoints use http(s).
   const base = upBase.replace(/^ws(s?):/, 'http$1:');
   const upstream = await fetch(base + rest, { method: req.method, headers, body, signal: ac.signal });
   const outHeaders: Record<string, string> = {};
@@ -265,7 +273,7 @@ const server = createServer((req, res) => {
     if (p === '/api/health') {
       return json(res, 200, { ...Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])), acp: !!setting('FV_ACP_COMMAND') });
     }
-    let m = /^\/api\/(anthropic|cartesia|deepgram|typesafe|openai\/[\w-]+)(\/.*)$/.exec(p);
+    let m = /^\/api\/(anthropic|cartesia|deepgram|gpubox|typesafe|openai\/[\w-]+)(\/.*)$/.exec(p);
     if (m) return forward(m[1], m[2] + url.search, req, res);
     m = /^\/api\/sessions(?:\/([^/]+))?$/.exec(p);
     if (m) return sessions(req, res, m[1] && decodeURIComponent(m[1]));
@@ -277,7 +285,7 @@ const server = createServer((req, res) => {
   });
 });
 
-// Deepgram streaming: browser <-> proxy <-> Deepgram, frames passed through unchanged.
+// Streaming (Deepgram, the GPU box): browser <-> proxy <-> upstream, frames passed through unchanged.
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');
@@ -285,12 +293,13 @@ server.on('upgrade', (req, socket, head) => {
     if (!localOnly(req)) return socket.destroy();
     return wss.handleUpgrade(req, socket, head, (client) => void acp(client).catch((e: unknown) => client.close(1011, String(e).slice(0, 120))));
   }
-  const m = /^\/api\/deepgram(\/.*)$/.exec(url.pathname);
+  const m = /^\/api\/(deepgram|gpubox)(\/.*)$/.exec(url.pathname);
   if (!m || !localOnly(req)) return socket.destroy();
+  const name = m[1];
   wss.handleUpgrade(req, socket, head, (client) => {
-    const up = upstreams.deepgram;
-    if (!configured(up)) return client.close(1011, 'DEEPGRAM_API_KEY is not set (set it in Settings)');
-    const remote = new WebSocket(baseOf(up) + m[1] + url.search, { headers: up.headers(keyOf(up)) });
+    const up = upstreams[name];
+    if (!configured(up)) return client.close(1011, `${!baseOf(up) ? up.baseVar : up.keyVar} is not set (set it in Settings)`);
+    const remote = new WebSocket(baseOf(up) + m[2] + url.search, { headers: up.headers(keyOf(up)) });
     const queued: { data: Buffer; binary: boolean }[] = [];
     client.on('message', (data: Buffer, binary) => {
       if (remote.readyState === WebSocket.OPEN) remote.send(data, { binary });
@@ -301,7 +310,7 @@ server.on('upgrade', (req, socket, head) => {
     });
     remote.on('message', (data: Buffer, binary) => client.readyState === WebSocket.OPEN && client.send(data, { binary }));
     remote.on('unexpected-response', (_r, res) => {
-      client.close(1011, `deepgram HTTP ${res.statusCode}`.slice(0, 120));
+      client.close(1011, `${name} HTTP ${res.statusCode}`.slice(0, 120));
     });
     // A close reason over 123 bytes throws; keep it short.
     remote.on('close', (code, reason) => client.readyState === WebSocket.OPEN && client.close(sendableCode(code), reason.subarray(0, 120)));

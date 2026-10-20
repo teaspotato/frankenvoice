@@ -2,11 +2,13 @@ import type { NodeDef } from '../../core/node';
 import type { AudioMsg, Json, JsonObject } from '../../core/types';
 import { isAudioMsg } from '../../core/types';
 import { deepgramAdapter } from './deepgram';
+import { gpuboxAsrAdapter } from './gpubox';
 import type { AsrAdapter } from './types';
 import { paramsFor, providerParams } from '../providers';
 
 export const asrAdapters: Record<string, AsrAdapter> = {
   [deepgramAdapter.provider]: deepgramAdapter,
+  [gpuboxAsrAdapter.provider]: gpuboxAsrAdapter,
 };
 
 /**
@@ -19,7 +21,7 @@ export const asrNode: NodeDef = {
   type: 'asr',
   title: 'ASR',
   category: 'asr',
-  description: 'Streaming speech-to-text with interim results and endpointing. Providers: Deepgram.',
+  description: 'Streaming speech-to-text with interim results and endpointing. Providers: Deepgram, Qwen3-ASR on the GPU box.',
   inputs: [
     { name: 'audio', type: 'audio' },
     { name: 'vad', type: 'vad', description: 'speech_end: ask the provider to finalize now' },
