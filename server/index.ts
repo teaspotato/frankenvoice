@@ -314,12 +314,13 @@ const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://local');
   const p = url.pathname;
   // Hosted mode: `?token=` on a page load sets the cookie, then the token is dropped from the URL.
+  // Lax, not Strict: a Strict cookie isn't sent on the redirect when the link was opened from another site.
   const given = url.searchParams.get('token');
   if (HOST_TOKEN && given !== null && req.method === 'GET' && !p.startsWith('/api/')) {
     if (!sameToken(given)) return json(res, 403, { error: 'wrong token' });
     url.searchParams.delete('token');
     res.writeHead(302, {
-      'set-cookie': `fv_token=${encodeURIComponent(given)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`,
+      'set-cookie': `fv_token=${encodeURIComponent(given)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`,
       location: url.pathname + url.search,
     });
     return res.end();
