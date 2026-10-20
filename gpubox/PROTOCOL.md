@@ -1,7 +1,7 @@
 # GPU box protocol
 
-One HTTP/WebSocket server on the GPU box (`gpubox/server.py`). The local proxy forwards
-`/api/gpubox/...` to it, adding `Authorization: Bearer <GPUBOX_TOKEN>`. The server
+One HTTP/WebSocket server on the GPU box (`gpubox/server.py`). The Frankenvoice server connects
+to it, adding `Authorization: Bearer <GPUBOX_TOKEN>`. The server
 rejects any request without that token (`?token=` also accepted, for testing). All JSON
 messages are text frames; audio is binary frames.
 
