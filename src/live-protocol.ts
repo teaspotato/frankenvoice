@@ -10,6 +10,8 @@
 //   {type:'stop'} {type:'pause'} {type:'resume'}
 //   {type:'mic.ready', ...device} {type:'mic.error', error}
 //   {type:'speaker.late', id, at, ms}          a playback run started `ms` after its session time `at`
+//   {type:'speaker.gate', id, at, pos, stop, silent}  the page gate cut playback at session time `at`, on user speech from mic
+//                                              sample `pos`; the sound ended at `stop` (syllable end) and was silent at `silent`
 //   bin {k:'mic', frame, ctxTime} + f32 PCM    a capture frame
 //   bin {k:'replay', graph?, liveChannels, audible} + session bundle   replay it on the server
 // Server -> page
@@ -20,6 +22,7 @@
 //   bin {k:'track', name, sampleRate} + f32    samples appended to a media track (before the events using them)
 //   {type:'mic.open', request} {type:'mic.close'}
 //   bin {k:'speaker', id, cmd, ..., now, s} + f32   a speaker command, with the session clock when sent
+//                                              (cmd 'gate', until: the page may stop playback on its own VAD until then; null: not)
 //   {type:'speaker.close', id}
 //   {type:'ended', id, stoppedAt?}             the run stopped; its full bundle follows
 //   bin {k:'bundle'} + session bundle

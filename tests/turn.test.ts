@@ -275,7 +275,7 @@ describe('speech over the agent, classified by its words', () => {
     for (const [seg, at] of [1500, 4000, 7000].entries()) h.send(1500, 'playback', { type: 'playback.segment', rid: 'r0', seg, at });
     return h;
   }
-  const controls = (h: ReturnType<typeof harness>) => h.out.filter((o) => o.port === 'control').map((o) => o.msg.type);
+  const controls = (h: ReturnType<typeof harness>) => h.out.filter((o) => o.port === 'control').map((o) => o.msg.type).filter((t) => t !== 'gate');
   const over = (h: ReturnType<typeof harness>, t0: number, t1: number, text: string) => {
     h.send(t0, 'vad', { type: 'vad.speech_start', at: t0 * sr });
     h.send(t1, 'vad', { type: 'vad.speech_end', at: t1 * sr });

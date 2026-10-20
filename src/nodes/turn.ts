@@ -98,6 +98,8 @@ interface DuplexParams {
   onset: string;
   holdAfterMs: number;
   yieldWithinMs: number;
+  pageGate: boolean;
+  pageGateWaitMs: number;
   duckDb: number;
   floorWords: string;
   asides: boolean;
@@ -159,6 +161,8 @@ type Candidate = {
   check?: () => void;
   /** Cuts the agent off (or ducks it) once the speech has gone on for `holdAfterMs`. */
   holdTimer?: TimerHandle;
+  /** The page stopped the agent on its own VAD: waiting for the VAD here to hear the speech too. */
+  gate?: TimerHandle;
 };
 
 /** Media samples per ms (16 kHz). */
@@ -363,6 +367,23 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       when: { bargeIn: [true] },
     },
     {
+      key: 'pageGate',
+      label: 'Stop in the page',
+      type: 'boolean',
+      default: true,
+      description:
+        'While a quick yield is allowed (the first yieldWithinMs of a reply), the page runs its own FireRedVAD on the mic and stops playback the moment it hears the user, without the round trip to the server. The yield waits for the VAD here: if it hears no speech in time, the agent goes on from where it stopped. Needs browser echo cancellation.',
+      when: { bargeIn: [true] },
+    },
+    {
+      key: 'pageGateWaitMs',
+      label: 'Confirm within (ms)',
+      type: 'number',
+      default: 600,
+      description: 'After the page stopped the agent, how long the VAD here has to hear the speech too; else the agent plays on.',
+      when: { bargeIn: [true], pageGate: [true] },
+    },
+    {
       key: 'holdAfterMs',
       label: 'Cut after (ms)',
       type: 'number',
@@ -563,6 +584,13 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let held = false;
     /** When the agent's current reply started playing. */
     let playingSince: number | null = null;
+    /** Until when (session time) the page may stop playback on its own VAD; null: it may not. */
+    let gateUntil: number | null = null;
+    const arm = (until: number | null) => {
+      if (until === gateUntil) return;
+      gateUntil = until;
+      ctx.emit('control', { type: 'gate', until });
+    };
     /** Words said over the agent that it should take in, held until its current sentence ends. */
     let aside: { text: string; from: number; to: number; timer?: TimerHandle; cutting?: boolean } | null = null;
     const useModel = () => p.useModel && model;
@@ -645,6 +673,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       state = next;
       ctx.emit('turn', { type: 'turn.transition', from: prev, to: next, on, why });
       ctx.setState('state', next);
+      if (next !== 'speaking') arm(null);
       if (holder(next) !== holder(prev)) {
         ctx.setState('floor', holder(next));
         ctx.log('info', `floor -> ${holder(next)}`, { why });
@@ -863,6 +892,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     const yieldFloor = (c: Candidate, why: string, quick = false) => {
       c.timer?.clear();
       c.wait?.clear();
+      c.gate?.clear();
       candidate = null;
       // Cancelling drops the held audio; the speaker restores its volume for the next reply.
       held = false;
@@ -936,6 +966,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       if (c.text && opensFloor(c.text)) return yieldFloor(c, 'floor-taking opener');
       c.timer?.clear();
       c.wait?.clear();
+      c.gate?.clear();
       candidate = null;
       const kind = !words(c.text).length ? 'noise' : isBackchannel(c.text) || !p.asides ? 'backchannel' : 'aside';
       if (kind !== 'aside') release();
@@ -987,6 +1018,38 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       c.check = check;
       c.timer = ctx.setTimer(classifies() || modelDecides() ? p.maxBackchannelMs : p.minSpeechMs, check, 'barge-in');
       return c;
+    };
+
+    /**
+     * The page heard the user start within the quick-yield window and stopped playback itself (the
+     * speaker is paused where it stopped). The VAD here decides: speech within `pageGateWaitMs` is
+     * the quick yield; none, and the agent plays on from where it stopped (noise, or echo the page heard).
+     */
+    const pageStopped = (msg: Msg) => {
+      gateUntil = null;
+      const why = `the page heard the user ${Math.round((msg.cut as number) - (playingSince ?? 0))} ms after the agent started`;
+      if (state === 'speaking+user' && candidate) return yieldFloor(candidate, why, true);
+      const c = state === 'speaking' ? overlap(msg.pos as number, 'user speech (page VAD)') : null;
+      if (!c) return void ctx.emit('control', { type: 'resume' });
+      if (speaking) return yieldFloor(c, why, true);
+      // Nothing to judge until the VAD here hears it.
+      c.timer?.clear();
+      c.holdTimer?.clear();
+      c.timer = c.holdTimer = undefined;
+      held = true;
+      c.gate = ctx.setTimer(
+        p.pageGateWaitMs,
+        () => {
+          c.gate = undefined;
+          if (candidate !== c) return;
+          candidate = null;
+          decide('noise', { ms: ctx.now() - c.since, text: c.text, why: `the page heard speech, the VAD here none in ${p.pageGateWaitMs} ms` });
+          go('backchannel', 'page stop not confirmed');
+          held = false;
+          ctx.emit('control', { type: 'resume' });
+        },
+        'page-gate',
+      );
     };
 
     ctx.setState('floor', holder(state));
@@ -1052,6 +1115,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         if (msg.type === 'playback.start') {
           playingSince = ctx.now();
           go('playback_start', 'playback started');
+          if (state === 'speaking' && p.bargeIn && p.pageGate && p.yieldWithinMs > 0) arm(playingSince + p.yieldWithinMs);
           // They started talking while it was thinking: don't talk over them while their words are judged.
           if (candidate) holdWhenSustained(candidate);
         } else if (msg.type === 'playback.end') {
@@ -1070,6 +1134,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             takeAside();
             if (!c) commit('aside, after the agent finished', undefined, { aside: true });
           }
+        } else if (msg.type === 'playback.paused' && msg.gate) {
+          pageStopped(msg);
         } else if (msg.type === 'playback.interrupted') {
           // Stopped before a word of it was heard: not a fight over the floor.
           if (countIfHeard) {
@@ -1101,7 +1167,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
           silence?.clear();
           silence = null;
           backoff?.timer?.clear();
-          if (state === 'speaking' && p.yieldWithinMs > 0 && playingSince !== null && ctx.now() - playingSince < p.yieldWithinMs) {
+          if (candidate?.gate) {
+            // The page already stopped the agent on this speech.
+            const c = candidate;
+            yieldFloor(c, `user speech (VAD), ${Math.round(ctx.now() - c.since)} ms after the page stopped the agent`, true);
+          } else if (state === 'speaking' && p.yieldWithinMs > 0 && playingSince !== null && ctx.now() - playingSince < p.yieldWithinMs) {
             // Both started into the same silence: the agent backs off at once rather than fight over the floor.
             const c = overlap(msg.at as number, 'user speech (VAD)');
             if (c && candidate === c) yieldFloor(c, `user spoke ${Math.round(ctx.now() - playingSince)} ms after the agent started`, true);

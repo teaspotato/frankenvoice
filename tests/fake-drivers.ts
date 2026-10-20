@@ -148,9 +148,18 @@ const typesafe: LiveDriver = (req, sink) => {
   return { send() {}, close: () => void (closed = true) };
 };
 
+/** A chat model: a fixed reply, cut at max_tokens; a last assistant message is continued (llama.cpp's prefill). */
 const openai: LiveDriver = (req, sink) => {
-  const r = req as { body: { messages: unknown[] } };
-  const tokens = `Reply number ${r.body.messages.length}. This is a second sentence! And a third?`.match(/\S+\s*/g)!;
+  const r = req as { body: { messages: { role: string; content: string }[]; max_tokens?: number } };
+  const msgs = r.body.messages;
+  const prefill = msgs.at(-1)?.role === 'assistant' ? msgs.at(-1)!.content : '';
+  const users = msgs.filter((m) => m.role !== 'assistant').length;
+  let tokens: string[] = `Reply number ${users}. This is a second sentence! And a third?`.match(/\S+\s*/g)!;
+  let skip = 0;
+  while (prefill && skip < tokens.length && tokens.slice(0, skip).join('').trimEnd() !== prefill) skip++;
+  tokens = tokens.slice(skip);
+  const cut = r.body.max_tokens !== undefined && tokens.length > r.body.max_tokens;
+  if (cut) tokens = tokens.slice(0, r.body.max_tokens);
   let closed = false;
   let t = jitter(2, 3);
   const ev = (e: Json) => {
@@ -158,7 +167,7 @@ const openai: LiveDriver = (req, sink) => {
     later(t, () => !closed && sink.recv(e));
   };
   for (const tok of tokens) ev({ id: 'c1', choices: [{ index: 0, delta: { content: tok }, finish_reason: null }] });
-  ev({ id: 'c1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+  ev({ id: 'c1', choices: [{ index: 0, delta: {}, finish_reason: cut ? 'length' : 'stop' }] });
   ev({ $done: true });
   later(t + 1, () => !closed && sink.close());
   return { send() {}, close: () => void (closed = true) };
@@ -170,6 +179,8 @@ const gpuboxTts: LiveDriver = (_req, sink) => {
   let text = '';
   /** Seconds of audio sent on this socket. */
   let at = 0;
+  /** Words the model has read. */
+  let read = 0;
   const out = sequence((m) => sink.recv(m), () => closed);
   out({ type: '$open' }, jitter(2, 3));
   out({ type: 'Ready', sample_rate: 24000 });
@@ -181,6 +192,8 @@ const gpuboxTts: LiveDriver = (_req, sink) => {
     const pcm = new Int16Array(n).map((_, i) => Math.round(Math.sin(i / 10) * 3000));
     const bytes = new Uint8Array(pcm.buffer);
     const per = n / 24000 / ws.length;
+    read += ws.length;
+    out({ type: 'Consumed', words: read, queued: 0 }, jitter(0.5, 1));
     out({ type: 'Words', words: ws.map((word, i) => ({ word, start: at + i * per, end: at + (i + 1) * per })) }, jitter(1, 2));
     at += n / 24000;
     // Deliberately split mid-sample.
@@ -206,6 +219,22 @@ const gpuboxTts: LiveDriver = (_req, sink) => {
     },
     close: () => void (closed = true),
   };
+};
+
+/** The server's canned-line cache: a tone for the line, from the cache or a background render. */
+const ttsCanned: LiveDriver = (req, sink) => {
+  const { text } = req as { text: string };
+  let closed = false;
+  const n = Math.round(text.length * 0.004 * 24000);
+  const pcm = new Int16Array(n).map((_, i) => Math.round(Math.sin(i / 7) * 3000));
+  const cached = Math.random() < 0.5;
+  later(jitter(cached ? 0.5 : 5, 3), () => {
+    if (closed) return;
+    sink.recv({ type: 'Canned', cached, key: 'k', sampleRate: 24000 });
+    sink.recv(null, new Uint8Array(pcm.buffer));
+    sink.close(null);
+  });
+  return { send() {}, close: () => void (closed = true) };
 };
 
 /** RNNoise stand-in: halves the signal, one reply per frame, after a random delay. */
@@ -262,7 +291,7 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, openai, rnnoise, speaker, 'turn-model': turnModel, typesafe };
+export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, 'tts-canned': ttsCanned, openai, rnnoise, speaker, 'turn-model': turnModel, typesafe };
 
 /** The default pipeline with the turn model on (it is off by default, a big download). */
 export function testConfig(): PipelineConfig {
@@ -270,5 +299,7 @@ export function testConfig(): PipelineConfig {
   c.turnmodel.variant = 'ssl_turn';
   // The fake user talks soon after replies start; these tests are about the rest of the floor rules.
   c.turn.params['full-duplex'] = { yieldWithinMs: 0 };
+  // Small chunks, so replies are paced by the scheduler.
+  c.sched.params.tick = { firstTokens: 3, chunkTokens: 2 };
   return c;
 }

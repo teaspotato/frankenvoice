@@ -12,9 +12,10 @@ import { speakerNode } from './speaker';
 import { echoLlmNode, toneTtsNode } from './mocks';
 import { backchannelNode, noBackchannelNode } from './backchannel';
 import { interjectNode, noInterjectNode } from './interject';
+import { schedNode } from './sched';
 
 export const registry: NodeRegistry = Object.fromEntries(
-  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, fireredVadNode, energyVadNode, asrNode, turnModelNode, noTurnModelNode, duplexTurnNode, halfDuplexTurnNode, llmNode, fillerOpenerNode, choiceOpenerNode, noOpenerNode, kyutaiTtsNode, speakerNode, echoLlmNode, toneTtsNode, backchannelNode, noBackchannelNode, interjectNode, noInterjectNode].map(
+  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, fireredVadNode, energyVadNode, asrNode, turnModelNode, noTurnModelNode, duplexTurnNode, halfDuplexTurnNode, llmNode, fillerOpenerNode, choiceOpenerNode, noOpenerNode, kyutaiTtsNode, speakerNode, echoLlmNode, toneTtsNode, backchannelNode, noBackchannelNode, interjectNode, noInterjectNode, schedNode].map(
     (d) => [d.type, d],
   ),
 );

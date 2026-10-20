@@ -5,7 +5,19 @@ import { Trajectory, type TrajectoryMeta } from '../core/trajectory';
 import type { GraphSpec } from '../core/graph';
 import type { Json, TrajEvent } from '../core/types';
 import { f32Of, frame, unframe } from '../live-protocol';
-import { captureMic, speakerOutputs, type MicRequest } from './audio';
+import { captureMic, speakerOutputs, type CutParams, type MicRequest } from './audio';
+import { PageGate } from './gate';
+import { resolveParams } from '../core/node';
+import { duplexTurnNode } from '../nodes/turn';
+
+/** The graph has turn-taking that may arm the page gate. */
+function wantsPageGate(graph: GraphSpec): boolean {
+  return graph.nodes.some((n) => {
+    if (n.type !== duplexTurnNode.type) return false;
+    const p = resolveParams(duplexTurnNode, n.params ?? {});
+    return !!p.pageGate && !!p.bargeIn && Number(p.yieldWithinMs) > 0;
+  });
+}
 
 export interface LiveHandlers {
   /** A run started on the server; `traj` fills as its events arrive. */
@@ -33,6 +45,11 @@ export class LiveClient {
   private clock = { now: 0, s: 0, paused: true };
   private stopMic: (() => void) | null = null;
   private speakers = new Map<number, ReturnType<typeof speakerOutputs>>();
+  /** Speakers the server lets the page stop on its own VAD, until a session time, with the fade to use. */
+  private gateArms = new Map<number, { until: number } & CutParams>();
+  /** The mic the page gate listens to: 16 kHz with browser echo cancellation (else it would hear the agent). */
+  private gateMic: { frameSamples: number } | null = null;
+  private gate = new PageGate((pos) => this.gateOnset(pos));
 
   constructor(private on: LiveHandlers) {}
 
@@ -91,6 +108,8 @@ export class LiveClient {
   }
 
   start(graph: GraphSpec, o: { env: Record<string, Json>; autosave: boolean; title: string }) {
+    // Load the page gate's VAD now, so the first reply finds it ready.
+    if (wantsPageGate(graph)) this.gate.load();
     this.send({ type: 'start', graph: graph as unknown as Json, env: o.env, autosave: o.autosave, title: o.title });
   }
 
@@ -115,6 +134,7 @@ export class LiveClient {
     this.stopMic = null;
     for (const s of this.speakers.values()) s.close();
     this.speakers.clear();
+    this.gateArms.clear();
   }
 
   private onMessage(m: { type: string; [k: string]: Json }) {
@@ -140,10 +160,12 @@ export class LiveClient {
       case 'mic.close':
         this.stopMic?.();
         this.stopMic = null;
+        this.gateMic = null;
         return;
       case 'speaker.close':
         this.speakers.get(m.id as number)?.close();
         this.speakers.delete(m.id as number);
+        this.gateArms.delete(m.id as number);
         return;
       case 'ended':
         this.clock = { ...this.clock, paused: true };
@@ -163,6 +185,17 @@ export class LiveClient {
     else if (h.k === 'bundle') this.on.bundle(payload.slice());
     else if (h.k === 'speaker') {
       const id = h.id as number;
+      if (h.cmd === 'gate') {
+        if (typeof h.until !== 'number') return void this.gateArms.delete(id);
+        this.gate.load();
+        return void this.gateArms.set(id, {
+          until: h.until,
+          cutoff: (h.cutoff as string) ?? 'fade',
+          maxFinishMs: (h.maxFinishMs as number) ?? 0,
+          tailMs: (h.tailMs as number) ?? 0,
+          releaseMs: (h.releaseMs as number) ?? 40,
+        });
+      }
       let s = this.speakers.get(id);
       if (!s) this.speakers.set(id, (s = speakerOutputs(this.now)));
       // The session time now: the clock when the command was sent, plus the time since (server clock).
@@ -173,12 +206,26 @@ export class LiveClient {
     }
   }
 
+  /** The page gate heard the user start: stop each armed speaker now and tell the server when, and where in the mic. */
+  private gateOnset(pos: number) {
+    const now = this.now();
+    for (const [id, arm] of this.gateArms) {
+      this.gateArms.delete(id);
+      if (now >= arm.until) continue;
+      const c = this.speakers.get(id)?.gateCut(now, arm);
+      this.send({ type: 'speaker.gate', id, at: now, pos, ...(c ? { stop: c.stop, silent: c.silent } : {}) });
+    }
+  }
+
   private openMic(r: MicRequest) {
     this.stopMic?.();
+    this.gate.reset();
+    this.gateMic = r.sampleRate === 16000 && r.echoCancellation ? { frameSamples: r.frameSamples } : null;
     this.stopMic = captureMic(r, {
       ready: (device) => this.send({ type: 'mic.ready', ...(device as Record<string, Json>) }),
       frame: (samples, n, ctxTime) => {
         if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(frame({ k: 'mic', frame: n, ctxTime }, new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength)));
+        if (this.gateMic) this.gate.push(samples, n * this.gateMic.frameSamples);
       },
       error: (e) => this.send({ type: 'mic.error', error: e instanceof Error ? `${e.name}: ${e.message}` : String(e) }),
     });

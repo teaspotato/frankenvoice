@@ -42,17 +42,24 @@ let servers: Server[] = [];
 let gpuboxPort = 0;
 let llmPort = 0;
 let livePort = 0;
-const seen = { asr: 0, tts: 0, llm: 0, auth: [] as string[] };
+const seen = { asr: 0, tts: 0, llm: 0, auth: [] as string[], ttsQueries: [] as string[] };
 const sessions = mkdtempSync(join(tmpdir(), 'fv-sessions-'));
 
 beforeAll(async () => {
-  const gpubox = createServer();
+  const gpubox = createServer((req, res) => {
+    if (req.url !== '/v1/tts/config') return res.writeHead(404).end();
+    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ model: 'fake', n_q: 32, temp: 0.6, voice: 'v', cfg: 2, sample_rate: 24000 }));
+  });
   const gwss = new WebSocketServer({ server: gpubox });
   gwss.on('connection', (ws, req) => {
     seen.auth.push(req.headers.authorization ?? '');
     const path = new URL(req.url!, 'http://x').pathname;
     if (path === '/v1/asr') (seen.asr++, serveDriver(ws, fakeDrivers['gpubox-asr'], {}));
-    else if (path === '/v1/tts') (seen.tts++, serveDriver(ws, fakeDrivers['gpubox-tts'], {}));
+    else if (path === '/v1/tts') {
+      seen.tts++;
+      seen.ttsQueries.push(new URL(req.url!, 'http://x').search);
+      serveDriver(ws, fakeDrivers['gpubox-tts'], {});
+    }
     else ws.close(4004);
   });
   const llm = createServer(async (req, res) => {
@@ -163,9 +170,37 @@ describe('the pipeline in the server', () => {
     expect(compareTrajectories(traj, runtime.trajectory).identical).toBe(true);
   }, 20_000);
 
+  it('renders a canned line once on the box, in the background, then serves it from the cache', async () => {
+    const { serverDrivers } = await import('../server/drivers');
+    const cannedDir = mkdtempSync(join(tmpdir(), 'fv-canned-'));
+    const d = serverDrivers(
+      (name): Upstream => (name === 'gpubox' ? { base: `ws://127.0.0.1:${gpuboxPort}`, headers: { authorization: `Bearer ${TOKEN}` } } : { headers: {}, missing: 'off' }),
+      { modelsDir: sessions, cannedDir },
+    );
+    const get = () =>
+      new Promise<{ head: Json; pcm: Uint8Array }>((resolve, reject) => {
+        let head: Json = null;
+        let pcm: Uint8Array = new Uint8Array();
+        d['tts-canned']({ text: 'Mm-hmm.', voice: '', sampleRate: 24000 }, {
+          recv: (m, bin) => (bin ? (pcm = bin) : (head = m)),
+          close: (e) => (e ? reject(new Error(JSON.stringify(e))) : resolve({ head, pcm })),
+        }, { now: () => 0 });
+      });
+    const before = seen.tts;
+    const a = await get();
+    expect(a.head).toMatchObject({ type: 'Canned', cached: false, sampleRate: 24000 });
+    expect(seen.tts).toBe(before + 1);
+    expect(seen.ttsQueries.at(-1)).toContain('priority=background');
+    const b = await get();
+    expect(b.head).toMatchObject({ type: 'Canned', cached: true, key: (a.head as { key: string }).key });
+    expect(seen.tts).toBe(before + 1);
+    expect(b.pcm).toEqual(a.pcm);
+    expect(readdirSync(cannedDir)).toHaveLength(1);
+  });
+
   it('runs onnxruntime-node VADs: Silero and FireRedVAD', async () => {
     const { serverDrivers } = await import('../server/drivers');
-    const d = serverDrivers(() => ({ headers: {}, missing: 'off' }), { modelsDir: sessions });
+    const d = serverDrivers(() => ({ headers: {}, missing: 'off' }), { modelsDir: sessions, cannedDir: sessions });
     const tone = new Float32Array(512).map((_, i) => 0.3 * Math.sin(i / 3));
     for (const [ch, req] of [
       ['silero', { model: 'v5', sampleRate: 16000, frameSamples: 512 }],

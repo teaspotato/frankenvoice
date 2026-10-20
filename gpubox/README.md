@@ -11,7 +11,7 @@ is in [PROTOCOL.md](PROTOCOL.md); the LLM is plain OpenAI `POST /v1/chat/complet
 |---|---|---|---|
 | `asr` | `v-asr` (sglang-omni 0.1.8) | 127.0.0.1:8101 | `sgl-omni serve` Qwen3-ASR-1.7B (or `ASR_MODEL`) with FP8 weights, `mem_fraction_static 0.15`, `max_running_requests 8` |
 | `llm` | none (prebuilt llama.cpp `b11753`, CUDA) | 127.0.0.1:8103 | `llama-server`: `google/gemma-4-12B-it-qat-q4_0-gguf` (official QAT Q4_0) + MTP draft head from `ggml-org/gemma-4-12B-it-GGUF`, 2 slots x 4k context, q8_0 KV cache with a full-size sliding-window cache (`--swa-full`, so a diverging prompt reuses its prefix), thinking off |
-| `tts` | `v-tts` (moshi 0.2.13) | 127.0.0.1:8102 | `kyutai_tts.py`: Kyutai streaming generation, one reply at a time |
+| `tts` | `v-tts` (moshi 0.2.13) | 127.0.0.1:8102 | `kyutai_tts.py`: Kyutai streaming generation, one reply at a time; background renders (canned lines) only when no reply waits, preempted by one |
 | `gateway` | `v-gw` (qwen-asr 0.0.6, FastAPI) | 0.0.0.0:8000 | `server.py`: auth, ASR segmenting/partials/finals, Qwen3-ForcedAligner-0.6B, relays `/v1/tts`, passes `/v1/chat/completions` and `/v1/models` through to `llm` |
 | `tunnel` | none | none | `cloudflared tunnel --protocol http2 --url http://localhost:8000` (quick tunnel; over the default QUIC it moved only ~110 KB/s, random `*.trycloudflare.com`) |
 | `ui` | Node 22 (`$ROOT/node`) | 127.0.0.1:8787 | The Frankenvoice server (`server/index.ts`) in hosted mode: runs the pipeline (VAD and the turn model on its CPU) against the gateway and llama.cpp over localhost, and serves the built UI from `$ROOT/frankenvoice/dist` behind the gpubox token; the page only sends the mic and plays the agent |
@@ -50,7 +50,7 @@ The tunnel keeps its URL as long as the `tunnel` process lives.
 Environment variables: `GPUBOX_ROOT` (venvs, logs, pid files; default `/content` if it exists, else `~/gpubox`),
 `GPUBOX_TOKEN` (default: random, saved in `$ROOT/gpubox.token`), `ASR_MODEL` (`Qwen/Qwen3-ASR-1.7B`, or
 `Qwen/Qwen3-ASR-0.6B`), `ASR_MEM` (0.15), `NO_LLM=1`, `LLM_CTX` (8192, shared by the slots), `LLM_SLOTS` (2), `LLM_SWA_FULL` (1; at 32k it needs 5.4 GB),
-`LLM_MTP` (1), `CUDA_MPS` (1: GPU services share the GPU through a CUDA MPS daemon), `LLM_MPS_PCT` (40: Gemma's cap on SMs under MPS), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
+`LLM_MTP` (1), `CUDA_MPS` (1: GPU services share the GPU through a CUDA MPS daemon), `LLM_MPS_PRIO` (1: Gemma is a below-normal MPS client, so Kyutai and ASR kernels go first), `LLM_MPS_PCT` (unset: optional cap on Gemma's SMs), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
 `NO_UI=1`, `FV_APP` (app archive, default `$ROOT/frankenvoice.tar.gz`).
 Logs are in `$ROOT/logs/{asr,llm,tts,gateway,tunnel,ui,ui-tunnel}.log`. Model files for the LLM are in `$ROOT/models`, llama.cpp
 in `$ROOT/llama.cpp`.
@@ -58,7 +58,7 @@ in `$ROOT/llama.cpp`.
 
 With Gemma decoding on one stream (`degrade.py`, 2026-10-20): no MPS, Kyutai RTF 1.05, first audio 617 ms, ASR final 582 ms,
 Gemma 20 tok/s. MPS uncapped: RTF 1.53, 916 ms, 561 ms, 53 tok/s (Gemma takes the SMs). MPS with Gemma at 40%: RTF 0.94,
-553 ms, 338 ms, 30 tok/s. Idle: RTF 0.63, 374 ms, 248 ms.
+553 ms, 338 ms, 30 tok/s. MPS with Gemma at below-normal priority, no cap (the default): RTF 0.84, 479 ms, 289 ms, 30 tok/s. Idle: RTF 0.63, 374 ms, 248 ms.
 
 ### Colab
 
@@ -129,8 +129,8 @@ Set the local server's GPU box URL to the `GPUBOX_URL` and its token to `GPUBOX_
 
 - **ASR partials** re-decode the whole segment about every `partial_ms` of new audio. A partial runs only when no
   decode is in flight and new voiced audio has arrived since the last one.
-- **ASR finals**: the server waits for any in-flight partial, decodes the segment, then times its words with the
-  forced aligner. The final carries an extra `align_ms` field. A Finalize on a segment with no voiced audio returns
+- **ASR finals**: the server cancels any in-flight partial (its result would be stale), decodes the segment, then
+  times its words with the forced aligner. The final carries an extra `align_ms` field. A Finalize on a segment with no voiced audio returns
   an empty final right away, without decoding.
 - **Energy gate**: 20 ms frames; a frame is voiced if it is more than 12 dB above the 10th-percentile level of the
   last 5 s and above -55 dBFS. For the first second of a connection, the floor is capped at -70 dBFS.
@@ -141,5 +141,5 @@ Set the local server's GPU box URL to the `GPUBOX_URL` and its token to `GPUBOX_
 - **TTS Words** times are `(text step + 19 - step of first audio frame) * 80 ms - 40 ms`. The -40 ms was calibrated
   against Qwen3-ForcedAligner on 6 renders (124 words). A word's `end` is the next word's start, so it includes any
   pause after the word.
-- **TTS Done** carries an extra `stats` object (`ttfa_ms`, `rtf`, `audio_s`, ...).
+- **TTS Done** carries an extra `stats` object (`ttfa_ms`, `rtf`, `rtf_3s` over the first 3 s of audio, `step_ms_p90`, `step_ms_max`, `audio_s`, ...).
 - A TTS socket that sends no text for 30 s without Close is treated as Closed, so it can't hold the GPU forever.

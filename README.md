@@ -48,6 +48,8 @@ mic ─> noise/echo ─────┼─> turn model ────┼─> turn �
           └─────────────────────┴─ what was played (echo reference, agent audio)
 ```
 
+The *Scheduler* stage (below, not drawn in the sketch) watches the reply in flight and paces the LLM.
+
 The wiring lives in `src/pipeline.ts` (`STAGES` and `buildGraph`). Each stage lists the node types that can fill it; the UI only chooses among those and sets their params. To change the topology, edit that file.
 
 ## Noise / echo cancellation
@@ -69,7 +71,7 @@ The echo canceller is deterministic, so a replay with changed knobs (**replay wi
 | --- | --- | --- |
 | `asr` | Qwen3-ASR-1.7B on the GPU box (`/v1/asr`) | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` |
 | `llm` | an OpenAI-compatible chat endpoint: llama.cpp with Gemma 4 12B on the GPU box (model `gemma-4-12b-it`), or any local server | `OPENAI_COMPAT_BASE_URL` (+ optional `OPENAI_COMPAT_API_KEY`) |
-| `tts.kyutai` | Kyutai TTS on the GPU box (`/v1/tts`): words stream in as the LLM writes them, word timings come back | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` |
+| `tts.kyutai` | Kyutai TTS on the GPU box (`/v1/tts`): words stream in as the LLM writes them, word timings come back. Canned lines (backchannels, openers) render once per box: the server keeps their audio (`fv-tts-cache` next to the settings file, or `FV_TTS_CACHE_DIR`), keyed by the text, voice and the box's TTS settings, and renders a missing one as a background job the box drops whenever a reply needs it | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` |
 | `opener.choice`, `backchannel` (*decide* `typesafe`), `interject` | TypeSafe Choice (`/v1/systemone`, model `jev-latest`) | `TYPESAFE_API_KEY` |
 
 The toolbar shows which settings the current config still needs; click it to open Settings.
@@ -77,6 +79,19 @@ The toolbar shows which settings the current config still needs; click it to ope
 The GPU box protocols are in `gpubox/PROTOCOL.md`. ASR and the LLM each have a small pure adapter (`src/nodes/asr/gpubox.ts`, `src/nodes/llm/openai.ts`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`server/drivers/index.ts`). Recordings keep the raw payloads, so replay feeds the same bytes through the same adapter.
 
 Turn-taking is full-duplex by default (`turn.duplex` in `src/nodes/turn.ts`); `half-duplex` is still selectable and ignores the user while the agent talks. The full-duplex stage is an explicit state machine (`FLOOR` in `src/nodes/turn.ts`): listening, thinking, speaking, and thinking+user / speaking+user while the user talks over the agent. Every transition is emitted as a `turn.transition` message with what triggered it.
+
+### Tick scheduler
+
+The *Scheduler* stage (`sched` in `src/nodes/sched.ts`) gives the pipeline a view of the GPU as 80 ms frames, one Kyutai frame each: TTS frame production comes first, LLM tokens and ASR partials go in the slack. While a reply is in flight (from `llm.start` until it is written, spoken and played) it ticks on an 80 ms grid from the reply's start, and logs every tick as a `sched.tick` message:
+
+| field | what |
+| --- | --- |
+| `n`, `rid`, `ms` | tick number, the reply, ms since the reply started |
+| `tts` | `audioMs` produced and `words` started during the tick, `queuedWords` (words Kyutai has been sent and not yet read: its `Consumed` count, plus words sent since), `bufferedMs` (how far the reply's audio is scheduled ahead of playback), `done` |
+| `llm` | `tokens` arrived during the tick, `pending` (granted and not arrived), `decision` (`grant`, `hold`, `busy`, `done`, `free`) and `why`, `granted` |
+| `asr` | `partials`, `finals` arrived during the tick |
+
+The backends are separate processes, so what the scheduler governs is when the LLM may write. With *Pace the LLM* on, the LLM writes a reply in chunks: its first request (a draft's too) asks for *first burst* tokens (16); a request that stops at its limit leaves the reply open (`llm.chunk`), and each `sched.grant` continues it with *chunk* tokens (8): the same messages plus the text so far as the assistant's turn, which llama.cpp continues, prefilling a token or two thanks to its prompt cache. A grant goes out on a tick when TTS has fewer than *lookahead* words (3) to read, or playback is about to run dry; before the first audio, otherwise nothing more until that audio is out (*hold until first audio*); after it, while TTS has fewer than *max words queued* (6) and its audio runs at least *min audio ahead* (300 ms) ahead of playback. Drafts are capped at the first burst and paced once kept. Off, the LLM runs free and the ticks are only logged. Grants and ticks are ordinary messages driven by recorded IO and timers, so they replay exactly; a future engine running the models in one process would take the grants over its own channel and report what it ran per tick, without changing the pipeline or replay.
 
 ### Turn model
 
@@ -92,6 +107,8 @@ Without the model, the stage commits a user turn on ASR endpointing. When VAD he
 - **interrupt**: the agent was speaking. It sends `cancel` to the LLM, TTS and speaker. The speaker reports how much of the reply was heard (whole sentences played, plus the words of the current one in proportion to its playback), and the LLM's history keeps only that, ending in "—".
 - **continue**: the agent was still thinking (the user wasn't done). The reply is cancelled, and the previous turn is resent together with what the user says now (`turn.user` with `replaces`), replacing it in the LLM history.
 
+**Yield if it just started** (`yieldWithinMs`, 1000 ms): speech within that long of the agent starting a reply stops it at once and gives the user the floor. With **Stop in the page** (`pageGate`, on by default) the stop itself doesn't wait for the network: at the start of a reply turn-taking arms the page (control `gate` with the window's end, passed on as a speaker command; disarmed when the agent stops holding the floor alone), and the page runs its own FireRedVAD (onnxruntime-web, loaded only when the option is on, same model and segmenter defaults as `vad.firered`) on the mic it captures. When it hears the user start while armed, it fades the reply out at once, drops the reply audio it is sent until the server acknowledges with a flush, and reports the stop (session time from the clock sync, and the mic sample where the speech started) as a speaker recv, so a replay reproduces it. The speaker takes that as a pause at the reported time (`playback.paused` with `gate`; what was heard is counted up to there). Turn-taking still leaves the decision to the VAD here: if it hears speech within *confirm within* (600 ms), that is the quick yield (cancel, the floor to the user, counted toward backing off only if a word was heard); if it hears none, the page heard noise or echo, the decision is `noise` and the agent plays on from the start of the word it stopped in. If the VAD here heard the speech first but past the window, the page's earlier onset still makes it a quick yield. The page gate only runs on 16 kHz capture with browser echo cancellation (otherwise it would hear the agent). The Playback lane marks each page stop with a red dot.
+
 The speaker no longer reports the end of playback during a gap between sentences; it waits until the TTS reply is complete.
 
 `llm.echo` and `tts.tone` (implementations `echo` and `tone`) are mocks for trying the pipeline without the GPU box.
@@ -103,7 +120,7 @@ The core rule is that **everything is replayable as-is**: ASR partials, LLM toke
 How the runtime ensures that:
 
 - **One session clock.** Every event has `t`, its arrival time in ms on a monotonic session clock. Events about audio also carry `media: {track, start, end}`, a sample range on a recorded media track. So each event records both *when* it happened and *which audio* it refers to. The mic driver also logs the AudioContext time of every captured frame.
-- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `rnnoise`, `silero`, `gpubox-asr`, `gpubox-tts`, `openai`, `typesafe`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. Timers are recorded the same way (`timer.set` / `timer.fire`).
+- **Everything external goes through recorded IO.** Nodes never call `fetch`, `setTimeout` or `Date.now`. They open *exchanges* on named channels (`mic`, `rnnoise`, `silero`, `gpubox-asr`, `gpubox-tts`, `tts-canned`, `openai`, `typesafe`, `speaker`). Every message coming back is an `io.recv` event with its payload and raw bytes, in the order and with the chunking it originally had. A canned line served from the server's cache is such an exchange too, so a replay gets it from the recording, not the cache. Timers are recorded the same way (`timer.set` / `timer.fire`).
 - **Deterministic turns.** When an external event arrives, the runtime stamps it with the current time, hands it to its node, and drains every resulting message synchronously, all at that timestamp. Nodes are pure functions of what they receive, so the same external events at the same times always produce the same log.
 - **Replay on a virtual clock.** A replay serves every recorded exchange and timer from the trajectory at its original time, with the original event order breaking ties. The result is checked against the source: the Sessions list shows *identical to source ✓* or the first event where the two differ.
 - **Causality.** Every event lists the seqs of the events that caused it, so any output (a TTS chunk, say) can be traced back through the LLM tokens to the ASR result and the audio frames behind it.

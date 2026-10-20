@@ -75,6 +75,11 @@ const DEFAULT_SYSTEM =
  * ends). A committed turn that names the check (`interject`) keeps it the way
  * a kept draft is kept; the history records the committed words, marked as
  * cut off, without the prompt.
+ *
+ * Paced (the scheduler's `sched.config` says so): a reply, and a draft, first asks for `firstTokens`
+ * tokens. A request that stops at its token limit leaves the reply open (`llm.chunk`), and each
+ * `sched.grant` continues it: the same messages plus the text so far as the assistant's turn, which
+ * llama.cpp continues; with its prompt cache that prefills only a token or two.
  */
 export const llmNode: NodeDef = {
   type: 'llm',
@@ -85,6 +90,7 @@ export const llmNode: NodeDef = {
     { name: 'turn', type: 'turn' },
     { name: 'control', type: 'control' },
     { name: 'interject', type: 'interject', description: 'interject.check / interject.drop: whether to cut in on the words so far' },
+    { name: 'sched', type: 'control', description: 'The scheduler: sched.config, sched.grant (write this many more tokens)' },
   ],
   outputs: [{ name: 'text', type: 'text' }],
   params: [
@@ -121,12 +127,21 @@ export const llmNode: NodeDef = {
       stopReason: string | null;
       /** llm.thinking was emitted for this reply. */
       thinking?: boolean;
+      /** Paced: its requests' token limit, tokens so far, chunks so far, and whether it waits for a grant. */
+      cap?: number;
+      tokens: number;
+      chunks: number;
+      waiting?: boolean;
+      /** The text so far ends in whitespace the continuation's prompt left out: drop it from the next delta. */
+      trimNext?: boolean;
       /** An interjection check: its id, the pass reply, and the verdict once known. */
       checkId?: string;
       pass?: string;
       verdict?: 'interject' | 'pass';
     }
     let active: Reply | undefined;
+    /** Set by the scheduler: write replies in chunks it grants. */
+    let pace: { firstTokens: number } | undefined;
     let draft: Reply | undefined;
     let check: Reply | undefined;
 
@@ -148,10 +163,26 @@ export const llmNode: NodeDef = {
       for (const ev of events) {
         if (!active) return;
         if (ev.type === 'delta') {
-          active.text += ev.text;
-          ctx.emit('text', { type: 'llm.delta', rid: active.rid, text: ev.text });
+          let text = ev.text;
+          if (active.trimNext) {
+            text = text.replace(/^\s+/, '');
+            if (!text) continue;
+            active.trimNext = false;
+          }
+          active.text += text;
+          active.tokens++;
+          ctx.emit('text', { type: 'llm.delta', rid: active.rid, text });
         } else if (ev.type === 'end') {
           active.stopReason = ev.stopReason;
+          if (active.cap !== undefined) {
+            const more = ev.stopReason === 'length' && active.tokens < (Number(reqParams.maxTokens) || Infinity);
+            ctx.emit('text', { type: 'llm.chunk', rid: active.rid, n: active.chunks++, tokens: active.tokens, stop: more ? 'length' : (ev.stopReason ?? 'stop') });
+            if (more) {
+              active.waiting = true;
+              ctx.setState('status', 'paced');
+              continue;
+            }
+          }
           finish('done');
         } else if (ev.type === 'error') finish('error', ev.error);
         else if (ev.type === 'thinking' && !active.thinking) {
@@ -168,7 +199,11 @@ export const llmNode: NodeDef = {
     };
 
     /** Send one request for `r` and route its stream to it. */
-    const send = (r: Reply, turns: ChatTurn[], params: JsonObject = reqParams): boolean => {
+    const send = (r: Reply, turns: ChatTurn[], params: JsonObject = reqParams, cap?: number): boolean => {
+      if (cap !== undefined) {
+        r.cap = cap;
+        params = { ...params, maxTokens: Math.min(cap, Number(params.maxTokens) || cap) };
+      }
       let request: Json;
       try {
         request = adapter.buildRequest(turns, params);
@@ -257,6 +292,8 @@ export const llmNode: NodeDef = {
       held: [],
       text: '',
       stopReason: null,
+      tokens: 0,
+      chunks: 0,
       ...extra,
     });
     const startDraft = (msg: Msg) => {
@@ -265,7 +302,7 @@ export const llmNode: NodeDef = {
       const d = reply(user, { draftId: msg.draftId as string, ...(msg.replaces ? { replaces: msg.replaces as string } : {}) });
       ctx.emit('text', { type: 'llm.draft', rid: d.rid, draftId: d.draftId!, text: user.text });
       draft = d;
-      send(d, historyFor(user, msg.replaces));
+      send(d, historyFor(user, msg.replaces), reqParams, pace?.firstTokens);
     };
 
     /** A committed user turn: answer it (with the draft made for it, if it still stands). */
@@ -315,7 +352,18 @@ export const llmNode: NodeDef = {
       ctx.setState('status', 'generating');
       active = r;
       r.live = true;
-      send(r, [...history]);
+      send(r, [...history], reqParams, pace?.firstTokens);
+    };
+
+    /** The scheduler lets a paced reply write `tokens` more: continue its text. */
+    const grant = (tokens: number) => {
+      const r = active;
+      if (!r?.waiting) return;
+      r.waiting = false;
+      ctx.setState('status', 'generating');
+      const prefix = r.text.trimEnd();
+      r.trimNext = prefix !== r.text;
+      send(r, [...history, { role: 'assistant', text: prefix }], reqParams, tokens);
     };
 
     return {
@@ -326,6 +374,11 @@ export const llmNode: NodeDef = {
             endCheck('dropped', 'cancelled');
             finish('cancelled');
           }
+          return;
+        }
+        if (port === 'sched') {
+          if (msg.type === 'sched.config') pace = msg.pace ? { firstTokens: Number(msg.firstTokens) || 16 } : undefined;
+          else if (msg.type === 'sched.grant' && msg.rid === active?.rid) grant(Number(msg.tokens));
           return;
         }
         if (port === 'interject') {

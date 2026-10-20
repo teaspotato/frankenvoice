@@ -12,6 +12,7 @@ import { loadEncoder, type Encoder } from '../embed/encoder';
 import { fireredDriver, sileroDriver } from './vad';
 import { turnModelDriver } from './turn-model';
 import { rnnoiseDriver } from './rnnoise';
+import { cannedDriver } from './canned';
 
 export type UpstreamName = 'gpubox' | 'llm' | 'typesafe';
 /** Where an upstream is and how to authenticate; `missing` says what isn't configured. */
@@ -234,8 +235,11 @@ const embed: LiveDriver = (req, sink) => {
   };
 };
 
-/** Everything but the mic and the speaker. `modelsDir` caches downloaded models (the turn model). */
-export function serverDrivers(up: Upstreams, o: { modelsDir: string }): DriverRegistry {
+/**
+ * Everything but the mic and the speaker. `modelsDir` caches downloaded models (the turn model),
+ * `cannedDir` the canned lines' audio.
+ */
+export function serverDrivers(up: Upstreams, o: { modelsDir: string; cannedDir: string }): DriverRegistry {
   const gpubox = socket(up, 'gpubox');
   return {
     silero: sileroDriver(ort, (model) => loadModel(MODELS[model] ?? MODELS.v5)),
@@ -243,6 +247,7 @@ export function serverDrivers(up: Upstreams, o: { modelsDir: string }): DriverRe
     openai: openai(up),
     'gpubox-asr': gpubox,
     'gpubox-tts': gpubox,
+    'tts-canned': cannedDriver(up, o.cannedDir),
     typesafe: typesafe(up),
     rnnoise: rnnoiseDriver,
     'turn-model': turnModelDriver(o.modelsDir),

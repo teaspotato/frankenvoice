@@ -10,6 +10,8 @@ interface StreamParams {
 }
 
 const CHANNEL = 'gpubox-tts';
+/** Canned lines: rendered once per box (a server-side cache, else a background job on the box). */
+const CANNED = 'tts-canned';
 
 /** A word of a reply's audio, in samples of its media track. */
 export interface SpokenWord {
@@ -72,7 +74,10 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       description: 'Pass on the word timings the server sends, so a cut-off reply resumes from the start of the word it stopped in.',
     },
   ],
-  channels: [{ name: CHANNEL, description: 'GPU box /v1/tts WebSocket: Speak/Flush/Close out, raw 16-bit PCM, Words, Flushed and Done in' }],
+  channels: [
+    { name: CHANNEL, description: 'GPU box /v1/tts WebSocket: Speak/Flush/Close out, raw 16-bit PCM, Words, Flushed and Done in' },
+    { name: CANNED, description: "A canned line's audio (16-bit PCM), from the server's cache or rendered on the box in the background" },
+  ],
   requires: () => ['gpubox'],
   create(ctx) {
     const p = ctx.params;
@@ -123,14 +128,13 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
     };
 
     /**
-     * Kyutai speaks one utterance per socket and the GPU box renders one at a time, so lines go one
-     * by one and wait while a reply is speaking. Dozens of sockets at once also held up the ASR
-     * socket: the browser opens one WebSocket to a host at a time.
+     * One line at a time. The server answers from its cache, or renders on the box as a background
+     * job that never holds up a reply (the box preempts it), so lines don't wait for replies.
      */
     const waiting: string[] = [];
     let rendering = false;
     const pump = () => {
-      if (rendering || reply || !waiting.length) return;
+      if (rendering || !waiting.length) return;
       rendering = true;
       let done = false;
       render(waiting.shift()!, () => {
@@ -144,35 +148,25 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
     /** Lines already re-sent once after their socket closed early. */
     const retried = new Set<string>();
     const render = (line: string, done: () => void) => {
-      let pending = true;
-      let chunks: Float32Array[] = [];
+      const chunks: Float32Array[] = [];
       const decode = decoder();
-      const io = ctx.io.open(CHANNEL, request(), {
-        onRecv(data: Json, bin) {
-          if (bin) return void chunks.push(decode(bin));
-          if ((data as JsonObject | null)?.type !== 'Flushed') return;
-          if (pending) canned.set(line, chunks);
-          pending = false;
-          chunks = [];
-          ctx.setState('canned', canned.size);
-          if (!io.closed) {
-            io.close();
-            done();
-          }
+      ctx.io.open(CANNED, { text: line, voice: p.voice, sampleRate: p.sampleRate }, {
+        onRecv(_data: Json, bin) {
+          if (bin) chunks.push(decode(bin));
         },
         onClose(err) {
-          // Closed before the line came back: try it once more.
-          const again = pending && !retried.has(line);
-          pending = false;
-          if (!again) return done();
+          if (!err && chunks.length) {
+            canned.set(line, chunks);
+            ctx.setState('canned', canned.size);
+            return done();
+          }
+          // Not rendered: try it once more.
+          if (retried.has(line)) return done();
           ctx.log('warn', 'canned line not rendered; retrying', { line, error: (err ?? null) as Json });
           retried.add(line);
           render(line, done);
         },
       });
-      io.send({ type: 'Speak', text: line });
-      io.send({ type: 'Flush' });
-      io.send({ type: 'Close' });
     };
 
     const emitAudio = (r: Reply, s: Seg, samples: Float32Array) => {
@@ -208,7 +202,6 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       if (!r.io.closed) r.io.close();
       ctx.emit('audio', { type: 'tts.response_end', rid: r.rid });
       ctx.setState('status', 'idle');
-      pump();
     };
 
     /**
@@ -225,6 +218,9 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
         }
         if (r.open) r.open.text = r.buf.slice(0, ready).trim();
         r.io.send({ type: 'Speak', text });
+        // For the scheduler: how many words TTS has been given.
+        const words = text.split(/\s+/).filter(Boolean).length;
+        if (words) ctx.emit('audio', { type: 'tts.sent', rid: r.rid, words });
         r.spoken = ready;
         ctx.setState('status', 'synthesizing');
       }
@@ -315,6 +311,11 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
               if (words.length) ctx.emit('audio', { type: 'tts.words', rid: r.rid, words: words as unknown as Json });
               return;
             }
+            if (m.type === 'Consumed') {
+              // For the scheduler: the words the model still has to read.
+              ctx.emit('audio', { type: 'tts.consumed', rid: r.rid, words: m.words ?? 0, queued: m.queued ?? 0 });
+              return;
+            }
             if (m.type === 'Flushed') {
               const s = r.segs.shift();
               if (s) {
@@ -344,7 +345,6 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       r.io.close({ status: 'cancelled' });
       ctx.emit('audio', { type: 'tts.cancelled', rid: r.rid });
       ctx.setState('status', 'idle');
-      pump();
     };
 
     return {
