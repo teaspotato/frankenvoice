@@ -120,7 +120,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
     },
     { key: 'attackMs', label: 'Attack (ms)', type: 'number', default: 10, description: 'Fade-in when resuming.' },
   ],
-  channels: [{ name: 'speaker', description: 'Scheduled playback through Web Audio', output: true }],
+  channels: [{ name: 'speaker', description: "Scheduled playback, rendered with Web Audio in the page; the page reports late starts", output: true }],
   create(ctx) {
     let io: ReturnType<typeof ctx.io.open> | undefined;
     let endAt = 0;
@@ -335,7 +335,10 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       start() {
         io = ctx.io.open('speaker', {}, {
           onRecv(data) {
-            ctx.setState('device', data);
+            // The page reports how late a run of playback started (its audio arrived after its time).
+            const d = data as { type?: string; ms?: number };
+            if (d?.type === 'late') ctx.setState('lateMs', d.ms ?? null);
+            else ctx.setState('device', data);
           },
         });
       },

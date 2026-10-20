@@ -1,4 +1,4 @@
-import type * as Ort from 'onnxruntime-web';
+import type * as Ort from 'onnxruntime-node';
 import { meanPool, WordPiece } from './wordpiece';
 
 export interface Encoder {

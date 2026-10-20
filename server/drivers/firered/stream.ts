@@ -1,6 +1,5 @@
 // FireRedVAD streaming VAD (FireRedTeam/FireRedVAD, Stream-VAD, Apache-2.0): Kaldi fbank features
-// and the causal DFSMN model on onnxruntime. No DOM or bundler imports, so Node scripts and tests
-// run the same code the browser driver does.
+// and the causal DFSMN model on onnxruntime-node. No DOM imports, so tests run the same code the server driver does.
 //
 //   const vad = new FireRedStream(ort, session);
 //   for each chunk of 16 kHz float samples: const probs = await vad.push(chunk)  // one per 10 ms frame
@@ -8,7 +7,7 @@
 // The model sees 25 ms windows every 10 ms (frame k covers samples [160k, 160k + 400) of the stream)
 // and keeps 19 frames of FSMN memory per block as its cache, so each frame is scored once, causally.
 
-import type * as Ort from 'onnxruntime-web';
+import type * as Ort from 'onnxruntime-node';
 import cmvn from './cmvn.json';
 
 export const SAMPLE_RATE = 16000;

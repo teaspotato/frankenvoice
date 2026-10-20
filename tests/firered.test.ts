@@ -1,13 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import * as ort from 'onnxruntime-web';
+import * as ort from 'onnxruntime-node';
 import { Runtime } from '../src/core/runtime';
 import { LiveScheduler } from '../src/core/scheduler';
 import { LiveWorld } from '../src/core/world';
 import { prepareReplay } from '../src/core/replay';
 import { registry } from '../src/nodes';
 import { buildGraph } from '../src/pipeline';
-import { FireRedStream, KaldiFbank, MEL_BINS } from '../src/drivers/firered/stream';
+import { FireRedStream, KaldiFbank, MEL_BINS } from '../server/drivers/firered/stream';
 import { testConfig, fakeDrivers } from './fake-drivers';
 
 describe('FireRedVAD features', () => {
@@ -31,7 +31,7 @@ describe('FireRedVAD features', () => {
 
   it('runs the bundled streaming model: one probability per frame, low on silence', async () => {
     ort.env.wasm.numThreads = 1;
-    const session = await ort.InferenceSession.create(new Uint8Array(readFileSync('src/drivers/firered/stream_vad.onnx')));
+    const session = await ort.InferenceSession.create(new Uint8Array(readFileSync('server/drivers/firered/stream_vad.onnx')));
     const vad = new FireRedStream(ort, session);
     const probs: number[] = [];
     for (let i = 0; i < 10; i++) probs.push(...(await vad.push(new Float32Array(480))));

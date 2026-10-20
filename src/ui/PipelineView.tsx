@@ -1,7 +1,7 @@
 import { registry } from '../nodes';
 import type { Json } from '../core/types';
 import type { Activity } from './activity';
-import type { TurnModelLoad } from '../drivers';
+import type { TurnModelLoad } from '../live-protocol';
 import { loadingState } from '../nodes/turn-model';
 import { STAGES, stageType, type PipelineConfig, type StageId } from '../pipeline';
 
