@@ -1,16 +1,16 @@
-import { useCallback, useEffect, useReducer, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { registry } from '../nodes';
 import { GRAPH_FORMAT, type GraphSpec } from '../core/graph';
-import { Runtime } from '../core/runtime';
-import { LiveScheduler, type Scheduler, type SimScheduler } from '../core/scheduler';
-import { LiveWorld } from '../core/world';
+import type { SimScheduler } from '../core/scheduler';
 import { prepareReplay } from '../core/replay';
 import { decodeBundle, encodeBundle } from '../core/bundle';
 import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
 import { SpanDetails } from './SpanDetails';
 import type { Json } from '../core/types';
-import { browserDrivers, micMonitor, preloadTurnModel, warmUp, sessionTitle, setOutputMuted, setOutputPaused, setOutputSuppressed, turnModelLoad, watchTurnModels } from '../drivers';
+import { micMonitor, replaySpeaker, setOutputMuted, setOutputPaused, setOutputSuppressed } from '../client/audio';
+import { LiveClient, type LiveHandlers } from '../client/live';
+import type { TurnModelLoad } from '../live-protocol';
 import { resolveParams } from '../core/node';
 import { turnModelRequest } from '../nodes/turn-model';
 import {
@@ -39,29 +39,6 @@ const CONFIG_KEY = 'frankenvoice.pipeline';
 const AUTOSAVE_KEY = 'frankenvoice.autosave';
 const MUTE_KEY = 'frankenvoice.mute';
 const TITLE_KEY = 'frankenvoice.titleModel';
-
-/** What was said in a session, for naming it: user turns and the agent's replies, in order. */
-function transcriptOf(traj: Trajectory): string {
-  const lines: string[] = [];
-  for (const e of traj.events) {
-    if (e.kind !== 'msg') continue;
-    const d = e.data as { type?: string; text?: string };
-    if (d.type === 'turn.user' && d.text) lines.push(`User: ${d.text}`);
-    else if (d.type === 'llm.end' && d.text) lines.push(`Agent: ${d.text}`);
-  }
-  return lines.join('\n').slice(0, 6000);
-}
-
-/** A title made safe as a session (file) name. */
-function titleToName(title: string): string {
-  return title
-    .replace(/[\/\\:*?"<>|\x00-\x1f]/g, ' ')
-    .replace(/^[\s.]+/, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 60)
-    .trim();
-}
 
 function loadConfig(): PipelineConfig {
   try {
@@ -106,24 +83,37 @@ function describeComparison(s: Session): string {
 export function App() {
   const [config, setConfig] = useState<PipelineConfig>(loadConfig);
   const [selected, setSelected] = useState<StageId | null>(null);
-  useEffect(() => {
-    const t = setTimeout(warmUp, 1000);
-    return () => clearTimeout(t);
-  }, []);
-  // The turn model is big: download and compile it as soon as it is configured, not when a session starts.
-  const [, turnModelChanged] = useReducer((n: number) => n + 1, 0);
-  useEffect(() => watchTurnModels(turnModelChanged), []);
+  // The turn model is big: the server downloads and compiles it as soon as it is configured, not when a session starts.
   const turnModelReq =
     stageType(config, 'turnmodel') === 'turnmodel.ssl'
       ? turnModelRequest(resolveParams(registry['turnmodel.ssl'], stageParams(config, 'turnmodel')) as { modelUrl: string; encoder: string; ep: string })
       : null;
   const turnModelKey = JSON.stringify(turnModelReq);
+  const [turnModel, setTurnModel] = useState<TurnModelLoad | undefined>();
   useEffect(() => {
-    if (turnModelReq) preloadTurnModel(turnModelReq);
+    setTurnModel(undefined);
+    if (!turnModelReq) return;
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = () =>
+      fetch('/api/turn-model', { method: 'POST', body: JSON.stringify(turnModelReq) })
+        .then((r) => (r.ok ? (r.json() as Promise<TurnModelLoad>) : Promise.reject(new Error(`HTTP ${r.status}`))))
+        .then((l) => {
+          if (done) return;
+          setTurnModel(l);
+          if (l.state === 'loading') timer = setTimeout(poll, 1000);
+        })
+        .catch(() => {});
+    void poll();
+    return () => {
+      done = true;
+      clearTimeout(timer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [turnModelKey]);
-  const turnModel = turnModelReq ? turnModelLoad(turnModelReq) : undefined;
   const [running, setRunning] = useState<'live' | 'replay' | null>(null);
+  /** Where the running run runs: the server (live sessions, replays with live channels) or the page (other replays). */
+  const [runWhere, setRunWhere] = useState<'server' | 'page'>('page');
   /** Mute switches on the Mic and Playback lanes: the recorded mic (heard during replay) and the agent's voice. */
   const [muted, setMuted] = useState<{ mic: boolean; agent: boolean }>(() => {
     try {
@@ -180,8 +170,6 @@ export function App() {
       /* storage unavailable */
     }
   }, [autoTitle, titleOn]);
-  const titleRef = useRef({ on: titleOn, model: autoTitle });
-  titleRef.current = { on: titleOn, model: autoTitle };
   const [autosave, setAutosave] = useState(() => {
     try {
       return localStorage.getItem(AUTOSAVE_KEY) !== 'off';
@@ -199,9 +187,12 @@ export function App() {
   /** The timeline item last clicked, shown in full in the side panel. */
   const [picked, setPicked] = useState<number[] | null>(null);
   const stopActivity = useRef<() => void>(() => {});
-  const runtimeRef = useRef<Runtime | null>(null);
-  const schedRef = useRef<Scheduler | null>(null);
+  /** The session clock of what runs (or ran last). */
+  const nowRef = useRef<() => number>(() => 0);
   const simRef = useRef<SimScheduler | null>(null);
+  const clientRef = useRef<LiveClient | null>(null);
+  /** The server run in progress: the session it replays, whether its result is kept, where it stopped. */
+  const serverRun = useRef<{ origin?: Session; keep: boolean; stoppedAt?: number } | null>(null);
 
   useEffect(() => {
     try {
@@ -234,41 +225,42 @@ export function App() {
 
   // ---- running ----------------------------------------------------------------
 
-  const attach = (rt: Runtime, scheduler: Scheduler) => {
-    runtimeRef.current = rt;
-    schedRef.current = scheduler;
+  /** Batches node states into one render per frame. */
+  const statesRef = useRef<{ pending: Record<string, Record<string, Json>>; raf: number }>({ pending: {}, raf: 0 });
+  const pushState = (node: string, state: Record<string, Json>) => {
+    const st = statesRef.current;
+    st.pending[node] = state;
+    if (!st.raf)
+      st.raf = requestAnimationFrame(() => {
+        st.raf = 0;
+        const p = st.pending;
+        st.pending = {};
+        setNodeStates((s) => ({ ...s, ...p }));
+      });
+  };
+
+  const attach = (traj: Trajectory, now: () => number) => {
+    nowRef.current = now;
     setNodeStates({});
-    setStateTypes(Object.fromEntries(rt.trajectory.meta.graph.nodes.map((n) => [n.id, n.type])));
-    let pending: Record<string, Record<string, Json>> = {};
-    let raf = 0;
+    setStateTypes(Object.fromEntries(traj.meta.graph.nodes.map((n) => [n.id, n.type])));
     stopActivity.current();
     const tracker = new ActivityTracker();
-    const unsub = rt.trajectory.subscribe((e) => tracker.consume(e, performance.now()));
+    const unsub = traj.subscribe((e) => tracker.consume(e, performance.now()));
     const timer = setInterval(() => setActivity(tracker.snapshot(performance.now())), 100);
     stopActivity.current = () => {
       unsub();
       clearInterval(timer);
       setActivity(NO_ACTIVITY);
     };
-    rt.onState((node, state) => {
-      pending[node] = state;
-      if (!raf)
-        raf = requestAnimationFrame(() => {
-          raf = 0;
-          const p = pending;
-          pending = {};
-          setNodeStates((s) => ({ ...s, ...p }));
-        });
-    });
   };
 
   /**
    * A live run or a replay with a changed config becomes a new session in the list. Playing a session
    * back as recorded doesn't: the view returns to that session, with a notice only if the replay diverged.
    */
-  const finishSession = async (rt: Runtime, origin?: Session, keep = true, stoppedAt?: number) => {
-    const s: Session = { traj: rt.trajectory, stoppedAt };
-    if (origin) s.comparison = compareTrajectories(origin.traj, rt.trajectory);
+  const finishSession = (traj: Trajectory, origin?: Session, keep = true, stoppedAt?: number) => {
+    const s: Session = { traj, stoppedAt };
+    if (origin) s.comparison = compareTrajectories(origin.traj, traj);
     if (keep) {
       setSessions((ss) => [s, ...ss]);
       setCurrent(s);
@@ -278,37 +270,9 @@ export function App() {
       if (!verdict.includes('✓')) setNotice(`Playback of ${origin!.traj.meta.id} ${verdict}: the code changed since it was recorded.`);
     }
     setRunning(null);
+    setRunWhere('page');
     stopActivity.current();
     setPaused(false);
-    if (rt.trajectory.meta.mode === 'live' && autosaveRef.current) await saveSession(s);
-    if (rt.trajectory.meta.mode === 'live' && titleRef.current.on && titleRef.current.model) void nameSession(s, titleRef.current.model);
-  };
-
-  /** Rename a finished session after what it was about; on any failure it keeps its generated id. */
-  const nameSession = async (s: Session, model: string) => {
-    const transcript = transcriptOf(s.traj);
-    if (!transcript) return;
-    let name: string;
-    try {
-      name = titleToName(await sessionTitle(model, transcript));
-    } catch (e) {
-      return setNotice(`Could not title the session with ${model}: ${String(e).slice(0, 200)}`);
-    }
-    if (!name) return;
-    const from = s.traj.meta.id;
-    for (let n = 1; n <= 9; n++) {
-      const to = n === 1 ? name : `${name} ${n}`;
-      if (s.saved) {
-        const res = await fetch(`/api/sessions/${encodeURIComponent(from)}`, { method: 'PATCH', body: JSON.stringify({ id: to }) }).catch(() => null);
-        if (res?.status === 409) continue;
-        if (!res?.ok) return;
-        s.saved = ((await res.json()) as { path: string }).path;
-        setServerSessions((l) => l.map((x) => (x === from ? to : x)));
-      } else if (sessionsRef.current.some((x) => x !== s && x.traj.meta.id === to)) continue;
-      s.traj.meta.id = to;
-      setSessions((ss) => [...ss]);
-      return;
-    }
   };
 
   const saveSession = async (s: Session) => {
@@ -319,39 +283,112 @@ export function App() {
       setServerSessions((l) => [s.traj.meta.id, ...l.filter((id) => id !== s.traj.meta.id)]);
       setSessions((ss) => [...ss]);
     } catch (e) {
-      /* proxy not running: the session stays in memory and can be exported */
       setNotice(`Session not saved (${String(e)}). It stays in this tab and can be exported.`);
     }
   };
 
-  const runLive = () => {
-    const scheduler = new LiveScheduler();
-    const rt = new Runtime({
-      graph: buildGraph(config),
-      registry,
-      scheduler,
-      world: new LiveWorld(browserDrivers, scheduler),
-      mode: 'live',
-      env: { userAgent: navigator.userAgent },
-    });
-    attach(rt, scheduler);
-    setCurrent({ traj: rt.trajectory });
-    setRunning('live');
-    setNotice('');
-    rt.start();
+  // ---- the server ------------------------------------------------------------------
+
+  /** What the server tells about its run, against the latest state of this component. */
+  const handlers = useRef<LiveHandlers>(null!);
+  handlers.current = {
+    session(traj) {
+      const run = serverRun.current;
+      attach(traj, () => clientRef.current?.now() ?? 0);
+      if (run?.keep !== false) setCurrent({ traj });
+      setPlayingBack(run?.keep === false);
+      setRunning(traj.meta.mode);
+      setRunWhere('server');
+      setPlayFrom(0);
+    },
+    states(states) {
+      for (const [node, state] of Object.entries(states)) pushState(node, state);
+    },
+    ended(info) {
+      if (serverRun.current) serverRun.current.stoppedAt = info.stoppedAt;
+    },
+    bundle(bytes) {
+      const run = serverRun.current;
+      serverRun.current = null;
+      let traj: Trajectory;
+      try {
+        traj = decodeBundle(bytes);
+      } catch (e) {
+        setRunning(null);
+        setRunWhere('page');
+        return setNotice(`The server's recording could not be read: ${String(e)}`);
+      }
+      finishSession(traj, run?.origin, run?.keep ?? true, run?.stoppedAt);
+    },
+    saved(id, path) {
+      setSessions((ss) => {
+        const s = ss.find((x) => x.traj.meta.id === id && x.traj.meta.mode === 'live');
+        if (s) s.saved = path;
+        return [...ss];
+      });
+      setServerSessions((l) => [id, ...l.filter((x) => x !== id)]);
+    },
+    renamed(from, to, path) {
+      setSessions((ss) => {
+        const s = ss.find((x) => x.traj.meta.id === from && x.traj.meta.mode === 'live');
+        if (s) {
+          s.traj.meta.id = to;
+          s.saved = path;
+        }
+        return [...ss];
+      });
+      setServerSessions((l) => l.map((x) => (x === from ? to : x)));
+    },
+    notice: (text) => setNotice(text),
+    closed(reason) {
+      if (!serverRun.current) return;
+      serverRun.current = null;
+      setRunning(null);
+      setRunWhere('page');
+      stopActivity.current();
+      setPaused(false);
+      setNotice(`Lost the server: ${reason}`);
+    },
+  };
+  const client = () => {
+    const h = handlers;
+    return (clientRef.current ??= new LiveClient({
+      session: (t) => h.current.session(t),
+      states: (s) => h.current.states(s),
+      ended: (i) => h.current.ended(i),
+      bundle: (b) => h.current.bundle(b),
+      saved: (id, p) => h.current.saved(id, p),
+      renamed: (f, t, p) => h.current.renamed(f, t, p),
+      notice: (t) => h.current.notice(t),
+      closed: (r) => h.current.closed(r),
+    }));
   };
 
+  /** Start a run on the server; `send` asks for it once connected. */
+  const runOnServer = async (run: { origin?: Session; keep: boolean }, send: (c: LiveClient) => void) => {
+    setNotice('');
+    const c = client();
+    try {
+      await c.connect();
+    } catch (e) {
+      return setNotice(String(e));
+    }
+    serverRun.current = run;
+    send(c);
+  };
+
+  const runLive = () =>
+    runOnServer({ keep: true }, (c) =>
+      c.start(buildGraph(config), { env: { userAgent: navigator.userAgent }, autosave: autosaveRef.current, title: titleOn ? autoTitle : '' }),
+    );
+
   const stop = () => {
+    if (runWhere === 'server') return clientRef.current?.stop();
     if (running === 'replay') {
       simRef.current?.stop();
       setOutputPaused(false);
       setPaused(false);
-      return;
     }
-    const rt = runtimeRef.current;
-    if (!rt) return;
-    rt.stop();
-    void finishSession(rt);
   };
 
   /** Session time ▶ starts from when nothing runs; set by clicking the timeline. */
@@ -376,23 +413,30 @@ export function App() {
     const source = origin.traj;
     const keep = replayOpts.useCurrentConfig;
     setNotice('');
-    const outputChannels = Object.values(registry).flatMap((d) => (d.channels ?? []).filter((c) => c.output).map((c) => c.name));
     const liveChannels = replayOpts.liveChannels
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
+    if (liveChannels.length) {
+      // Live channels are served by the server's drivers, so the replay runs there, in real time.
+      return runOnServer({ origin, keep }, (c) =>
+        c.replay(encodeBundle(source), { graph: keep ? buildGraph(config) : undefined, liveChannels, audible: replayOpts.audible }),
+      );
+    }
+    const outputChannels = Object.values(registry).flatMap((d) => (d.channels ?? []).filter((c) => c.output).map((c) => c.name));
     const { runtime: rt, sim } = prepareReplay(source, {
       registry,
-      graph: replayOpts.useCurrentConfig ? buildGraph(config) : source.meta.graph,
-      drivers: browserDrivers,
-      liveChannels,
+      graph: keep ? buildGraph(config) : source.meta.graph,
+      drivers: { speaker: replaySpeaker },
       monitorChannels: replayOpts.audible && replayOpts.realtime ? outputChannels : [],
     });
     simRef.current = sim;
-    attach(rt, sim);
+    attach(rt.trajectory, () => sim.now());
+    rt.onState(pushState);
     if (keep) setCurrent({ traj: rt.trajectory });
     setPlayingBack(!keep);
     setRunning('replay');
+    setRunWhere('page');
     setPlayFrom(0);
     if (replayOpts.realtime) {
       // Hear the user's side too: the mic frames as the replay reaches them.
@@ -420,13 +464,15 @@ export function App() {
       stopActivity.current();
       return replay(origin, again);
     }
-    await finishSession(rt, origin, keep, stoppedAt);
+    finishSession(rt.trajectory, origin, keep, stoppedAt);
   };
 
   /** Seek: a replay jumps there (restarting if it's earlier); otherwise ▶ will start there. */
   const seek = (t: number) => {
     t = Math.max(0, t);
     const sim = simRef.current;
+    // A replay on the server can't seek.
+    if (running === 'replay' && runWhere === 'server') return;
     if (running === 'replay' && sim && replayOpts.realtime) {
       if (t > sim.now()) skipTo(sim, t);
       else {
@@ -438,6 +484,12 @@ export function App() {
 
   /** Pause or resume a realtime replay: the session clock and the audio already scheduled both freeze. */
   const togglePause = () => {
+    if (running === 'replay' && runWhere === 'server') {
+      if (paused) clientRef.current?.resume();
+      else clientRef.current?.pause();
+      setOutputPaused(!paused);
+      return setPaused(!paused);
+    }
     const sim = simRef.current;
     if (running !== 'replay' || !sim) return;
     if (sim.isPaused) sim.resume();
@@ -449,7 +501,7 @@ export function App() {
   const transport = (
     <span className="transport">
       {running === 'replay' ? (
-        <button onClick={togglePause} disabled={!replayOpts.realtime} title={paused ? 'Resume (space)' : 'Pause (space)'}>
+        <button onClick={togglePause} disabled={!replayOpts.realtime && runWhere === 'page'} title={paused ? 'Resume (space)' : 'Pause (space)'}>
           {paused ? '▶' : '❚❚'}
         </button>
       ) : (
@@ -627,13 +679,13 @@ export function App() {
         <button disabled={!!running} onClick={() => confirm('Reset every stage to its default settings?') && setConfig(defaultConfig())}>Reset config</button>
         <span className="spacer" />
         {health === null ? (
-          <span className="warn">proxy not reachable: run `pnpm dev`</span>
+          <span className="warn">server not reachable: run `pnpm dev`</span>
         ) : missingKeys.length ? (
           <button className="link warn" onClick={() => setShowSettings(true)}>
             needs keys: {missingKeys.join(', ')}
           </button>
         ) : (
-          <span className="ok">proxy ok</span>
+          <span className="ok">server ok</span>
         )}
         <button onClick={() => setShowSettings(true)}>Settings</button>
         <button
@@ -654,14 +706,14 @@ export function App() {
         <Dashboard
           trajectory={current?.traj}
           running={!!running}
-          now={() => schedRef.current?.now() ?? 0}
+          now={() => nowRef.current()}
           selected={selected}
           onSelect={(lane, item) => selectStage(stageOf(lane), !item)}
           transport={transport}
           onSeek={seek}
           muted={muted}
           onMute={(which) => setMuted((m) => ({ ...m, [which]: !m[which] }))}
-          playhead={running === 'replay' && playingBack ? () => simRef.current?.now() ?? 0 : running ? null : playFrom}
+          playhead={running === 'replay' && playingBack ? () => nowRef.current() : running ? null : playFrom}
           onFocusEvents={(seqs) => {
             setFocus((f) => ({ seqs, n: (f?.n ?? 0) + 1 }));
             setPicked(seqs);
@@ -679,10 +731,10 @@ export function App() {
         )}
 
         <h3>Sessions</h3>
-        <label className="autosave" title="Save each live session to the proxy's sessions folder when it stops">
+        <label className="autosave" title="The server saves each live session to its sessions folder when it stops (set when a session starts)">
           <input type="checkbox" checked={autosave} onChange={(e) => setAutosave(e.target.checked)} /> autosave live sessions
         </label>
-        <label className="autosave" title="When a live session stops, ask this model on the LLM endpoint for a short title and rename the session to it">
+        <label className="autosave" title="When a live session stops, the server asks this model on the LLM endpoint for a short title and renames the saved session to it">
           <input type="checkbox" checked={titleOn} onChange={(e) => setTitleOn(e.target.checked)} /> name sessions with{' '}
           <input className="title-model" value={autoTitle} disabled={!titleOn} onChange={(e) => setAutoTitle(e.target.value)} />
         </label>
@@ -701,7 +753,7 @@ export function App() {
             />{' '}
             replay with current config
           </label>
-          <label>
+          <label title="Channels served live by the server's drivers instead of the recording; such a replay runs on the server, in real time">
             live channels{' '}
             <input
               placeholder="e.g. openai,gpubox-tts"
@@ -733,7 +785,7 @@ export function App() {
                   Replay
                 </button>
                 {!s.saved && s.traj.meta.mode === 'live' && (
-                  <button onClick={() => saveSession(s)} title="Save to the proxy's sessions folder">
+                  <button onClick={() => saveSession(s)} title="Save to the server's sessions folder">
                     Save
                   </button>
                 )}

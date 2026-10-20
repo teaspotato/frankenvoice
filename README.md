@@ -6,10 +6,10 @@ A research playground for full-duplex voice agents built from existing component
 
 ```bash
 pnpm install
-pnpm dev               # local proxy on :8787 + Vite on :5173
+pnpm dev               # server (pipeline) on :8787 + Vite on :5173
 ```
 
-Everything but the TypeSafe stages runs on your own GPU box (`gpubox/README.md`): Qwen3-ASR, Gemma on llama.cpp and Kyutai TTS. Open **Settings** in the toolbar to enter its URL and token, the LLM endpoint and the TypeSafe key. The proxy saves them to `.frankenvoice/settings.json` (git-ignored, readable only by you); the page never gets a key back, only whether it is set. A `.env` file (see `.env.example`) still works, and values set in Settings override it. The proxy port (`FV_PROXY_PORT`) is the one thing that has to come from the environment, since the page needs it to reach the proxy.
+Everything but the TypeSafe stages runs on your own GPU box (`gpubox/README.md`): Qwen3-ASR, Gemma on llama.cpp and Kyutai TTS. Open **Settings** in the toolbar to enter its URL and token, the LLM endpoint and the TypeSafe key. The server saves them to `.frankenvoice/settings.json` (git-ignored, readable only by you); the page never gets a key back, only whether it is set. A `.env` file (see `.env.example`) still works, and values set in Settings override it. The server port (`FV_PROXY_PORT`) is the one thing that has to come from the environment, since the page needs it to reach the server.
 
 Open http://localhost:5173 and press **Run live**. Allow microphone access. Press **Stop** to finish. The session is saved to `./sessions/<id>.fvs` (uncheck **autosave live sessions** to keep sessions only in the tab) and appears in the Sessions list, where **Replay** runs it again.
 
@@ -31,9 +31,11 @@ Open http://localhost:5173 and press **Run live**. Allow microphone access. Pres
 - **Layout**: drag the edges between the diagram, dashboard, event log and side panel to resize them (double-click an edge to reset); **Hide panel** in the toolbar collapses the side panel (selecting a stage brings it back); the event log starts collapsed, click **Events** to open it. Sizes are remembered in the browser.
 - **Sessions** (right): **New session** clears the dashboard; click a session's name to rename it (a saved session's file is renamed too); **Save** writes an unsaved live session to `./sessions` when autosave is off; **Delete** removes a session from the list and, for a recorded session, its file in `./sessions`.
 
-The pipeline runs in the browser. The small proxy in `server/` keeps API keys out of the page, avoids CORS, and stores settings and session bundles. It only answers requests from the local UI: other websites (by `Origin`) and DNS-rebinding hosts (by `Host`) get 403. It forwards requests and streams responses unchanged, so the browser records exactly what each server sent.
+The pipeline runs in the server (`server/`, Node), next to the models and providers: VAD (onnxruntime-node), the turn model, RNNoise, the sentence encoder, and the connections to the GPU box, the LLM and TypeSafe. The page is only the mic, the speaker and the observability view. It keeps one WebSocket to the server (`/api/live`, protocol in `src/live-protocol.ts`): mic frames go up (captured with the browser's echo cancellation, noise suppression and gain as the Noise / echo stage asks, since playback happens in the page); speaker commands with their session time come down and are scheduled on an audio clock synced to the server's by pings; and the run's trajectory (events, node states, media tracks) streams down so the page keeps a mirror and draws it as it happens. When a run stops the server sends its full recording, saves it (autosave) and names it. One page drives the server at a time: a page that connects takes over and stops a run the previous page had going. The server only answers the local UI: other websites (by `Origin`) and DNS-rebinding hosts (by `Host`) get 403.
 
-To host the UI somewhere else (for example on the GPU box, behind a tunnel), build it with `pnpm build` and start the proxy with `FV_STATIC_DIR=dist` and `FV_HOST_TOKEN=<secret>`. It then serves the UI too, and instead of local-only access every request must be same-origin and carry the token: open the page once with `?token=<secret>`, which sets an HttpOnly cookie. Anyone with the token can change settings, so treat it like a password.
+Replays of a recording run in the page (they need no providers: the recorded agent audio plays locally). A replay with **live channels** runs on the server, in real time (it can pause, not seek).
+
+To host the UI somewhere else (for example on the GPU box, behind a tunnel), build it with `pnpm build` and start the server with `FV_STATIC_DIR=dist` and `FV_HOST_TOKEN=<secret>`. It then serves the UI too, and instead of local-only access every request must be same-origin and carry the token: open the page once with `?token=<secret>`, which sets an HttpOnly cookie. Anyone with the token can change settings, so treat it like a password.
 
 ## Pipeline
 
@@ -55,8 +57,8 @@ The stage between the mic and VAD/ASR has four implementations, each with its kn
 | implementation | what it does | knobs |
 | --- | --- | --- |
 | `browser` (default) | WebRTC echo cancellation, noise suppression and gain control, applied by the browser at capture | each of the three on/off |
-| `aec` | NLMS echo canceller in the page. Its reference is the audio the speaker played, placed on the session clock. Browser processing is off, so the Mic lane is raw and the Cleaned lane is its output | filter length, step size, reference delay, double-talk threshold, residual suppression, adapt on/off |
-| `rnnoise` | RNNoise neural noise suppression (WASM, 48 kHz internally); also reports a voice probability | wet/dry mix, gate below a voice probability, gate depth, browser AEC in front |
+| `aec` | NLMS echo canceller (a node, in the server). Its reference is the audio the speaker played, placed on the session clock. Browser processing is off, so the Mic lane is raw and the Cleaned lane is its output | filter length, step size, reference delay, double-talk threshold, residual suppression, adapt on/off |
+| `rnnoise` | RNNoise neural noise suppression (WASM in the server, 48 kHz internally); also reports a voice probability | wet/dry mix, gate below a voice probability, gate depth, browser AEC in front |
 | `off` | raw microphone, no processing | none |
 
 The echo canceller is deterministic, so a replay with changed knobs (**replay with current config**) shows what they would have done to the same recorded audio. RNNoise's output is recorded, and its mix and gate are applied after the recording, so those two can also be retuned on a replay.
@@ -72,13 +74,13 @@ The echo canceller is deterministic, so a replay with changed knobs (**replay wi
 
 The toolbar shows which settings the current config still needs; click it to open Settings.
 
-The GPU box protocols are in `gpubox/PROTOCOL.md`. ASR and the LLM each have a small pure adapter (`src/nodes/asr/gpubox.ts`, `src/nodes/llm/openai.ts`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`src/drivers/index.ts`). Recordings keep the raw payloads, so replay feeds the same bytes through the same adapter.
+The GPU box protocols are in `gpubox/PROTOCOL.md`. ASR and the LLM each have a small pure adapter (`src/nodes/asr/gpubox.ts`, `src/nodes/llm/openai.ts`): it builds the request and parses the raw response payloads into the node's common messages. The network code lives in a driver per channel (`server/drivers/index.ts`). Recordings keep the raw payloads, so replay feeds the same bytes through the same adapter.
 
 Turn-taking is full-duplex by default (`turn.duplex` in `src/nodes/turn.ts`); `half-duplex` is still selectable and ignores the user while the agent talks. The full-duplex stage is an explicit state machine (`FLOOR` in `src/nodes/turn.ts`): listening, thinking, speaking, and thinking+user / speaking+user while the user talks over the agent. Every transition is emitted as a `turn.transition` message with what triggered it.
 
 ### Turn model
 
-The *Turn model* stage (`turnmodel.ssl` in `src/nodes/turn-model.ts`) runs the ssl_turn model from the [turn-playground Space](https://huggingface.co/spaces/shinohararin/turn-playground) in a worker (WebGPU, or WASM on the CPU). Its two channels are the user (cleaned mic) and the agent (what the speaker played, placed on the same clock), and every 80 ms it scores both for *end of turn* and *take the floor*. The thresholds (TurnBench dev operating points 0.64 / 0.18, 0.5 s refractory) are applied in the node, on the recorded scores, so they can be retuned on a replay. The model files (213 MB) download from the Space and compile as soon as the page opens (or the stage's model settings change), with a progress bar on the Turn model stage; the browser caches the files, and the compiled model is kept across sessions, so a session starts with it ready; *Model files URL* points elsewhere (for example a retrained export). The *Turn model* lane shows both scores for both speakers against the thresholds, and the events committed.
+The *Turn model* stage (`turnmodel.ssl` in `src/nodes/turn-model.ts`) runs the ssl_turn model from the [turn-playground Space](https://huggingface.co/spaces/shinohararin/turn-playground) on the server's CPU (onnxruntime-node). Its two channels are the user (cleaned mic) and the agent (what the speaker played, placed on the same clock), and every 80 ms it scores both for *end of turn* and *take the floor*. The thresholds (TurnBench dev operating points 0.64 / 0.18, 0.5 s refractory) are applied in the node, on the recorded scores, so they can be retuned on a replay. The model files (213 MB) download from the Space and compile as soon as the stage is picked (or its model settings change), with a progress bar on the Turn model stage; the server caches the files (`fv-models` next to its settings file), and the compiled model is kept across sessions, so a session starts with it ready; *Model files URL* points elsewhere (for example a retrained export). The *Turn model* lane shows both scores for both speakers against the thresholds, and the events committed.
 
 While the model runs, turn-taking uses it: the user's *take the floor* stops the agent at once, user speech over the agent that ends without one is a backchannel (whatever the words), and the user's *end of turn* commits the turn, waiting up to *wait for ASR* (600 ms) for the final words. *Max backchannel* still applies as a safety net, and so does ASR `utterance_end`. Until the model is ready, or if it fails or falls behind real time (it gives up 3.2 s behind), the rules below apply.
 
@@ -131,7 +133,7 @@ A stage is filled by a node: a `NodeDef` (see `src/nodes/*.ts`): ports, params, 
 3. Keep all state inside the node and expose what matters with `ctx.setState` so it lands in the log.
 4. Append produced audio with `ctx.media.append` and emit `{type: 'audio', ...ref, samples}`.
 
-The browser side of a channel is a `LiveDriver` in `src/drivers/index.ts`. Register the node in `src/nodes/index.ts` and list it as a variant of its stage in `src/pipeline.ts`. To give it its own dashboard drawing, derive the data in `src/ui/timeline.ts` and draw it in `src/ui/Dashboard.tsx`.
+The live side of a channel is a `LiveDriver` in `server/drivers/index.ts` (the mic and speaker are the page's, in `server/live.ts`). Register the node in `src/nodes/index.ts` and list it as a variant of its stage in `src/pipeline.ts`. To give it its own dashboard drawing, derive the data in `src/ui/timeline.ts` and draw it in `src/ui/Dashboard.tsx`.
 
 ## Layout
 
@@ -139,9 +141,10 @@ The browser side of a channel is a `LiveDriver` in `src/drivers/index.ts`. Regis
 src/core/     runtime, scheduler (live + virtual clock), world (live/replay IO), trajectory, bundle, compare
 src/pipeline.ts  the fixed pipeline: stages, their implementations, wiring
 src/nodes/    node definitions
-src/drivers/  browser drivers: mic worklet, Silero (onnxruntime-web), GPU box WebSockets, OpenAI-compatible SSE, TypeSafe, Web Audio
+src/client/   the page's end of /api/live: mic capture (worklet), Web Audio playback, clock sync, trajectory mirror
 src/ui/       pipeline diagram, dashboard (timeline.ts derives lanes, Dashboard.tsx draws them), stage panel, settings, sessions, event log
-server/       local proxy and session storage
+server/       the server: runs the pipeline for the page (live.ts), drivers (Silero/FireRedVAD/turn model on
+              onnxruntime-node, RNNoise, GPU box WebSockets, OpenAI-compatible SSE, TypeSafe), settings, session storage
 tests/        replay determinism tests with randomized fake drivers
 ```
 

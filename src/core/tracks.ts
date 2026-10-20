@@ -22,13 +22,22 @@ interface Track extends TrackInfo {
  */
 export class TrackStore {
   private tracks = new Map<string, Track>();
+  private f32Listeners = new Set<(name: string, bytes: Uint8Array, sampleRate: number) => void>();
 
   appendF32(name: string, samples: Float32Array, sampleRate: number): MediaRef {
     const tr = this.get(name, 'f32', sampleRate);
     const start = tr.length;
-    this.push(tr, new Uint8Array(samples.buffer.slice(samples.byteOffset, samples.byteOffset + samples.byteLength)));
+    const bytes = new Uint8Array(samples.buffer.slice(samples.byteOffset, samples.byteOffset + samples.byteLength));
+    this.push(tr, bytes);
     tr.length += samples.length;
+    for (const l of this.f32Listeners) l(name, bytes, sampleRate);
     return { track: name, start, end: tr.length };
+  }
+
+  /** Called with the bytes of every f32 append (the server streams media tracks to the page). */
+  onAppendF32(fn: (name: string, bytes: Uint8Array, sampleRate: number) => void): () => void {
+    this.f32Listeners.add(fn);
+    return () => this.f32Listeners.delete(fn);
   }
 
   appendBytes(name: string, bytes: Uint8Array): BinRef {

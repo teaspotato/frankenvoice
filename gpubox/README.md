@@ -14,7 +14,7 @@ is in [PROTOCOL.md](PROTOCOL.md); the LLM is plain OpenAI `POST /v1/chat/complet
 | `tts` | `v-tts` (moshi 0.2.13) | 127.0.0.1:8102 | `kyutai_tts.py`: Kyutai streaming generation, one reply at a time |
 | `gateway` | `v-gw` (qwen-asr 0.0.6, FastAPI) | 0.0.0.0:8000 | `server.py`: auth, ASR segmenting/partials/finals, Qwen3-ForcedAligner-0.6B, relays `/v1/tts`, passes `/v1/chat/completions` and `/v1/models` through to `llm` |
 | `tunnel` | none | none | `cloudflared tunnel --protocol http2 --url http://localhost:8000` (quick tunnel; over the default QUIC it moved only ~110 KB/s, random `*.trycloudflare.com`) |
-| `ui` | Node 22 (`$ROOT/node`) | 127.0.0.1:8787 | The Frankenvoice proxy (`server/index.ts`) in hosted mode: serves the built UI from `$ROOT/frankenvoice/dist` behind the gpubox token, and talks to the gateway and llama.cpp over localhost |
+| `ui` | Node 22 (`$ROOT/node`) | 127.0.0.1:8787 | The Frankenvoice server (`server/index.ts`) in hosted mode: runs the pipeline (VAD and the turn model on its CPU) against the gateway and llama.cpp over localhost, and serves the built UI from `$ROOT/frankenvoice/dist` behind the gpubox token; the page only sends the mic and plays the agent |
 | `ui-tunnel` | none | none | `cloudflared tunnel --protocol http2 --url http://localhost:8787` (a second quick tunnel, printed as `UI_URL`) |
 
 Moshi and qwen-asr need different torch/transformers versions, so TTS runs in its own venv and process.
@@ -103,7 +103,7 @@ to reach the gateway's ASR/TTS/LLM API directly. If any process exits, the conta
 ## Hosted UI
 
 `setup.sh` can also serve the Frankenvoice web UI from the box, so the whole thing is one https URL and the
-proxy reaches ASR, TTS and the LLM over localhost (no keys or tunnels on your laptop).
+server, which runs the pipeline, reaches ASR, TTS and the LLM over localhost (no keys or tunnels on your laptop).
 
 1. Upload the app (the repo is private, so the box can't clone it):
    `git archive --format=tar.gz -o frankenvoice.tar.gz HEAD`, then
@@ -114,7 +114,7 @@ proxy reaches ASR, TTS and the LLM over localhost (no keys or tunnels on your la
    `ui-tunnel` (about 15 s). A full `setup.sh` / `start` does the same when the archive is there, and `stop` stops
    them too. To pick up a new archive, kill `ui` (`kill -- -$(cat $ROOT/ui.pid)`) and run `setup.sh ui` again;
    `ui-tunnel` and its URL stay.
-3. `setup.sh status` prints `UI_URL`. Open **`UI_URL/?token=<GPUBOX_TOKEN>`** once: the proxy sets an HttpOnly cookie
+3. `setup.sh status` prints `UI_URL`. Open **`UI_URL/?token=<GPUBOX_TOKEN>`** once: the server sets an HttpOnly cookie
    (30 days) and redirects to `UI_URL/`. Without it every page and API call gets 403. Anyone with the token can
    change settings, so treat it like a password.
 
@@ -133,7 +133,7 @@ app folder or the settings file; `setup.sh` reads it from `$DATA/gpubox.token` a
 
 ## Point Frankenvoice at it
 
-Set the local proxy's GPU box URL to the `GPUBOX_URL` and its token to `GPUBOX_TOKEN`. Check it with
+Set the local server's GPU box URL to the `GPUBOX_URL` and its token to `GPUBOX_TOKEN`. Check it with
 `curl -H "Authorization: Bearer $GPUBOX_TOKEN" $GPUBOX_URL/health`.
 
 ## Behavior notes

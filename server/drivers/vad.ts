@@ -1,9 +1,8 @@
-// VAD model drivers on onnxruntime. No bundler-specific imports: the browser registry passes in
-// onnxruntime-web and a session loader, and Node scripts pass the same, so both run this code.
+// VAD model drivers on onnxruntime-node. The model loader is passed in, so tests run the same code.
 
-import type * as Ort from 'onnxruntime-web';
-import type { LiveDriver } from '../core/world';
-import type { Json } from '../core/types';
+import type * as Ort from 'onnxruntime-node';
+import type { LiveDriver } from '../../src/core/world';
+import type { Json } from '../../src/core/types';
 import { FireRedStream } from './firered/stream';
 
 type OrtModule = typeof Ort;

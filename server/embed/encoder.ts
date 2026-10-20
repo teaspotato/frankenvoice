@@ -1,4 +1,4 @@
-import type * as Ort from 'onnxruntime-web';
+import type * as Ort from 'onnxruntime-node';
 import { meanPool, WordPiece } from './wordpiece';
 
 export interface Encoder {
@@ -7,8 +7,8 @@ export interface Encoder {
 }
 
 /** A sentence encoder (BERT-style ONNX export with mean pooling) on onnxruntime. */
-export async function loadEncoder(ort: typeof Ort, model: Uint8Array, vocab: string): Promise<Encoder> {
-  const session = await ort.InferenceSession.create(model);
+export async function loadEncoder(ort: typeof Ort, model: Uint8Array, vocab: string, options?: Ort.InferenceSession.SessionOptions): Promise<Encoder> {
+  const session = await ort.InferenceSession.create(model, options ?? {});
   const tok = new WordPiece(vocab);
   const needsTypes = session.inputNames.includes('token_type_ids');
   return {
