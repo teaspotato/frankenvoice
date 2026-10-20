@@ -270,10 +270,9 @@ class AsrSession:
         gen = self.seg_gen
         self.seg_gen += 1             # any in-flight partial is now stale
         if self.inflight is not None and not self.inflight.done():
-            try:
-                await self.inflight
-            except Exception:  # noqa: BLE001
-                pass
+            # its result would be dropped anyway: don't make the final wait for it (it cost up to ~250 ms)
+            self.inflight.cancel()
+            self.inflight = None
         pcm, seg_start = self.seg, self.seg_start
         seg_end = seg_start + len(pcm)
         had_speech = self.speech_started

@@ -129,8 +129,8 @@ Set the local server's GPU box URL to the `GPUBOX_URL` and its token to `GPUBOX_
 
 - **ASR partials** re-decode the whole segment about every `partial_ms` of new audio. A partial runs only when no
   decode is in flight and new voiced audio has arrived since the last one.
-- **ASR finals**: the server waits for any in-flight partial, decodes the segment, then times its words with the
-  forced aligner. The final carries an extra `align_ms` field. A Finalize on a segment with no voiced audio returns
+- **ASR finals**: the server cancels any in-flight partial (its result would be stale), decodes the segment, then
+  times its words with the forced aligner. The final carries an extra `align_ms` field. A Finalize on a segment with no voiced audio returns
   an empty final right away, without decoding.
 - **Energy gate**: 20 ms frames; a frame is voiced if it is more than 12 dB above the 10th-percentile level of the
   last 5 s and above -55 dBFS. For the first second of a connection, the floor is capped at -70 dBFS.
