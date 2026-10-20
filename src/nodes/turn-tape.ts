@@ -29,6 +29,7 @@ interface TapeParams {
   ttsLeadMs: number;
   cutAfterMs: number;
   idleCells: number;
+  cutOverCells: number;
   maxLines: number;
   keepLines: number;
   stableWords: boolean;
@@ -104,6 +105,13 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     { key: 'ttsLeadMs', label: 'TTS lead (ms)', type: 'number', default: 400, description: 'From writing a word to hearing it, for the headroom.' },
     { key: 'cutAfterMs', label: 'Cut after user voice (ms)', type: 'number', default: 200, description: 'User voice over the agent’s answer this long stops it (backchannel cues are never cut).' },
     { key: 'idleCells', label: 'Stop calling after silent cells', type: 'number', default: 6, description: 'No calls (listen) once this many cells in a row had no user words or voice, unless the agent is speaking. 0: always call.' },
+    {
+      key: 'cutOverCells',
+      label: 'Cut off ends after silent cells',
+      type: 'number',
+      default: 3,
+      description: 'After a cut, this many cells without user words or voice (and no resume or answer) end the cut-off state: the next lines say silent. 0: it lasts until Gemma resumes or answers.',
+    },
     { key: 'maxLines', label: 'Max tape lines', type: 'number', default: 72, description: 'Longer tapes are cut to the last lines below, the rest kept as a plain transcript (one full prefill).' },
     { key: 'keepLines', label: 'Lines kept when cut', type: 'number', default: 40 },
     { key: 'stableWords', label: 'Commit stable partial words', type: 'boolean', default: true, description: 'Put ASR partial words on the tape once a later partial repeats them (else only finals).' },
@@ -286,6 +294,11 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     /** One cell ends: write its line up to the action and decide it. */
     const boundary = () => {
       const n = ++cellNo;
+      // Cut off, and the user has been quiet for a while without Gemma resuming or answering: the turn is over.
+      if (state === 'cut' && p.cutOverCells > 0 && idle >= p.cutOverCells) {
+        state = 'silent';
+        setFloor();
+      }
       const c = newCell(n, Math.round(n * cellMs) / 1000, state, winWords, winVoice || speaking);
       winWords = [];
       winVoice = speaking;

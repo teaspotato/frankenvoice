@@ -148,6 +148,14 @@ describe('the tape stage', () => {
     h.advance(3200);
     expect(h.prompt()).toContain('  2.56 | user: (silent) | agent (speaking): continue "in [cut]"\n  3.20 | user: (talking) | agent (cut off):');
     expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " resume " say | " respond " say');
+    // Quiet for three cells after the cut without an answer: the cut-off state is over.
+    h.send(3300, 'vad', { type: 'vad.speech_end', at: 0 });
+    for (const t of [3840, 4480, 5120, 5760, 6400]) {
+      h.answer(' listen');
+      h.advance(t);
+    }
+    expect(h.prompt().endsWith('  6.40 | user: (silent) | agent (silent):')).toBe(true);
+    expect(h.prompt()).toContain('  5.76 | user: (silent) | agent (cut off): listen');
   });
 
   it('skips the call while one is out, and while the TTS queue is full', () => {
