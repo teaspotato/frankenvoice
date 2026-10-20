@@ -195,6 +195,16 @@ export function App() {
   const [users, setUsers] = useState<{ pages: number; sessions: number; max: number; queued: number } | null>(null);
   /** This page's place in the queue for the box (0: not waiting). */
   const [queuePos, setQueuePos] = useState(0);
+  /** When this page's wait ends at the latest, and when its live session hits the time limit (Date.now() ms). */
+  const [queueEta, setQueueEta] = useState<number | null>(null);
+  const [endsAt, setEndsAt] = useState<number | null>(null);
+  /** Ticks each second while a countdown shows. */
+  const [clockNow, setClockNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (queueEta === null && endsAt === null) return;
+    const t = setInterval(() => setClockNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [queueEta, endsAt]);
   const reconnectRef = useRef<() => void>(() => {});
   /** The server run in progress: the session it replays, whether its result is kept, where it stopped. */
   const serverRun = useRef<{ origin?: Session; keep: boolean; stoppedAt?: number } | null>(null);
@@ -310,6 +320,7 @@ export function App() {
       for (const [node, state] of Object.entries(states)) pushState(node, state);
     },
     ended(info) {
+      setEndsAt(null);
       if (serverRun.current) serverRun.current.stoppedAt = info.stoppedAt;
     },
     bundle(bytes) {
@@ -346,8 +357,10 @@ export function App() {
     },
     notice: (text) => setNotice(text),
     users: (u) => setUsers(u),
-    queue(position, started) {
+    limit: (leftMs) => setEndsAt(Date.now() + leftMs),
+    queue(position, started, waitMs) {
       setQueuePos(position);
+      setQueueEta(position && waitMs !== null ? Date.now() + waitMs : null);
       if (position) setNotice(`The GPU box is busy: you're ${position === 1 ? 'next' : `number ${position}`} in line. Your session starts by itself.`);
       else if (started) setNotice('');
       // Left the queue: nothing will start.
@@ -356,6 +369,8 @@ export function App() {
     closed(reason) {
       setUsers(null);
       setQueuePos(0);
+      setQueueEta(null);
+      setEndsAt(null);
       reconnectRef.current();
       if (!serverRun.current) return;
       serverRun.current = null;
@@ -377,7 +392,8 @@ export function App() {
       renamed: (f, t, p) => h.current.renamed(f, t, p),
       notice: (t) => h.current.notice(t),
       users: (u) => h.current.users(u),
-      queue: (p, s) => h.current.queue(p, s),
+      queue: (p, s, w) => h.current.queue(p, s, w),
+      limit: (l) => h.current.limit(l),
       closed: (r) => h.current.closed(r),
     }));
   };
@@ -688,6 +704,34 @@ export function App() {
   const stageOf = (lane: string | null): StageId | null =>
     lane === null ? null : STAGES.some((s) => s.id === lane) ? (lane as StageId) : 'tts';
 
+  const mmss = (until: number) => {
+    const s = Math.max(0, Math.round((until - clockNow) / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  };
+
+  // Waiting for the box: only the queue shows; the session starts by itself when its turn comes.
+  if (queuePos > 0 && !running)
+    return (
+      <div className="queue-page">
+        <span className="brand">frankenvoice</span>
+        <h1>The GPU box is busy</h1>
+        <p>
+          You're {queuePos === 1 ? 'next' : `number ${queuePos}`} in line. Your session starts by itself; keep this tab open.
+        </p>
+        {queueEta !== null && (
+          <p className="eta">
+            starts in at most <b>{mmss(queueEta)}</b>
+          </p>
+        )}
+        {users && (
+          <p className="muted">
+            {users.pages} user{users.pages === 1 ? '' : 's'} connected · {users.sessions}/{users.max} live · {users.queued} waiting
+          </p>
+        )}
+        <button onClick={() => clientRef.current?.stop()}>✕ Leave queue</button>
+      </div>
+    );
+
   return (
     <div
       className={`app${layout.logOpen ? '' : ' log-collapsed'}${layout.sideOpen ? '' : ' side-collapsed'}`}
@@ -707,6 +751,11 @@ export function App() {
           <button className="danger" onClick={stop}>
             ■ Stop {running}
           </button>
+        )}
+        {running === 'live' && endsAt !== null && (
+          <span className={endsAt - clockNow < 30_000 ? 'warn' : 'muted'} title="Live sessions stop (and are saved) at the time limit, so others in line get their turn">
+            {mmss(endsAt)} left
+          </span>
         )}
         <button
           onClick={() => download('frankenvoice-pipeline.json', JSON.stringify({ format: CONFIG_FORMAT, formatVersion: CONFIG_FORMAT_VERSION, stages: config }, null, 2), 'application/json')}

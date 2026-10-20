@@ -29,9 +29,12 @@
 //   {type:'saved', id, path} {type:'renamed', from, to, path} {type:'notice', text}
 //   {type:'users', pages, sessions, max, queued}  pages connected, sessions using the GPU box, the cap (FV_MAX_SESSIONS,
 //                                              default 1), pages waiting; on connect and on change
-//   {type:'queue', position, ahead?}           the box is busy: this page's start (or replay with live channels) waits,
+//   {type:'queue', position, ahead?, waitMs?}  the box is busy: this page's start (or replay with live channels) waits,
 //                                              `position` in line from 1; it starts by itself when its turn comes.
+//                                              waitMs: the longest wait from the session limit (null: no limit);
+//                                              re-sent every 5 s while waiting.
 //                                              position 0: no longer waiting (started: its turn came; else it left with 'stop')
+//   {type:'limit', leftMs}                     this page's live session is stopped (and saved) in leftMs (FV_MAX_SESSION_S)
 //
 // Each page has its own run; pages don't take over each other, they queue.
 

@@ -27,6 +27,10 @@ export interface LiveOptions {
   cannedDir?: string;
   /** How many sessions may use the GPU box at once; more wait in a queue. Default 1. */
   maxSessions?: () => number;
+  /** A live session is stopped after this long (ms; 0 = never), so a stuck page can't hold the box. */
+  maxSessionMs?: () => number;
+  /** How often the server pings each page (ms); a page that misses two pongs is dropped. */
+  heartbeatMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -117,6 +121,8 @@ interface Run {
   title: string;
   /** Uses the GPU box (a live session, or a replay with live channels): counts against the cap. */
   box: boolean;
+  /** When the session limit stops it (Date.now() ms), for live sessions under a limit. */
+  endsAt?: number;
   /** Stops the run; resolves once it is finished and handed over. */
   stop(): Promise<void>;
   detach(): void;
@@ -128,6 +134,8 @@ export class LiveHub {
   private lastUsers = '';
   /** Pages waiting for the box, first in line first, with what to run when their turn comes. */
   private queue: { page: Page; go: () => void; told?: number }[] = [];
+  /** Re-sends each waiting page its place and wait while anyone waits. */
+  private queueTick?: ReturnType<typeof setInterval>;
 
   constructor(private o: LiveOptions) {
     this.drivers = serverDrivers(o.upstreams, { modelsDir: o.modelsDir, cannedDir: o.cannedDir ?? join(o.modelsDir, '..', 'fv-tts-cache') });
@@ -163,6 +171,17 @@ export class LiveHub {
     const page = new Page(ws, this.drivers);
     this.pages.add(page);
     this.broadcastUsers(page);
+    // A tab closed behind a tunnel may never send a close: without pongs the socket is dead.
+    let alive = true;
+    ws.on('pong', () => (alive = true));
+    const beat = setInterval(() => {
+      if (!alive) {
+        this.log('a page stopped answering pings: dropping it');
+        return ws.terminate();
+      }
+      alive = false;
+      ws.ping();
+    }, this.o.heartbeatMs ?? 10_000);
     ws.on('message', (data: Buffer, binary) => {
       try {
         if (binary) this.onBinary(page, unframe(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)));
@@ -172,6 +191,7 @@ export class LiveHub {
       }
     });
     ws.on('close', () => {
+      clearInterval(beat);
       this.pages.delete(page);
       this.leaveQueue(page);
       // Its mic and speaker are gone: its run can't go on (its end lets the next page in).
@@ -233,10 +253,42 @@ export class LiveHub {
     return true;
   }
 
-  private tellQueue() {
-    this.queue.forEach((q, i) => {
-      if (q.told !== i + 1) q.page.send({ type: 'queue', position: (q.told = i + 1), ahead: i });
+  private get maxSessionMs() {
+    return Math.max(0, this.o.maxSessionMs?.() ?? 0);
+  }
+
+  /**
+   * The longest each waiting page may wait (ms, in line order), from the session limit: the box's runs end by their
+   * limit, and each page ahead may use a whole one. Null without a limit.
+   */
+  private waits(): (number | null)[] {
+    const limit = this.maxSessionMs;
+    if (!limit) return this.queue.map(() => null);
+    const now = Date.now();
+    const slots: number[] = [];
+    for (const p of this.pages) if (p.run?.box) slots.push(Math.max(0, (p.run.endsAt ?? now + limit) - now));
+    while (slots.length < this.maxSessions) slots.push(0);
+    return this.queue.map(() => {
+      slots.sort((a, b) => a - b);
+      const wait = slots[0];
+      slots[0] += limit;
+      return wait;
     });
+  }
+
+  /** Tell waiting pages their place in line and how long they may wait; `all`: also those whose place didn't change. */
+  private tellQueue(all = false) {
+    const waits = this.waits();
+    this.queue.forEach((q, i) => {
+      if (all || q.told !== i + 1) q.page.send({ type: 'queue', position: (q.told = i + 1), ahead: i, waitMs: waits[i] });
+    });
+    if (!this.queue.length) {
+      clearInterval(this.queueTick);
+      this.queueTick = undefined;
+    } else if (!this.queueTick) {
+      this.queueTick = setInterval(() => this.tellQueue(true), 5000);
+      this.queueTick.unref?.();
+    }
   }
 
   /** The box has room: start the pages first in line. */
@@ -325,21 +377,37 @@ export class LiveHub {
     });
     const s = this.stream(page, rt, () => scheduler.now(), () => false);
     let stopping: Promise<void> | undefined;
+    const limit = this.maxSessionMs;
+    const timer =
+      limit > 0
+        ? setTimeout(() => {
+            page.send({ type: 'notice', text: `the session reached the ${Math.round(limit / 1000)} s limit and was stopped` });
+            this.log(`live session ${rt.trajectory.meta.id} hit the time limit`);
+            void run.stop();
+          }, limit)
+        : undefined;
     const run: Run = {
       rt,
       now: () => scheduler.now(),
       autosave: m.autosave !== false,
       title: m.title ?? '',
       box: true,
+      endsAt: limit > 0 ? Date.now() + limit : undefined,
       detach: s.detach,
       stop: () =>
         (stopping ??= (async () => {
-          rt.stop();
-          await this.finish(page, run);
+          clearTimeout(timer);
+          try {
+            rt.stop();
+          } finally {
+            await this.finish(page, run);
+          }
         })()),
     };
     page.run = run;
+    if (limit > 0) page.send({ type: 'limit', leftMs: limit });
     this.broadcastUsers();
+    this.tellQueue(true);
     this.log(`live session ${rt.trajectory.meta.id} started`);
     rt.start();
   }

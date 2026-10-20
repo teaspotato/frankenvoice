@@ -66,6 +66,13 @@ const SETTINGS: SettingDef[] = [
     default: '1',
     hint: 'More pages wait in a queue. One L4 gives one user the best latency; 2 users add about 1 s to each reply, 4 about 2 s',
   },
+  {
+    name: 'FV_MAX_SESSION_S',
+    group: 'Users',
+    label: 'Longest live session (s)',
+    default: '180',
+    hint: 'A live session is stopped (and saved) after this long, so a stuck page can\'t hold the box. 0 = no limit',
+  },
 ];
 const SETTING_NAMES = new Set(SETTINGS.map((d) => d.name));
 const SETTINGS_FILE = resolve(process.env.FV_SETTINGS_FILE ?? '.frankenvoice/settings.json');
@@ -309,7 +316,9 @@ const server = createServer((req, res) => {
 });
 
 // The page's socket: mic in, agent audio and the run's trajectory out.
-const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR, maxSessions: () => Number(setting('FV_MAX_SESSIONS')) || 1 });
+const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR, maxSessions: () => Number(setting('FV_MAX_SESSIONS')) || 1,
+  maxSessionMs: () => Math.max(0, Number(setting('FV_MAX_SESSION_S') ?? 180) || 0) * 1000,
+});
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');

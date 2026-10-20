@@ -32,7 +32,9 @@ export interface LiveHandlers {
   /** Pages connected to the server, sessions using the GPU box, the most it runs at once, and pages waiting. */
   users(info: { pages: number; sessions: number; max: number; queued: number }): void;
   /** The box is busy: this page's run waits, `position` in line from 1 (0: not waiting any more). It starts by itself. */
-  queue(position: number, started: boolean): void;
+  queue(position: number, started: boolean, waitMs: number | null): void;
+  /** This page's live session is stopped by the session limit in `leftMs`. */
+  limit(leftMs: number): void;
   /** The socket closed (the server went away). */
   closed(reason: string): void;
 }
@@ -183,7 +185,9 @@ export class LiveClient {
       case 'users':
         return this.on.users({ pages: m.pages as number, sessions: m.sessions as number, max: m.max as number, queued: (m.queued as number) ?? 0 });
       case 'queue':
-        return this.on.queue(m.position as number, m.started === true);
+        return this.on.queue(m.position as number, m.started === true, typeof m.waitMs === 'number' ? m.waitMs : null);
+      case 'limit':
+        return this.on.limit(m.leftMs as number);
     }
   }
 

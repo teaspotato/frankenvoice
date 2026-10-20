@@ -41,6 +41,8 @@ function serveDriver(ws: WebSocket, driver: LiveDriver, req: Json) {
 let servers: Server[] = [];
 let gpuboxPort = 0;
 let llmPort = 0;
+/** The live session limit the hub uses (ms; 0: none), set per test. */
+let limitMs = 0;
 let livePort = 0;
 const seen = { asr: 0, tts: 0, llm: 0, auth: [] as string[], ttsQueries: [] as string[] };
 const sessions = mkdtempSync(join(tmpdir(), 'fv-sessions-'));
@@ -84,6 +86,8 @@ beforeAll(async () => {
           : { headers: {}, missing: 'TYPESAFE_API_KEY is not set' },
     sessionsDir: () => sessions,
     modelsDir: join(sessions, 'models'),
+    maxSessionMs: () => limitMs,
+    heartbeatMs: 300,
     log: () => {},
   });
   const server = createServer();
@@ -240,6 +244,64 @@ describe('the pipeline in the server', () => {
     await b.saved;
     expect(b.got.saved).toMatch(/\.fvs$/);
     for (const p of [b, c3]) p.ws.close();
+  }, 20_000);
+
+  it('drops a page that stopped answering, and stops a session at the time limit', async () => {
+    const c = defaultConfig();
+    c.vad.variant = 'energy';
+    c.backchannel.variant = 'off';
+    const start = JSON.stringify({ type: 'start', graph: buildGraph(c) as unknown as Json, env: {}, autosave: true, title: '' });
+    const open = async (autoPong: boolean) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${livePort}/api/live`, { autoPong });
+      const got = { msgs: [] as { type: string; [k: string]: Json }[], closed: false };
+      let micTimer: ReturnType<typeof setInterval> | undefined;
+      ws.on('close', () => ((got.closed = true), clearInterval(micTimer)));
+      ws.on('message', (data: Buffer, binary) => {
+        if (binary) return;
+        const m = JSON.parse(data.toString()) as { type: string; [k: string]: Json };
+        got.msgs.push(m);
+        if (m.type === 'mic.open') {
+          const { frameSamples } = m.request as { frameSamples: number };
+          ws.send(JSON.stringify({ type: 'mic.ready', label: 'fake', contextSampleRate: 16000, settings: {} }));
+          let n = 0;
+          micTimer = setInterval(() => {
+            if (ws.readyState !== ws.OPEN) return clearInterval(micTimer);
+            ws.send(frame({ k: 'mic', frame: n++, ctxTime: n * 0.032 }, new Uint8Array(new Float32Array(frameSamples).buffer)));
+          }, 30);
+        }
+      });
+      await new Promise((r) => ws.once('open', r));
+      return { ws, got, of: (t: string) => got.msgs.filter((m) => m.type === t) };
+    };
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    limitMs = 2500;
+    try {
+      // A page whose tab went away without a close: it never answers pings.
+      const dead = await open(false);
+      dead.ws.send(start);
+      await wait(150);
+      expect(dead.of('limit')).toEqual([{ type: 'limit', leftMs: 2500 }]);
+      const b = await open(true);
+      b.ws.send(start);
+      await wait(100);
+      const q = b.of('queue')[0];
+      expect(q).toMatchObject({ position: 1 });
+      expect(q.waitMs as number).toBeGreaterThan(2000);
+      expect(q.waitMs as number).toBeLessThanOrEqual(2500);
+      // Two missed pings drop the dead page, and the next in line starts.
+      await wait(900);
+      expect(dead.got.closed).toBe(true);
+      expect(b.of('session')).toHaveLength(1);
+      expect(b.of('queue').at(-1)).toMatchObject({ position: 0, started: true });
+      // The session stops by itself at the limit, and is saved.
+      await wait(2800);
+      expect(b.of('notice').map((m) => m.text)).toContainEqual(expect.stringMatching(/limit/));
+      expect(b.of('saved')).toHaveLength(1);
+      expect(b.got.closed).toBe(false);
+      b.ws.close();
+    } finally {
+      limitMs = 0;
+    }
   }, 20_000);
 
   it('renders a canned line once on the box, in the background, then serves it from the cache', async () => {
