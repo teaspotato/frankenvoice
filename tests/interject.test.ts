@@ -131,6 +131,25 @@ describe('the interjection gate', () => {
     expect(h.of('interject.check')).toHaveLength(0);
   });
 
+  it('lets a check in flight finish, then checks the newer words', () => {
+    const h = harness(interjectNode);
+    h.send(0, 'vad', { type: 'vad.speech_start' });
+    h.send(100, 'turn', words('The Eiffel Tower is in Berlin.'));
+    h.ios[0].h.onRecv!(gateAnswer('complete'), undefined);
+    h.send(600, 'turn', words('The Eiffel Tower is in Berlin. It was built in 1999.'));
+    h.ios[1].h.onRecv!(gateAnswer('complete'), undefined);
+    // Not cancelled for the newer words.
+    expect(h.of('interject.drop')).toHaveLength(0);
+    expect(h.of('interject.check')).toHaveLength(1);
+    h.send(1500, 'text', { type: 'llm.check_verdict', checkId: 'interject-c0', verdict: 'pass', text: '[listen]' });
+    expect(h.of('interject.check').map((m) => m.text)).toEqual(['The Eiffel Tower is in Berlin.', 'The Eiffel Tower is in Berlin. It was built in 1999.']);
+    // A failed check moves on too.
+    h.send(1600, 'turn', words('The Eiffel Tower is in Berlin. It was built in 1999. By Gustave.'));
+    h.ios[2].h.onRecv!(gateAnswer('complete'), undefined);
+    h.send(2000, 'text', { type: 'llm.check_end', checkId: 'interject-c1', status: 'error' });
+    expect(h.of('interject.check')).toHaveLength(3);
+  });
+
   it('waits at most maxWaitMs for a pause', () => {
     const h = harness(interjectNode, { maxWaitMs: 1000 });
     h.send(0, 'vad', { type: 'vad.speech_start' });
@@ -147,6 +166,14 @@ describe('the LLM on interjection checks', () => {
   const tok = (text: string) => ({ choices: [{ index: 0, delta: { content: text } }] });
   const messages = (r: Json) => (r as { body: { messages: { role: string; content: string }[] } }).body.messages.map((m) => m.content);
   const check = (text: string) => ({ type: 'interject.check', checkId: 'c0', text, prompt: '[cut in? else [listen]]', pass: '[listen]' });
+
+  it('asks with thinking off and a short token limit', () => {
+    const h = harness(llmNode, { provider: 'anthropic', model: 'claude-haiku-5-5', thinking: 'model default', system: 'sys' });
+    h.send(0, 'interject', check('The tower is in Berlin.'));
+    expect(h.ios[0].request).toMatchObject({ thinking: { type: 'disabled' }, max_tokens: 300 });
+    h.send(500, 'turn', { type: 'turn.user', turnId: 'u0', text: 'Hi.' });
+    expect((h.ios[1].request as { thinking?: unknown }).thinking).toBeUndefined();
+  });
 
   it('passes when the reply is the pass reply', () => {
     const h = harness(llmNode, params);

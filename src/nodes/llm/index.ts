@@ -64,6 +64,9 @@ export const llmAdapters: Record<string, LlmAdapter> = {
   [openaiCompatAdapter.provider]: openaiCompatAdapter,
 };
 
+/** Enough for the one or two sentences an interjection is. */
+const CHECK_MAX_TOKENS = 300;
+
 const DEFAULT_SYSTEM =
   'You are a voice assistant in a live spoken conversation. Your words are converted to speech, so answer in short, natural spoken sentences. No markdown, lists, or emoji.';
 
@@ -89,7 +92,8 @@ const openai = { provider: ['openai-compatible'] };
  *
  * An `interject.check` (the user's words so far, while they still talk) asks
  * whether to cut in: a request like a draft's, with the check's prompt after
- * the words, its stream held back. As soon as the reply is clearly not the
+ * the words, its stream held back, with thinking off and a short token limit
+ * so it answers fast. As soon as the reply is clearly not the
  * pass reply, `llm.check_verdict` says `interject` (else `pass`, and the check
  * ends). A committed turn that names the check (`interject`) keeps it the way
  * a kept draft is kept; the history records the committed words, marked as
@@ -418,7 +422,8 @@ export const llmNode: NodeDef = {
       });
       ctx.emit('text', { type: 'llm.check', rid: r.rid, checkId: r.checkId!, text });
       check = r;
-      send(r, historyFor(user, msg.replaces));
+      // A check is a reflex: no thinking (it took a second or more before the verdict), and a short answer.
+      send(r, historyFor(user, msg.replaces), { ...reqParams, thinking: 'off', maxTokens: Math.min(Number(reqParams.maxTokens) || CHECK_MAX_TOKENS, CHECK_MAX_TOKENS) });
     };
     const dropDraft = (why: string) => {
       if (!draft) return;

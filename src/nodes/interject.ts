@@ -40,7 +40,9 @@ const count = (key: string) => (key ? key.split(' ').length : 0);
 /**
  * TypeSafe gates the user's words so far (turn.words) while they talk; when
  * they end on something complete, the LLM is asked whether to cut in
- * (interject.check, with `prompt` added to the words). If it wants to, the next
+ * (interject.check, with `prompt` added to the words). A check in flight is
+ * never cancelled for newer words: they are checked as soon as it ends, so a
+ * check always gets an answer. If the LLM wants to cut in, the next
  * pause in the user's speech (VAD speech end) takes the floor
  * (interject.take); if they go on for `maxWaitMs` or `maxExtraWords` more words
  * without one, the interjection is dropped as stale.
@@ -65,7 +67,7 @@ export const interjectNode: NodeDef = {
     },
     { key: 'pass', label: 'Pass reply', type: 'string', default: PASS, description: 'What the LLM replies when it lets the user go on (the prompt must ask for it).' },
     { key: 'maxWaitMs', label: 'Max wait for a pause (ms)', type: 'number', default: 2500, description: 'Drop the interjection if the user does not pause this long after the LLM wanted to cut in.' },
-    { key: 'maxExtraWords', label: 'Max extra words', type: 'number', default: 8, description: 'Drop the interjection if the user says this many more words than the LLM saw before pausing.' },
+    { key: 'maxExtraWords', label: 'Max extra words', type: 'number', default: 12, description: 'Drop the interjection if the user says this many more words than the LLM saw before pausing.' },
     { key: 'model', label: 'TypeSafe model', type: 'string', default: 'jev-latest' },
   ],
   channels: [{ name: 'typesafe', description: "TypeSafe Choice over the user's words so far: one JSON request, one JSON answer" }],
@@ -87,6 +89,8 @@ export const interjectNode: NodeDef = {
     let gen = 0;
     /** The check with the LLM in flight, or the interjection waiting for a pause. */
     let check: { id: string; key: string; interject?: string; taken?: boolean; wait?: TimerHandle } | null = null;
+    /** Newer words were judged complete while a check was in flight: check them when it ends. */
+    let queued = false;
 
     const drop = (why: string) => {
       const c = check;
@@ -106,7 +110,9 @@ export const interjectNode: NodeDef = {
     const startCheck = () => {
       const key = draftKey(words);
       if (!key || key === checked || draftOut || check?.interject) return;
-      drop('words went on');
+      // Restarting would throw away the time the LLM has already spent: wait for its answer.
+      if (check) return void (queued = true);
+      queued = false;
       checked = key;
       check = { id: `${ctx.id}-c${n++}`, key };
       ctx.emit('check', {
@@ -157,15 +163,22 @@ export const interjectNode: NodeDef = {
         }
         if (port === 'text') {
           const c = check;
-          if (msg.type !== 'llm.check_verdict' || !c || msg.checkId !== c.id) return;
-          if (msg.verdict !== 'interject') {
+          if (!c || msg.checkId !== c.id) return;
+          // Ended without wanting to cut in (a pass, or a failed request): on to the words queued meanwhile.
+          if ((msg.type === 'llm.check_verdict' && msg.verdict !== 'interject') || (msg.type === 'llm.check_end' && msg.status !== 'kept' && !c.interject)) {
             check = null;
             ctx.setState('check', '');
+            if (queued) startCheck();
             return;
           }
+          if (msg.type !== 'llm.check_verdict') return;
           c.interject = String(msg.text ?? '');
           // The user talked on while the LLM was deciding.
-          if (count(draftKey(words)) - count(c.key) > Number(p.maxExtraWords)) return drop(`the user said more than ${Number(p.maxExtraWords)} words past it`);
+          if (count(draftKey(words)) - count(c.key) > Number(p.maxExtraWords)) {
+            drop(`the user said more than ${Number(p.maxExtraWords)} words past it`);
+            if (queued) startCheck();
+            return;
+          }
           if (!speaking) take('the user was already silent');
           else
             c.wait = ctx.setTimer(
@@ -184,6 +197,7 @@ export const interjectNode: NodeDef = {
             if (!words) {
               // Committed, or gone: start over with the next words.
               asked = checked = '';
+              queued = false;
               gen++;
               if (!check?.taken) drop('the turn ended');
               return;
