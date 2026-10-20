@@ -6,7 +6,7 @@ import { asrNode } from './asr';
 import { duplexTurnNode, halfDuplexTurnNode } from './turn';
 import { noTurnModelNode, turnModelNode } from './turn-model';
 import { llmNode } from './llm';
-import { fillerOpenerNode, noOpenerNode } from './opener';
+import { choiceOpenerNode, fillerOpenerNode, noOpenerNode } from './opener';
 import { workersNode, mockWorkersNode, noWorkersNode } from './workers';
 import { ttsNode } from './tts';
 import { streamingTtsNode } from './tts/stream';
@@ -16,7 +16,7 @@ import { echoLlmNode, toneTtsNode } from './mocks';
 import { backchannelNode, noBackchannelNode } from './backchannel';
 
 export const registry: NodeRegistry = Object.fromEntries(
-  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, energyVadNode, asrNode, turnModelNode, noTurnModelNode, duplexTurnNode, halfDuplexTurnNode, llmNode, fillerOpenerNode, noOpenerNode, workersNode, mockWorkersNode, noWorkersNode, ttsNode, streamingTtsNode, browserTtsNode, speakerNode, echoLlmNode, toneTtsNode, backchannelNode, noBackchannelNode].map(
+  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, energyVadNode, asrNode, turnModelNode, noTurnModelNode, duplexTurnNode, halfDuplexTurnNode, llmNode, fillerOpenerNode, choiceOpenerNode, noOpenerNode, workersNode, mockWorkersNode, noWorkersNode, ttsNode, streamingTtsNode, browserTtsNode, speakerNode, echoLlmNode, toneTtsNode, backchannelNode, noBackchannelNode].map(
     (d) => [d.type, d],
   ),
 );

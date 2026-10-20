@@ -38,7 +38,7 @@ export const STAGES: StageDef[] = [
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex' } },
   { id: 'backchannel', label: 'Backchannels', variants: { on: 'backchannel', off: 'backchannel.off' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' }, managed: ['delegate'], managedNote: 'Delegation (the worker tools) is set by the Workers stage.' },
-  { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', off: 'opener.off' } },
+  { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', typesafe: 'opener.choice', off: 'opener.off' } },
   { id: 'workers', label: 'Workers', variants: { acp: 'workers', mock: 'workers.mock', off: 'workers.off' } },
   { id: 'tts', label: 'TTS', variants: { api: 'tts', 'deepgram-stream': 'tts.stream', browser: 'tts.browser', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
@@ -143,7 +143,10 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
     e('backchannel', 'text', 'tts', 'text'),
     e('llm', 'text', 'tts', 'text'),
     e('llm', 'text', 'opener', 'text'),
+    // The opener may pick its line from the user's words.
+    e('turn', 'turn', 'opener', 'turn'),
     e('opener', 'text', 'tts', 'text'),
+    ...(registry[stageType(c, 'turn')].outputs.some((p) => p.name === 'text') ? [e('turn', 'text', 'tts', 'text')] : []),
     // Delegation: the LLM hands tasks to workers and hears back; the VAD tells it when the user pauses.
     e('llm', 'workers', 'workers', 'workers'),
     e('workers', 'updates', 'llm', 'updates'),

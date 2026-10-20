@@ -72,6 +72,7 @@ ASR, LLM and TTS each have a **Provider** param:
 | | `deepgram` (Aura, `/v1/speak`, 16-bit PCM; default voice `aura-2-thalia-en`) | `DEEPGRAM_API_KEY` |
 | | `openai-compatible` (`/audio/speech`, PCM), endpoint `openai` / `custom` | as above |
 | `tts.browser` | the browser's built-in `speechSynthesis` | none |
+| `opener.choice`, `backchannel` (*decide* `typesafe`) | TypeSafe Choice (`/v1/systemone`, model `jev-latest`) | `TYPESAFE_API_KEY` |
 
 For OpenRouter, set the LLM stage provider to `openai-compatible`, endpoint `openrouter`, and a model slug. The `API` setting picks Chat Completions (`chat`, the default, which every compatible server has) or the Responses API (`responses`, sent stateless with the whole history and `store: false`). The toolbar shows which keys the current config still needs; click it to open Settings.
 

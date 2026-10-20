@@ -235,6 +235,20 @@ async function postJson(url: string, body: Json, signal: AbortSignal): Promise<R
   return fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
 }
 
+/** TypeSafe primitives (a Choice question): one JSON request, one JSON answer. */
+const typesafe: LiveDriver = (req, sink) => {
+  const r = req as { path: string; body: Json };
+  const ac = new AbortController();
+  (async () => {
+    const res = await postJson(`/api/typesafe${r.path}`, r.body, ac.signal);
+    const text = await res.text();
+    if (!res.ok) return sink.close({ error: { status: res.status, body: text } });
+    sink.recv(JSON.parse(text) as Json);
+    sink.close(null);
+  })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
+  return { send() {}, close: () => ac.abort() };
+};
+
 /** An OpenAI-compatible SSE stream at `path`; each data line is recorded parsed, `[DONE]` as {"$done": true}. */
 const openaiSse =
   (path: string): LiveDriver =>
@@ -753,4 +767,4 @@ const embed: LiveDriver = (req, sink) => {
   };
 };
 
-export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, 'openai-responses': openaiResponses, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel, embed, acp };
+export const browserDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, 'openai-responses': openaiResponses, cartesia, 'openai-tts': openaiTts, 'deepgram-tts': deepgramTts, 'deepgram-tts-ws': deepgram, 'speech-synthesis': speechSynthesisDriver, rnnoise, speaker, 'turn-model': turnModel, embed, acp, typesafe };
