@@ -586,6 +586,39 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let playingSince: number | null = null;
     /** Until when (session time) the page may stop playback on its own VAD; null: it may not. */
     let gateUntil: number | null = null;
+    /**
+     * The playing reply's utterances (tagged replies): from when each plays, whether the user may cut
+     * it off and whether the quick yield applies. Speech that starts in one that may not be cut off is
+     * let be (no pause, no yield); if it is still going when an interruptible one starts, it counts from then.
+     */
+    let utts: { rid: string | null; list: { at: number; interruptible: boolean; gate: boolean }[] } = { rid: null, list: [] };
+    let playingRid: string | null = null;
+    const flagsAt = (t: number) => {
+      const list = utts.rid === playingRid ? utts.list : [];
+      return list.findLast((u) => u.at <= t) ?? list[0] ?? { interruptible: true, gate: true };
+    };
+    /** Speech that started in an utterance that may not be cut off, and the look at the next utterance. */
+    let protectedOnset: { at: number; timer?: TimerHandle } | null = null;
+    const clearProtected = () => {
+      protectedOnset?.timer?.clear();
+      protectedOnset = null;
+    };
+    /** At `t`, if the user is still talking over an utterance that may be cut off now, it counts as their onset. */
+    const lookAgainAt = (t: number) => {
+      const o = protectedOnset;
+      if (!o) return;
+      o.timer?.clear();
+      o.timer = ctx.setTimer(
+        Math.max(0, t - ctx.now()),
+        () => {
+          o.timer = undefined;
+          if (protectedOnset !== o || !speaking || state !== 'speaking' || !flagsAt(ctx.now()).interruptible) return;
+          clearProtected();
+          overlap(o.at, 'user speech (VAD), still going when an interruptible utterance started');
+        },
+        'protected',
+      );
+    };
     const arm = (until: number | null) => {
       if (until === gateUntil) return;
       gateUntil = until;
@@ -621,7 +654,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       return false;
     };
     const hold = () => {
-      if (held) return;
+      if (held || !flagsAt(ctx.now()).interruptible) return;
       if (p.onset === 'cut') ctx.emit('control', { type: 'pause' });
       else if (p.onset === 'duck' && p.duckDb > 0) ctx.emit('control', { type: 'duck', db: p.duckDb });
       else return;
@@ -1027,6 +1060,12 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
      */
     const pageStopped = (msg: Msg) => {
       gateUntil = null;
+      const f = flagsAt(typeof msg.cut === 'number' ? msg.cut : ctx.now());
+      if (!f.interruptible || !f.gate) {
+        // The page stopped an utterance that isn't subject to the quick yield (a race with disarming it).
+        ctx.log('debug', 'page stop in an utterance without the quick yield: resumed');
+        return void ctx.emit('control', { type: 'resume' });
+      }
       const why = `the page heard the user ${Math.round((msg.cut as number) - (playingSince ?? 0))} ms after the agent started`;
       if (state === 'speaking+user' && candidate) return yieldFloor(candidate, why, true);
       const c = state === 'speaking' ? overlap(msg.pos as number, 'user speech (page VAD)') : null;
@@ -1112,13 +1151,27 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         return;
       }
       if (port === 'playback') {
+        if (msg.type === 'playback.segment') {
+          const rid = (msg.rid as string) ?? null;
+          if (utts.rid !== rid) utts = { rid, list: [] };
+          const u = { at: msg.at as number, interruptible: msg.interruptible !== false, gate: msg.gate !== false };
+          utts.list = [...utts.list.filter((x) => x.at < u.at), u];
+          // The quick yield doesn't reach into an utterance it doesn't apply to.
+          if (rid === playingRid && gateUntil !== null && (!u.interruptible || !u.gate)) arm(u.at <= ctx.now() ? null : Math.min(gateUntil, u.at));
+          if (protectedOnset && rid === playingRid) lookAgainAt(u.at);
+          return;
+        }
         if (msg.type === 'playback.start') {
           playingSince = ctx.now();
+          playingRid = (msg.rid as string) ?? null;
+          clearProtected();
           go('playback_start', 'playback started');
-          if (state === 'speaking' && p.bargeIn && p.pageGate && p.yieldWithinMs > 0) arm(playingSince + p.yieldWithinMs);
+          const f = flagsAt(playingSince);
+          if (state === 'speaking' && p.bargeIn && p.pageGate && p.yieldWithinMs > 0 && f.interruptible && f.gate) arm(playingSince + p.yieldWithinMs);
           // They started talking while it was thinking: don't talk over them while their words are judged.
           if (candidate) holdWhenSustained(candidate);
         } else if (msg.type === 'playback.end') {
+          clearProtected();
           const c = candidate;
           if (!go('playback_end', 'playback ended')) return;
           held = false;
@@ -1171,7 +1224,14 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             // The page already stopped the agent on this speech.
             const c = candidate;
             yieldFloor(c, `user speech (VAD), ${Math.round(ctx.now() - c.since)} ms after the page stopped the agent`, true);
-          } else if (state === 'speaking' && p.yieldWithinMs > 0 && playingSince !== null && ctx.now() - playingSince < p.yieldWithinMs) {
+          } else if (state === 'speaking' && p.bargeIn && !flagsAt(ctx.now()).interruptible) {
+            // The agent is saying something that must be heard to the end: let them talk over it.
+            clearProtected();
+            protectedOnset = { at: msg.at as number };
+            decide('protected', { at: msg.at as Json, why: 'the utterance playing may not be cut off' });
+            const next = (utts.rid === playingRid ? utts.list : []).find((u) => u.at > ctx.now());
+            if (next) lookAgainAt(next.at);
+          } else if (state === 'speaking' && p.yieldWithinMs > 0 && playingSince !== null && ctx.now() - playingSince < p.yieldWithinMs && flagsAt(ctx.now()).gate) {
             // Both started into the same silence: the agent backs off at once rather than fight over the floor.
             const c = overlap(msg.at as number, 'user speech (VAD)');
             if (c && candidate === c) yieldFloor(c, `user spoke ${Math.round(ctx.now() - playingSince)} ms after the agent started`, true);
@@ -1197,6 +1257,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         } else if (msg.type === 'vad.speech_end') {
           ctx.setState('userSpeaking', false);
           speaking = false;
+          clearProtected();
           if (vadEot?.resumed) {
             // A short sound in the silence: the end of turn stays open, timed from the first stop.
             vadEot.resumed.clear();

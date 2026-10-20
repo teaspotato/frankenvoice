@@ -218,6 +218,8 @@ describe('page gate: record and replay', () => {
     };
     const c = testConfig();
     c.turn.params['full-duplex'] = { yieldWithinMs: 1000, pageGateWaitMs: 50 };
+    // Plain replies: the fake session's timing has the agent start before the user's next words.
+    c.llm.params.api = { utterances: 'plain' };
     const scheduler = new LiveScheduler();
     const rt = new Runtime({ graph: buildGraph(c), registry, scheduler, world: new LiveWorld({ ...fakeDrivers, speaker }, scheduler), mode: 'live' });
     rt.start();

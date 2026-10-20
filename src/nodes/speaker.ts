@@ -16,6 +16,9 @@ interface PlayedSegment {
   announced?: number;
   /** Pauses inside it: when, and for how long. */
   gaps?: { at: number; ms: number }[];
+  /** Its utterance's flags (tagged replies): whether the user may cut it off, and whether the quick yield applies. */
+  interruptible?: boolean;
+  gate?: boolean;
 }
 
 /** How long `s` was paused before `at`. */
@@ -199,7 +202,15 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       ctx.emit('played', { type: 'audio', track: c.track, start: c.start, end: c.end, sampleRate: c.sampleRate, samples: c.samples, at: c.at });
     };
     const announce = (r: string | null, s: PlayedSegment) =>
-      ctx.emit('playback', { type: 'playback.segment', rid: r as string, seg: s.seg, text: s.text, at: s.announced! });
+      ctx.emit('playback', {
+        type: 'playback.segment',
+        rid: r as string,
+        seg: s.seg,
+        text: s.text,
+        at: s.announced!,
+        ...(s.interruptible !== undefined ? { interruptible: s.interruptible } : {}),
+        ...(s.gate !== undefined ? { gate: s.gate } : {}),
+      });
 
     /** Backchannels playing or recently played; they play on their own output, which a flush doesn't stop. */
     let cues: Chunk[] = [];
@@ -413,7 +424,13 @@ export const speakerNode: NodeDef<SpeakerParams> = {
         if (msg.type === 'tts.segment_start') {
           const r = (msg.rid as string) ?? null;
           if (!segs.has(r)) segs.set(r, []);
-          const s: PlayedSegment = { seg: msg.seg as number, text: msg.text as string, announced: Math.max(clock(), endAt) };
+          const s: PlayedSegment = {
+            seg: msg.seg as number,
+            text: msg.text as string,
+            announced: Math.max(clock(), endAt),
+            ...(typeof msg.interruptible === 'boolean' ? { interruptible: msg.interruptible } : {}),
+            ...(typeof msg.gate === 'boolean' ? { gate: msg.gate } : {}),
+          };
           segs.get(r)!.push(s);
           // While paused it is announced on resume, when its time is known.
           if (paused === null || r !== rid) announce(r, s);

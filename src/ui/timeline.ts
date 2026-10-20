@@ -371,6 +371,11 @@ export class TimelineModel {
           this.bargeIns.push({ t0: e.t, text: '', seqs: [e.seq] });
           break;
         }
+        if (d.decision === 'protected') {
+          // Speech over an utterance that must be heard to the end: let be.
+          this.bargeIns.push({ t0: e.t, t1: e.t, text: '', decision: 'protected', why: d.why, seqs: [e.seq] });
+          break;
+        }
         const b = this.bargeIns[this.bargeIns.length - 1];
         if (b && b.t1 === undefined) {
           b.t1 = e.t;
@@ -528,7 +533,11 @@ export class TimelineModel {
         this.playback.push({ t0: d.at ?? e.t, text: d.rid ?? '', rid: d.rid ?? '', seqs: [e.seq] });
         break;
       case 'playback.segment':
-        this.playbackSegments.push({ t: d.at ?? e.t, text: d.text ?? '', seq: e.seq });
+        this.playbackSegments.push({
+          t: d.at ?? e.t,
+          text: `${d.text ?? ''}${d.interruptible === false ? ' [must be heard to the end]' : ''}${d.gate === false ? ' [no quick yield]' : ''}`,
+          seq: e.seq,
+        });
         break;
       case 'playback.gain':
         this.closeHold(d.at ?? e.t, e.seq);

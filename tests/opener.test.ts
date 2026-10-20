@@ -11,7 +11,7 @@ function harness(params: Record<string, unknown>) {
   const ios: { channel: string; request: Json; h: IOHandlers; closed: boolean }[] = [];
   const ctx: NodeContext = {
     id: 'llm',
-    params: resolveParams(llmNode, params as never),
+    params: resolveParams(llmNode, { utterances: 'plain', ...params } as never),
     now: () => now,
     cause: undefined,
     emit: (_port, msg) => out.push(msg),

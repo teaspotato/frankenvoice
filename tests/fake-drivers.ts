@@ -154,10 +154,16 @@ const openai: LiveDriver = (req, sink) => {
   const msgs = r.body.messages;
   const prefill = msgs.at(-1)?.role === 'assistant' ? msgs.at(-1)!.content : '';
   const users = msgs.filter((m) => m.role !== 'assistant').length;
-  // A request with a grammar is a backchannel's.
-  let tokens: string[] = (r.body as { grammar?: string }).grammar ? ['Oh,', ' okay.'] : `Reply number ${users}. This is a second sentence! And a third?`.match(/\S+\s*/g)!;
+  // Backchannels run on slot 1; a reply with a grammar is tagged, one utterance per line.
+  const b = r.body as { grammar?: string; id_slot?: number };
+  const bc = b.id_slot === 1;
+  let tokens: string[] = bc
+    ? ['Oh,', ' okay.']
+    : b.grammar
+      ? ['[i', '1g0] ', 'Reply ', 'number ', `${users}.`, '\n[i', '0g1] ', 'This ', 'is ', 'a ', 'second ', 'sentence!', '\n[i', '1g1] ', 'And ', 'a ', 'third?']
+      : `Reply number ${users}. This is a second sentence! And a third?`.match(/\S+\s*/g)!;
   let skip = 0;
-  while (prefill && !(r.body as { grammar?: string }).grammar && skip < tokens.length && tokens.slice(0, skip).join('').trimEnd() !== prefill) skip++;
+  while (prefill && !bc && skip < tokens.length && tokens.slice(0, skip).join('').trimEnd() !== prefill) skip++;
   tokens = tokens.slice(skip);
   const cut = r.body.max_tokens !== undefined && tokens.length > r.body.max_tokens;
   if (cut) tokens = tokens.slice(0, r.body.max_tokens);

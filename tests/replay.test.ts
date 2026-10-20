@@ -41,6 +41,8 @@ describe('record and replay', () => {
     expect(types('transcript')).toContain('asr.final');
     expect(types('turn')).toContain('turn.user');
     expect(types('text')).toContain('llm.delta');
+    // Tagged replies: each utterance's flags before its words.
+    expect(types('text')).toContain('llm.utterance');
     expect(types('audio')).toContain('audio');
     expect(types('playback')).toContain('playback.start');
     expect(types('scores')).toContain('turnmodel.frame');

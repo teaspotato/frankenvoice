@@ -83,7 +83,9 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
     const p = ctx.params;
     const request = (): Json => ({ path: '/v1/tts', query: (p.voice ? { voice: p.voice } : {}) as JsonObject });
     /** The open segment's `text` grows as words go out; its audio plays at once. */
-    type Seg = { seg: number; text: string; started: boolean; announced?: string };
+    /** An utterance's flags (tagged replies), carried by its segments. */
+    type Flags = { interruptible: boolean; gate: boolean };
+    type Seg = { seg: number; text: string; started: boolean; announced?: string; flags?: Flags };
     type Reply = {
       rid: string;
       io: ReturnType<typeof ctx.io.open>;
@@ -101,6 +103,8 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       /** The socket's audio (samples from its first) placed on the media track, for the server's word times. */
       pieces: { a: number; m: number; n: number }[];
       received: number;
+      /** The flags of the utterance being written (tagged replies). */
+      flags?: Flags;
     };
     let reply: Reply | undefined;
     /** Opener lines (fillers), synthesized ahead so they play at once. */
@@ -173,7 +177,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       if (!s.started) {
         s.started = true;
         s.announced = s.text;
-        ctx.emit('audio', { type: 'tts.segment_start', rid: r.rid, seg: s.seg, text: s.text });
+        ctx.emit('audio', { type: 'tts.segment_start', rid: r.rid, seg: s.seg, text: s.text, ...(s.flags ?? {}) });
       }
       if (!samples.length) return;
       const ref = ctx.media.append('audio', samples, p.sampleRate);
@@ -213,7 +217,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       if (ready > r.spoken) {
         const text = r.buf.slice(r.spoken, ready);
         if (!r.open && text.trim()) {
-          r.open = { seg: r.segNo++, text: '', started: false };
+          r.open = { seg: r.segNo++, text: '', started: false, flags: r.flags };
           r.segs.push(r.open);
         }
         if (r.open) r.open.text = r.buf.slice(0, ready).trim();
@@ -239,7 +243,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
           s.text = text;
         }
         if (r.spoken > 0 && r.buf.slice(0, r.spoken).trim()) {
-          r.open = { seg: r.segNo++, text: r.buf.slice(0, r.spoken).trim(), started: false };
+          r.open = { seg: r.segNo++, text: r.buf.slice(0, r.spoken).trim(), started: false, flags: r.flags };
           r.segs.push(r.open);
         }
         if (all) break;
@@ -411,6 +415,12 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
           case 'llm.start':
             cancel();
             start(msg.rid as string);
+            break;
+          case 'llm.utterance':
+            // A new utterance: the one before ends its segment here, and the next ones carry its flags.
+            if (!r || r.rid !== msg.rid) return;
+            if (r.buf.trim()) send(r, true, false);
+            r.flags = { interruptible: msg.interruptible !== false, gate: msg.gate !== false };
             break;
           case 'opener.lines':
           case 'bc.lines':
