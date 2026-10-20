@@ -33,7 +33,7 @@ Open http://localhost:5173 and press **Run live**. Allow microphone access. Pres
 
 The pipeline runs in the browser. The small proxy in `server/` keeps API keys out of the page, avoids CORS, and stores settings and session bundles. It only answers requests from the local UI: other websites (by `Origin`) and DNS-rebinding hosts (by `Host`) get 403. It forwards requests and streams responses unchanged, so the browser records exactly what each server sent.
 
-To host the UI somewhere else (for example on the GPU box, behind a tunnel), build it with `pnpm build` and start the proxy with `FV_STATIC_DIR=dist` and `FV_HOST_TOKEN=<secret>`. It then serves the UI too, and instead of local-only access every request must be same-origin and carry the token: open the page once with `?token=<secret>`, which sets an HttpOnly cookie. Anyone with the token can change settings, including the worker command, so treat it like a password.
+To host the UI somewhere else (for example on the GPU box, behind a tunnel), build it with `pnpm build` and start the proxy with `FV_STATIC_DIR=dist` and `FV_HOST_TOKEN=<secret>`. It then serves the UI too, and instead of local-only access every request must be same-origin and carry the token: open the page once with `?token=<secret>`, which sets an HttpOnly cookie. Anyone with the token can change settings, so treat it like a password.
 
 ## Pipeline
 

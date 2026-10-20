@@ -252,25 +252,3 @@ describe('SimScheduler seek', () => {
   });
 });
 
-describe('TimelineModel workers', () => {
-  it('packs workers into rows, gives a follow-up its own bar, and keeps a result when a finished worker is stopped', () => {
-    const traj = new Trajectory({ format: TRAJECTORY_FORMAT, formatVersion: 1, id: 't', createdAt: '', mode: 'live', graph: { nodes: [], edges: [] } as never, graphHash: '' });
-    let seq = 0;
-    const ev = (t: number, data: Record<string, unknown>) => traj.append({ seq: seq++, t, node: 'workers', kind: 'msg', port: 'updates', data: data as never });
-    ev(0, { type: 'worker.started', workerId: 'w1', task: 'a' });
-    ev(10, { type: 'worker.done', workerId: 'w1', text: 'A' });
-    ev(12, { type: 'worker.started', workerId: 'w2', task: 'b' });
-    ev(15, { type: 'worker.steer', workerId: 'w1', text: 'more', followUp: true });
-    ev(20, { type: 'worker.done', workerId: 'w1', text: 'A2' });
-    ev(25, { type: 'worker.done', workerId: 'w2', text: 'B' });
-    ev(30, { type: 'worker.stopped', workerId: 'w2' });
-    const m = new TimelineModel(traj);
-    m.update();
-    expect(m.workers.map((w) => [w.id, w.row, w.t0, w.t1, w.status, w.result])).toEqual([
-      ['w1', 0, 0, 10, 'done', 'A'],
-      ['w2', 0, 12, 25, 'done', 'B'],
-      ['w1', 1, 15, 20, 'done', 'A2'],
-    ]);
-    expect(m.workers[1].marks.map((k) => k.kind)).toEqual(['stop']);
-  });
-});

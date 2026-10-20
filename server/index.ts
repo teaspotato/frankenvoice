@@ -3,11 +3,9 @@
 // so the browser records exactly what the provider sent. It also stores
 // session bundles and the settings edited in the web UI (keys, base URLs).
 
-import { spawn } from 'node:child_process';
 import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { dirname, extname, join, resolve, sep } from 'node:path';
@@ -59,16 +57,6 @@ const SETTINGS: SettingDef[] = [
   { name: 'OPENAI_COMPAT_API_KEY', group: 'LLM (OpenAI-compatible)', label: 'API key (optional)', secret: true },
   { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'API key', secret: true },
   { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
-  {
-    name: 'FV_ACP_COMMAND',
-    group: 'Workers (ACP agent)',
-    label: 'Agent command',
-    default: 'npx -y @agentclientprotocol/claude-agent-acp@0.85.1',
-    hint: 'Started once per worker; speaks the Agent Client Protocol on stdin/stdout. Gets the Anthropic key and base URL below.',
-  },
-  { name: 'ANTHROPIC_API_KEY', group: 'Workers (ACP agent)', label: 'Anthropic API key', secret: true },
-  { name: 'ANTHROPIC_BASE_URL', group: 'Workers (ACP agent)', label: 'Anthropic base URL', hint: 'Empty uses the agent\'s default' },
-  { name: 'FV_ACP_CWD', group: 'Workers (ACP agent)', label: 'Working folder', default: '.frankenvoice/workers', hint: 'Where workers run; relative to where the proxy runs' },
   { name: 'FV_SESSIONS_DIR', group: 'Storage', label: 'Sessions folder', default: 'sessions', hint: 'Relative to where the proxy runs' },
 ];
 const SETTING_NAMES = new Set(SETTINGS.map((d) => d.name));
@@ -323,7 +311,7 @@ const server = createServer((req, res) => {
       return json(res, 200, { file: SETTINGS_FILE, settings: describeSettings() });
     }
     if (p === '/api/health') {
-      return json(res, 200, { ...Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])), acp: !!setting('FV_ACP_COMMAND') });
+      return json(res, 200, Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])));
     }
     let m = /^\/api\/(gpubox|typesafe|llm)(\/.*)$/.exec(p);
     if (m) return forward(m[1], m[2] + url.search, req, res);
@@ -342,10 +330,6 @@ const server = createServer((req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');
-  if (url.pathname === '/api/acp') {
-    if (!allowed(req)) return socket.destroy();
-    return wss.handleUpgrade(req, socket, head, (client) => void acp(client).catch((e: unknown) => client.close(1011, String(e).slice(0, 120))));
-  }
   const m = /^\/api\/(gpubox)(\/.*)$/.exec(url.pathname);
   if (!m || !allowed(req)) return socket.destroy();
   const name = m[1];
@@ -371,79 +355,6 @@ server.on('upgrade', (req, socket, head) => {
     client.on('close', () => remote.readyState <= WebSocket.OPEN && remote.close());
   });
 });
-
-/**
- * Workers: one agent process per connection, speaking ACP (newline-delimited
- * JSON-RPC) on stdin/stdout. Each line goes to the browser as one text frame
- * and back, unchanged, so the browser records the whole conversation. The
- * first frame is ours, {$open}, with the folder the agent runs in; stderr
- * lines come as {$stderr}, for errors.
- */
-const agents = new Set<number>();
-// Detached agents outlive the proxy unless it takes them down with it.
-process.on('exit', () => {
-  for (const pid of agents) {
-    try {
-      process.kill(-pid, 'SIGTERM');
-    } catch {
-      // already gone
-    }
-  }
-});
-for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]] as const) process.on(sig, () => process.exit(code));
-
-async function acp(client: WebSocket) {
-  // The browser starts talking as soon as the socket opens: hold its lines until the agent is up.
-  const early: string[] = [];
-  let write = (line: string) => void early.push(line);
-  client.on('message', (data: Buffer) => write(data.toString('utf8')));
-  // The browser may hang up while the agent is still starting: stop it as soon as there is one.
-  let hungUp = false;
-  let onHangUp = () => void (hungUp = true);
-  client.on('close', () => onHangUp());
-  const command = setting('FV_ACP_COMMAND');
-  if (!command) return client.close(1011, 'FV_ACP_COMMAND is not set (set it in Settings)');
-  const cwd = resolve(setting('FV_ACP_CWD')!);
-  await mkdir(cwd, { recursive: true });
-  if (hungUp) return;
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  const key = setting('ANTHROPIC_API_KEY');
-  if (key) env.ANTHROPIC_API_KEY = key;
-  const base = setting('ANTHROPIC_BASE_URL');
-  if (base) env.ANTHROPIC_BASE_URL = base;
-  // Its own process group: the command runs through a shell (npx, pnpm exec …), and stopping must reach the agent under it.
-  const child = spawn(command, { cwd, env, shell: true, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
-  const kill = (sig: NodeJS.Signals) => {
-    try {
-      process.kill(-child.pid!, sig);
-    } catch {
-      // already gone
-    }
-  };
-  if (child.pid) agents.add(child.pid);
-  const send = (line: string) => client.readyState === WebSocket.OPEN && client.send(line);
-  send(JSON.stringify({ $open: { cwd, command, pid: child.pid ?? null } }));
-  createInterface({ input: child.stdout }).on('line', (line) => line.trim() && send(line));
-  createInterface({ input: child.stderr }).on('line', (line) => {
-    console.warn(`[acp ${child.pid}] ${line}`);
-    send(JSON.stringify({ $stderr: line }));
-  });
-  child.stdin.on('error', () => {});
-  write = (line) => void (child.stdin.writable && child.stdin.write(`${line}\n`));
-  for (const line of early.splice(0)) write(line);
-  child.on('error', (e) => client.readyState === WebSocket.OPEN && client.close(1011, `could not start the agent: ${String(e)}`.slice(0, 120)));
-  // 'close', not 'exit': it comes after stdout and stderr are drained, so the last lines go out first.
-  child.on('close', (code, signal) => {
-    agents.delete(child.pid!);
-    if (client.readyState === WebSocket.OPEN) client.close(code === 0 ? 1000 : 1011, `agent exited (${signal ?? code})`);
-  });
-  onHangUp = () => {
-    if (child.exitCode === null && child.pid) {
-      kill('SIGTERM');
-      setTimeout(() => child.exitCode === null && kill('SIGKILL'), 3000).unref();
-    }
-  };
-}
 
 // Last resort: one bad request must not stop the proxy, which would drop every connection of a live session.
 process.on('uncaughtException', (e) => console.error('[proxy] uncaught error, still running:', e));

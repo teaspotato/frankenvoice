@@ -24,7 +24,6 @@ const POS: Record<StageId, [number, number]> = {
   backchannel: [810, 206],
   llm: [810, 88],
   opener: [1010, 88],
-  workers: [1010, 330],
   tts: [1210, 88],
   speaker: [1410, 88],
 };
@@ -122,14 +121,6 @@ export function PipelineView({
       const [sx, lx, ky] = [ix + W - 20, POS.llm[0] + 20, iy - 26];
       edges.push({ src: 'interject.check', d: `M${sx},${iy} L${sx},${ky + 8} Q${sx},${ky} ${sx + 8},${ky} L${lx - 8},${ky} Q${lx},${ky} ${lx},${ky - 8} L${lx},${POS.llm[1] + H + 2}`, label: 'interrupt?', lx: lx + 34, ly: POS.llm[1] + H + 12 });
     }
-  }
-  // Delegation: tasks out of the LLM's right side, down the gap beside the opener to the workers, and their news back.
-  {
-    const [rx, ry] = [POS.llm[0] + W, POS.llm[1] + H / 2];
-    const [wx, wy] = POS.workers;
-    const gap = (POS.opener[0] - rx) / 2;
-    edges.push({ src: 'llm.workers', d: `M${rx},${ry - 8} L${rx + gap + 8},${ry - 8} L${rx + gap + 8},${wy + H * 0.35} L${wx - 2},${wy + H * 0.35}`, label: 'tasks', lx: rx + gap + 30, ly: wy - 40 });
-    edges.push({ src: 'workers.updates', d: `M${wx},${wy + H * 0.7} L${rx + gap - 8},${wy + H * 0.7} L${rx + gap - 8},${ry + 8} L${rx + 2},${ry + 8}`, label: 'results', lx: rx + gap - 44, ly: wy + H * 0.7 - 6 });
   }
   // Playback feedback: up from the speaker, back over the row, down into turn-taking.
   const [ox, oy] = [POS.speaker[0] + W / 2, POS.speaker[1]];

@@ -59,9 +59,6 @@ export const openaiCompatAdapter: LlmAdapter = {
         const d = data as JsonObject | null;
         return d?.error ? [{ type: 'error', error: d.error }] : end();
       },
-      native() {
-        return null;
-      },
     };
   },
 };

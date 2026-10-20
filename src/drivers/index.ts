@@ -118,42 +118,6 @@ const proxiedSocket = (upstream: string): LiveDriver => (req, sink) => {
 
 const gpubox = proxiedSocket('gpubox');
 
-/** Workers: one ACP agent process per exchange, run by the proxy; JSON-RPC lines both ways. */
-const acp: LiveDriver = (_req, sink) => {
-  const u = new URL('/api/acp', location.href);
-  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(u.toString());
-  const pending: string[] = [];
-  let closedByNode = false;
-  ws.onopen = () => {
-    for (const p of pending.splice(0)) ws.send(p);
-  };
-  ws.onmessage = (e) => {
-    const line = String(e.data);
-    try {
-      sink.recv(JSON.parse(line) as Json);
-    } catch {
-      // Not JSON-RPC: something the agent printed to stdout.
-      sink.recv({ $stdout: line });
-    }
-  };
-  ws.onclose = (e) => {
-    if (!closedByNode) sink.close({ code: e.code, reason: e.reason, ...(e.code !== 1000 ? { error: e.reason || `websocket closed (${e.code})` } : {}) });
-  };
-  return {
-    send(data) {
-      const line = JSON.stringify(data);
-      if (ws.readyState === WebSocket.OPEN) ws.send(line);
-      else if (ws.readyState === WebSocket.CONNECTING) pending.push(line);
-    },
-    close() {
-      closedByNode = true;
-      if (ws.readyState === WebSocket.CONNECTING) ws.onopen = () => ws.close(1000);
-      else ws.close(1000);
-    },
-  };
-};
-
 /** Read a fetch body as Server-Sent Events, yielding each event's data string. Comment lines are dropped. */
 async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const reader = body.getReader();
@@ -704,4 +668,4 @@ const embed: LiveDriver = (req, sink) => {
   };
 };
 
-export const browserDrivers: DriverRegistry = { mic, silero, firered, openai, 'gpubox-asr': gpubox, 'gpubox-tts': gpubox, rnnoise, speaker, 'turn-model': turnModel, embed, acp, typesafe };
+export const browserDrivers: DriverRegistry = { mic, silero, firered, openai, 'gpubox-asr': gpubox, 'gpubox-tts': gpubox, rnnoise, speaker, 'turn-model': turnModel, embed, typesafe };

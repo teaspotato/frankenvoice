@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { heardOfReply, llmNode } from '../src/nodes/llm';
+import { cutToHeard, heardOfReply, llmNode } from '../src/nodes/llm';
 import { fillerOpenerNode } from '../src/nodes/opener';
 import { resolveParams, type IOHandlers, type NodeContext } from '../src/core/node';
 import type { Json, Msg } from '../src/core/types';
@@ -125,6 +125,17 @@ describe('fillers while a reasoning model thinks', () => {
     main.h.onRecv!(done, undefined);
     h.send(5000, { type: 'turn.user', turnId: 'u1', text: 'and then?' });
     expect(body(h.chat()[1].request).messages.map((m) => m.content)).toEqual(['sys', 'plan a week in Japan', 'Day one: Tokyo.', 'and then?']);
+  });
+
+  it('cuts a reply spanning several turns to what was heard', () => {
+    const history = [
+      { role: 'user' as const, text: 'q', turnId: 'u0' },
+      { role: 'assistant' as const, text: 'Let me look that up.', rid: 'r0' },
+      { role: 'assistant' as const, text: 'It will take a moment.', rid: 'r0' },
+      { role: 'user' as const, text: 'ok', turnId: 'u1' },
+    ];
+    expect(cutToHeard(history, [1, 2], 'Let me look that up. It will').map((t) => t.text)).toEqual(['q', 'Let me look that up.', 'It will—', 'ok']);
+    expect(cutToHeard(history, [1, 2], 'Let me look').map((t) => t.text)).toEqual(['q', 'Let me look—', 'ok']);
   });
 
   it('keeps only the reply\'s own words of what was heard', () => {

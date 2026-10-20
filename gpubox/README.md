@@ -87,7 +87,7 @@ proxy reaches ASR, TTS and the LLM over localhost (no keys or tunnels on your la
    `ui-tunnel` and its URL stay.
 3. `setup.sh status` prints `UI_URL`. Open **`UI_URL/?token=<GPUBOX_TOKEN>`** once: the proxy sets an HttpOnly cookie
    (30 days) and redirects to `UI_URL/`. Without it every page and API call gets 403. Anyone with the token can
-   change settings, including the worker command, so treat it like a password.
+   change settings, so treat it like a password.
 
 Preset from the environment (shown as `env` in Settings):
 

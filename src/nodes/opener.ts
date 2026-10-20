@@ -230,7 +230,7 @@ export const choiceOpenerNode: NodeDef = {
         switch (msg.type) {
           case 'llm.start': {
             end();
-            // Replies the user didn't ask for (a worker's news) get no opener.
+            // Replies to no user turn get no opener.
             const turnId = (msg.turnId as string | null) ?? null;
             if (!turnId) return;
             cur = { rid: msg.rid as string, turnId, t0: ctx.now(), words: false, done: false };

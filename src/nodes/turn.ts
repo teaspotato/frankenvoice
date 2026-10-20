@@ -72,8 +72,6 @@ export const halfDuplexTurnNode: NodeDef<TurnParams> = {
             if (from < 0) from = msg.start as number;
             to = msg.end as number;
             ctx.setState('pending', parts.join(' '));
-            // Words are waiting to be committed: the LLM holds its workers' news until they are.
-            if (parts.length === 1) ctx.emit('turn', { type: 'turn.pending', words: true });
           }
           if (msg.speechFinal && ctx.params.commitOn === 'speech_final') commit('speech_final');
         } else if (msg.type === 'asr.utterance_end') {
@@ -929,15 +927,6 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     ctx.setState('floor', holder(state));
     ctx.setState('state', state);
 
-    /** Whether the user has words not yet committed, told to the LLM when it changes (so news waits for them). */
-    let hadWords = false;
-    const syncPending = () => {
-      const has = parts.length > 0 || !!partial?.text;
-      if (has === hadWords) return;
-      hadWords = has;
-      ctx.emit('turn', { type: 'turn.pending', words: has });
-    };
-
     /** The uncommitted words, told whenever they change while listening (for early interjections). */
     let lastWords = '';
     const syncWords = () => {
@@ -1144,7 +1133,6 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       },
       onInput(port, msg) {
         handle(port, msg);
-        syncPending();
         syncWords();
       },
     };

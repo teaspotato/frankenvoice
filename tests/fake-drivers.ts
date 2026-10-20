@@ -135,41 +135,6 @@ const gpuboxAsr: LiveDriver = (_req, sink) => {
   };
 };
 
-/** An ACP agent: sets up a session, then answers each prompt after thinking and one web fetch (asking permission first). */
-const acp: LiveDriver = (_req, sink) => {
-  let closed = false;
-  const out = sequence((m) => sink.recv(m), () => closed);
-  const update = (sessionId: string, u: Json) => out({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update: u } });
-  out({ $open: { cwd: '/tmp/fake-workers', command: 'fake-acp', pid: 1 } }, 1);
-  let calls = 0;
-  /** The rest of a prompt's turn, once its permission request is answered. */
-  let pendingPrompt: (() => void) | undefined;
-  return {
-    send(data) {
-      const m = data as { id?: number; method?: string; params?: { sessionId?: string }; result?: unknown };
-      const ok = (result: Json) => out({ jsonrpc: '2.0', id: m.id!, result });
-      if (m.method === 'initialize') ok({ protocolVersion: 1, agentCapabilities: {} });
-      else if (m.method === 'session/new') ok({ sessionId: 'sess-fake', configOptions: ['model', 'effort'].map((id) => ({ id, name: id, type: 'select', currentValue: 'default', options: [] })) });
-      else if (m.method === 'session/set_config_option') ok({ configOptions: [] });
-      else if (m.method === 'session/prompt') {
-        const sid = m.params!.sessionId!;
-        const n = ++calls;
-        update(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Deep thought.' } });
-        update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Let me check.' } });
-        update(sid, { sessionUpdate: 'tool_call', toolCallId: `tc${n}`, title: 'Fetch https://example.com', kind: 'fetch', status: 'pending' });
-        out({ jsonrpc: '2.0', id: 1000 + n, method: 'session/request_permission', params: { sessionId: sid, toolCall: { toolCallId: `tc${n}`, title: 'Fetch https://example.com', kind: 'fetch' }, options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'reject', name: 'Reject', kind: 'reject_once' }] } });
-        const id = m.id!;
-        pendingPrompt = () => {
-          update(sid, { sessionUpdate: 'tool_call_update', toolCallId: `tc${n}`, status: 'completed' });
-          for (const tok of ['The answer ', 'is 42.']) update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: tok } });
-          out({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } }, 100);
-        };
-      } else if (m.id !== undefined && m.method === undefined && m.result) pendingPrompt?.();
-    },
-    close: () => void (closed = true),
-  };
-};
-
 /** TypeSafe Choice: picks the first option that isn't "-", about a millisecond later. */
 const typesafe: LiveDriver = (req, sink) => {
   const criteria = (req as { body: { questions: { pick: { criteria: Record<string, string> } } } }).body.questions.pick.criteria;
@@ -297,7 +262,7 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, openai, rnnoise, speaker, 'turn-model': turnModel, acp, typesafe };
+export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, openai, rnnoise, speaker, 'turn-model': turnModel, typesafe };
 
 /** The default pipeline with the turn model on (it is off by default, a big download). */
 export function testConfig(): PipelineConfig {
