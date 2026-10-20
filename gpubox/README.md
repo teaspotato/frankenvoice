@@ -50,10 +50,15 @@ The tunnel keeps its URL as long as the `tunnel` process lives.
 Environment variables: `GPUBOX_ROOT` (venvs, logs, pid files; default `/content` if it exists, else `~/gpubox`),
 `GPUBOX_TOKEN` (default: random, saved in `$ROOT/gpubox.token`), `ASR_MODEL` (`Qwen/Qwen3-ASR-1.7B`, or
 `Qwen/Qwen3-ASR-0.6B`), `ASR_MEM` (0.15), `NO_LLM=1`, `LLM_CTX` (8192, shared by the slots), `LLM_SLOTS` (2), `LLM_SWA_FULL` (1; at 32k it needs 5.4 GB),
-`LLM_MTP` (1), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
+`LLM_MTP` (1), `CUDA_MPS` (1: GPU services share the GPU through a CUDA MPS daemon), `LLM_MPS_PCT` (40: Gemma's cap on SMs under MPS), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
 `NO_UI=1`, `FV_APP` (app archive, default `$ROOT/frankenvoice.tar.gz`).
 Logs are in `$ROOT/logs/{asr,llm,tts,gateway,tunnel,ui,ui-tunnel}.log`. Model files for the LLM are in `$ROOT/models`, llama.cpp
 in `$ROOT/llama.cpp`.
+`setup.sh restart-gpu` restarts only the GPU services (and MPS), keeping the tunnels' URLs.
+
+With Gemma decoding on one stream (`degrade.py`, 2026-10-20): no MPS, Kyutai RTF 1.05, first audio 617 ms, ASR final 582 ms,
+Gemma 20 tok/s. MPS uncapped: RTF 1.53, 916 ms, 561 ms, 53 tok/s (Gemma takes the SMs). MPS with Gemma at 40%: RTF 0.94,
+553 ms, 338 ms, 30 tok/s. Idle: RTF 0.63, 374 ms, 248 ms.
 
 ### Colab
 
