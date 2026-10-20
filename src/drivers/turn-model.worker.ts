@@ -6,7 +6,8 @@ import wasmUrl from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm?url';
 import mjsUrl from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs?url';
 import { TurnStream } from './turn-stream';
 
-ort.env.wasm.wasmPaths = { wasm: wasmUrl, mjs: mjsUrl };
+// Built pages take the wasm from jsDelivr, like the main thread (see ORT_CDN in drivers/index.ts).
+ort.env.wasm.wasmPaths = import.meta.env.PROD ? `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ort.env.versions.web}/dist/` : { wasm: wasmUrl, mjs: mjsUrl };
 ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
 
 /** Blocks (3.2 s) of unprocessed audio before giving up: the model can't keep up. */

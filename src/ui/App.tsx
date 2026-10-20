@@ -10,7 +10,7 @@ import { compareTrajectories, type Comparison } from '../core/compare';
 import type { Trajectory } from '../core/trajectory';
 import { SpanDetails } from './SpanDetails';
 import type { Json } from '../core/types';
-import { browserDrivers, micMonitor, preloadTurnModel, sessionTitle, setOutputMuted, setOutputPaused, setOutputSuppressed, turnModelLoad, watchTurnModels } from '../drivers';
+import { browserDrivers, micMonitor, preloadTurnModel, warmUp, sessionTitle, setOutputMuted, setOutputPaused, setOutputSuppressed, turnModelLoad, watchTurnModels } from '../drivers';
 import { resolveParams } from '../core/node';
 import { turnModelRequest } from '../nodes/turn-model';
 import {
@@ -103,6 +103,10 @@ function describeComparison(s: Session): string {
 export function App() {
   const [config, setConfig] = useState<PipelineConfig>(loadConfig);
   const [selected, setSelected] = useState<StageId | null>(null);
+  useEffect(() => {
+    const t = setTimeout(warmUp, 1000);
+    return () => clearTimeout(t);
+  }, []);
   // The turn model is big: download and compile it as soon as it is configured, not when a session starts.
   const [, turnModelChanged] = useReducer((n: number) => n + 1, 0);
   useEffect(() => watchTurnModels(turnModelChanged), []);

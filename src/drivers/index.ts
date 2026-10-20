@@ -16,8 +16,19 @@ import { toJson } from '../core/json';
 import { loadEncoder, type Encoder } from '../embed/encoder';
 import { fireredDriver, sileroDriver } from './vad';
 
-ort.env.wasm.wasmPaths = { wasm: ortWasmUrl, mjs: ortMjsUrl };
+/**
+ * Built pages take onnxruntime's wasm (14 MB) from jsDelivr, cached worldwide, rather than from
+ * wherever the page is hosted (the GPU box sits behind a tunnel). The dev server serves its own.
+ */
+export const ORT_CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ort.env.versions.web}/dist/`;
+ort.env.wasm.wasmPaths = import.meta.env.PROD ? ORT_CDN : { wasm: ortWasmUrl, mjs: ortMjsUrl };
 ort.env.wasm.numThreads = 1;
+
+/** Fetch what a live session loads first (the wasm, the VAD models) while the page is idle, so Run live finds them cached. */
+export function warmUp() {
+  const wasm = import.meta.env.PROD ? `${ORT_CDN}ort-wasm-simd-threaded.wasm` : ortWasmUrl;
+  for (const url of [wasm, sileroV5Url, fireredUrl]) void fetch(url, { priority: 'low' } as RequestInit).catch(() => {});
+}
 
 const errorJson = (e: unknown): Json => ({ error: e instanceof Error ? `${e.name}: ${e.message}` : String(e) });
 
