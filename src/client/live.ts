@@ -29,10 +29,10 @@ export interface LiveHandlers {
   saved(id: string, path: string): void;
   renamed(from: string, to: string, path: string): void;
   notice(text: string): void;
-  /** Pages connected to the server, sessions using the GPU box, and the most it runs at once. */
-  users(info: { pages: number; sessions: number; max: number }): void;
-  /** The server refused to start a run: the GPU box is full. */
-  full(text: string): void;
+  /** Pages connected to the server, sessions using the GPU box, the most it runs at once, and pages waiting. */
+  users(info: { pages: number; sessions: number; max: number; queued: number }): void;
+  /** The box is busy: this page's run waits, `position` in line from 1 (0: not waiting any more). It starts by itself. */
+  queue(position: number, started: boolean): void;
   /** The socket closed (the server went away). */
   closed(reason: string): void;
 }
@@ -181,9 +181,9 @@ export class LiveClient {
       case 'notice':
         return this.on.notice(m.text as string);
       case 'users':
-        return this.on.users({ pages: m.pages as number, sessions: m.sessions as number, max: m.max as number });
-      case 'full':
-        return this.on.full(m.text as string);
+        return this.on.users({ pages: m.pages as number, sessions: m.sessions as number, max: m.max as number, queued: (m.queued as number) ?? 0 });
+      case 'queue':
+        return this.on.queue(m.position as number, m.started === true);
     }
   }
 

@@ -192,7 +192,9 @@ export function App() {
   const simRef = useRef<SimScheduler | null>(null);
   const clientRef = useRef<LiveClient | null>(null);
   /** Who else is on the server (from its live socket, opened at load). */
-  const [users, setUsers] = useState<{ pages: number; sessions: number; max: number } | null>(null);
+  const [users, setUsers] = useState<{ pages: number; sessions: number; max: number; queued: number } | null>(null);
+  /** This page's place in the queue for the box (0: not waiting). */
+  const [queuePos, setQueuePos] = useState(0);
   const reconnectRef = useRef<() => void>(() => {});
   /** The server run in progress: the session it replays, whether its result is kept, where it stopped. */
   const serverRun = useRef<{ origin?: Session; keep: boolean; stoppedAt?: number } | null>(null);
@@ -344,12 +346,16 @@ export function App() {
     },
     notice: (text) => setNotice(text),
     users: (u) => setUsers(u),
-    full(text) {
-      serverRun.current = null;
-      setNotice(text);
+    queue(position, started) {
+      setQueuePos(position);
+      if (position) setNotice(`The GPU box is busy: you're ${position === 1 ? 'next' : `number ${position}`} in line. Your session starts by itself.`);
+      else if (started) setNotice('');
+      // Left the queue: nothing will start.
+      else serverRun.current = null;
     },
     closed(reason) {
       setUsers(null);
+      setQueuePos(0);
       reconnectRef.current();
       if (!serverRun.current) return;
       serverRun.current = null;
@@ -371,7 +377,7 @@ export function App() {
       renamed: (f, t, p) => h.current.renamed(f, t, p),
       notice: (t) => h.current.notice(t),
       users: (u) => h.current.users(u),
-      full: (t) => h.current.full(t),
+      queue: (p, s) => h.current.queue(p, s),
       closed: (r) => h.current.closed(r),
     }));
   };
@@ -689,7 +695,11 @@ export function App() {
     >
       <header className="toolbar">
         <span className="brand">frankenvoice</span>
-        {!running ? (
+        {queuePos > 0 && !running ? (
+          <button onClick={() => clientRef.current?.stop()} title="Your session starts by itself when the one ahead ends">
+            ✕ Leave queue ({queuePos === 1 ? 'next' : `${queuePos - 1} ahead`})
+          </button>
+        ) : !running ? (
           <button className="primary" onClick={runLive}>
             ● Run live
           </button>
@@ -724,9 +734,9 @@ export function App() {
         {users && (
           <span
             className={users.sessions >= users.max ? 'warn' : 'muted'}
-            title={`${users.pages} page${users.pages === 1 ? '' : 's'} connected; ${users.sessions} of ${users.max} sessions running on the GPU box`}
+            title={`${users.pages} page${users.pages === 1 ? '' : 's'} connected; ${users.sessions} of ${users.max} sessions running on the GPU box; ${users.queued} waiting`}
           >
-            {users.pages} user{users.pages === 1 ? '' : 's'} · {users.sessions}/{users.max} live{users.sessions >= users.max ? ' (full)' : ''}
+            {users.pages} user{users.pages === 1 ? '' : 's'} · {users.sessions}/{users.max} live{users.queued ? ` · ${users.queued} waiting` : ''}
           </span>
         )}
         <button onClick={() => setShowSettings(true)}>Settings</button>

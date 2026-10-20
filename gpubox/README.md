@@ -51,7 +51,7 @@ Environment variables: `GPUBOX_ROOT` (venvs, logs, pid files; default `/content`
 `GPUBOX_TOKEN` (default: random, saved in `$ROOT/gpubox.token`), `ASR_MODEL` (`Qwen/Qwen3-ASR-1.7B`, or
 `Qwen/Qwen3-ASR-0.6B`), `ASR_MEM` (0.15), `NO_LLM=1`, `LLM_CTX` (8192, shared by the slots), `LLM_SLOTS` (2), `LLM_SWA_FULL` (1; at 32k it needs 5.4 GB),
 `LLM_MTP` (1), `CUDA_MPS` (1: GPU services share the GPU through a CUDA MPS daemon), `LLM_MPS_PRIO` (1: Gemma is a below-normal MPS client, so Kyutai and ASR kernels go first), `LLM_MPS_PCT` (unset: optional cap on Gemma's SMs), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
-`KYUTAI_MAX_BATCH` (4: replies rendered at once), `NO_UI=1`, `FV_APP` (app archive, default `$ROOT/frankenvoice.tar.gz`).
+`KYUTAI_MAX_BATCH` (1: replies rendered at once; the app serves one user at a time and queues the rest), `NO_UI=1`, `FV_APP` (app archive, default `$ROOT/frankenvoice.tar.gz`).
 Logs are in `$ROOT/logs/{asr,llm,tts,gateway,tunnel,ui,ui-tunnel}.log`. Model files for the LLM are in `$ROOT/models`, llama.cpp
 in `$ROOT/llama.cpp`.
 `setup.sh restart-gpu` restarts only the GPU services (and MPS), keeping the tunnels' URLs.
@@ -62,9 +62,9 @@ Gemma 20 tok/s. MPS uncapped: RTF 1.53, 916 ms, 561 ms, 53 tok/s (Gemma takes th
 
 ### Several users (2026-10-20, `mu_bench.py`, L4)
 
-Kyutai batches up to `KYUTAI_MAX_BATCH` replies (CUDA graphs captured once at that size, so a step costs the same
-with 1 or 4 busy rows; `KYUTAI_MAX_BATCH=1` gives back the old single-reply step). N replies speaking at once, the
-text fed at about 40 words/s:
+Kyutai can batch up to `KYUTAI_MAX_BATCH` replies (CUDA graphs captured once at that size, so a step costs the same
+with 1 or 4 busy rows). The default is 1: the app runs one session at a time (`FV_MAX_SESSIONS`, others queue), and
+batch 1 keeps the single-reply step. With `KYUTAI_MAX_BATCH=4`, N replies speaking at once, text fed at about 40 words/s:
 
 | N | step p50 / p90 (ms) | RTF | first audio p50 / p90 (ms) | with Gemma decoding 1 stream: step p90, RTF, first audio p50 / p90 |
 |---|---|---|---|---|
@@ -78,6 +78,12 @@ text fed at about 40 words/s:
 No playback gaps in any run; ASR of the batch-4 renders matches the text (WER 0). First audio grows with N because a
 reply that starts alone skips the depth transformer for its first 16 steps (they are silent), which it can't do
 while other rows need it. Kyutai's memory grows from 4.5 to 5.0 GB at batch 4.
+
+End to end with the app (`FV_MAX_SESSIONS=4`, `KYUTAI_MAX_BATCH=4`, LLM 2 slots): N headless pages, each its own
+session from the same fake mic, 2 min, medians / p90 per reply. Last word heard to first agent audio: 1.80 / 1.98 s with
+1 user, 2.75 / 2.89 s with 2, 3.77 / 5.24 s with 4. LLM first token 116, 253, 489 ms; Kyutai first audio after its first
+word 508, 1036, 1179 ms; playback stalls 0, 5, 115. So the app serves one user at a time (`FV_MAX_SESSIONS=1`,
+the default); other pages queue.
 
 ASR (sglang batches; 8 s clips streamed in real time through the gateway): final after Finalize p50 / p90 201 / 316 ms
 with 1 stream, 287 / 368 with 2, 318 / 488 with 4; partial decode p50 94, 121, 144 ms.
@@ -118,6 +124,11 @@ server, which runs the pipeline, reaches ASR, TTS and the LLM over localhost (no
 3. `setup.sh status` prints `UI_URL`. Open **`UI_URL/?token=<GPUBOX_TOKEN>`** once: the server sets an HttpOnly cookie
    (30 days) and redirects to `UI_URL/`. Without it every page and API call gets 403. Anyone with the token can
    change settings, so treat it like a password.
+
+Several people can open the page. One live session runs at a time (`FV_MAX_SESSIONS`, 1 by default): a page that
+presses Run live while another session runs waits in line, sees its place, and starts by itself when the session
+ahead stops or its page closes. Waiting pages can still look at and replay sessions, and every page shows how many
+users are connected, how many sessions run and how many wait.
 
 Preset from the environment (shown as `env` in Settings):
 

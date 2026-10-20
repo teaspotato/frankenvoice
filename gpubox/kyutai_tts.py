@@ -5,7 +5,8 @@ The gateway (server.py) authenticates clients and relays `/v1/tts` WebSockets he
 Protocol: see PROTOCOL.md ("TTS: WS /v1/tts").
 
 Continuous batching: one worker thread steps every active reply as one batch of up to
-KYUTAI_MAX_BATCH rows (default 4), one model step (80 ms of audio) per row per batch step.
+KYUTAI_MAX_BATCH rows (default 1, for one user at a time; 4 measured fine, see README), one model
+step (80 ms of audio) per row per batch step.
 Replies join and leave at step boundaries: a new one takes a free row (its rows of the model,
 codec and conditioning state are reset), a finished or cancelled one frees it. The CUDA graphs
 are captured once at the full batch size, so a step costs the same with 1 or 4 rows busy; rows
@@ -50,7 +51,9 @@ FRAME = 1920  # samples per Mimi frame (12.5 Hz)
 # had median -0.08 s, mean -0.04 s (the aligner's resolution is 80 ms), so we shift by -0.04 s.
 WORD_OFFSET_S = float(os.environ.get("KYUTAI_WORD_OFFSET_S", "-0.04"))
 IDLE_CLOSE_S = float(os.environ.get("KYUTAI_IDLE_CLOSE_S", "30"))
-MAX_BATCH = int(os.environ.get("KYUTAI_MAX_BATCH", "4"))
+# 1 by default: the box serves one user at a time (the app queues the others), and a step at batch 1 is ~10% faster;
+# a reply still preempts a background (canned) render
+MAX_BATCH = int(os.environ.get("KYUTAI_MAX_BATCH", "1"))
 
 
 @dataclass

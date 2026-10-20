@@ -1,7 +1,8 @@
 // The pipeline runs here. A page connects one socket (/api/live, see src/live-protocol.ts): it
 // sends mic frames and controls, and gets the agent's audio to play plus the run's trajectory to
-// show. Each page has its own run (session, recording, autosave); up to `maxSessions` run at once,
-// and every page is told how many pages are connected and how many sessions run.
+// show. Each page has its own run (session, recording, autosave). Up to `maxSessions` (default 1) use the
+// GPU box at once; a page that asks for another waits in a FIFO queue and starts when its turn comes.
+// Every page is told how many pages are connected, how many sessions run and how many wait.
 
 import { mkdir, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -24,7 +25,7 @@ export interface LiveOptions {
   modelsDir: string;
   /** Canned lines' audio, rendered once per box (default: tts-cache in modelsDir's folder). */
   cannedDir?: string;
-  /** How many sessions (live or replay) may run at once; more are refused with a `full` message. Default 4. */
+  /** How many sessions may use the GPU box at once; more wait in a queue. Default 1. */
   maxSessions?: () => number;
   log?: (msg: string) => void;
 }
@@ -125,6 +126,8 @@ export class LiveHub {
   private pages = new Set<Page>();
   private drivers: DriverRegistry;
   private lastUsers = '';
+  /** Pages waiting for the box, first in line first, with what to run when their turn comes. */
+  private queue: { page: Page; go: () => void; told?: number }[] = [];
 
   constructor(private o: LiveOptions) {
     this.drivers = serverDrivers(o.upstreams, { modelsDir: o.modelsDir, cannedDir: o.cannedDir ?? join(o.modelsDir, '..', 'fv-tts-cache') });
@@ -135,7 +138,7 @@ export class LiveHub {
   }
 
   private get maxSessions() {
-    return Math.max(1, Math.floor(this.o.maxSessions?.() ?? 4));
+    return Math.max(1, Math.floor(this.o.maxSessions?.() ?? 1));
   }
 
   /** Runs in progress that use the GPU box (live sessions, replays with live channels). */
@@ -145,9 +148,9 @@ export class LiveHub {
     return n;
   }
 
-  /** Who is here, for every page: connected pages, running sessions, and the cap. Sent when it changes (and to `to`). */
+  /** Who is here, for every page: connected pages, running sessions, the cap, pages waiting. Sent when it changes (and to `to`). */
   private broadcastUsers(to?: Page) {
-    const m = { type: 'users', pages: this.pages.size, sessions: this.sessions, max: this.maxSessions };
+    const m = { type: 'users', pages: this.pages.size, sessions: this.sessions, max: this.maxSessions, queued: this.queue.length };
     const key = JSON.stringify(m);
     if (key !== this.lastUsers) {
       this.lastUsers = key;
@@ -155,7 +158,7 @@ export class LiveHub {
     } else to?.send(m);
   }
 
-  /** A page connected. Each page runs its own sessions; pages don't take over each other. */
+  /** A page connected. Each page runs its own sessions; pages don't take over each other, they queue. */
   handle(ws: WebSocket) {
     const page = new Page(ws, this.drivers);
     this.pages.add(page);
@@ -170,7 +173,8 @@ export class LiveHub {
     });
     ws.on('close', () => {
       this.pages.delete(page);
-      // Its mic and speaker are gone: its run can't go on.
+      this.leaveQueue(page);
+      // Its mic and speaker are gone: its run can't go on (its end lets the next page in).
       void page.run?.stop();
       this.broadcastUsers();
     });
@@ -183,6 +187,8 @@ export class LiveHub {
       case 'start':
         return this.startLive(page, m as unknown as { graph: GraphSpec; env?: Record<string, Json>; autosave?: boolean; title?: string });
       case 'stop':
+        // Stop the run, or leave the queue.
+        if (this.leaveQueue(page)) return page.send({ type: 'queue', position: 0 });
         return void page.run?.stop();
       case 'pause':
         return page.run?.sim?.pause();
@@ -204,21 +210,46 @@ export class LiveHub {
     else if (header.k === 'replay') this.startReplay(page, header, payload);
   }
 
-  /** Whether `page` may start a run; if not, it is told why. */
-  private admit(page: Page, box: boolean): boolean {
-    if (page.run) {
-      page.send({ type: 'notice', text: 'a session is already running' });
-      return false;
-    }
-    if (!box) return true;
-    const n = this.sessions;
-    const max = this.maxSessions;
-    if (n >= max) {
-      page.send({ type: 'full', sessions: n, max, text: `The GPU box is full: ${n} of ${max} sessions are running. Try again when one ends.` });
-      this.log(`refused a session: ${n} of ${max} running`);
-      return false;
-    }
+  /**
+   * Run `go` for `page` now if the box has room (or the run doesn't use it), else queue it: the page hears its
+   * place in line (`queue`, position from 1) and `go` runs when its turn comes.
+   */
+  private request(page: Page, box: boolean, go: () => void) {
+    if (page.run || this.queue.some((q) => q.page === page)) return page.send({ type: 'notice', text: 'a session is already running or waiting' });
+    if (!box || (this.sessions < this.maxSessions && !this.queue.length)) return go();
+    this.queue.push({ page, go });
+    this.log(`a page waits for the box (${this.queue.length} in line)`);
+    this.tellQueue();
+    this.broadcastUsers();
+  }
+
+  /** Take `page` out of the queue; true if it was waiting. */
+  private leaveQueue(page: Page): boolean {
+    const n = this.queue.length;
+    this.queue = this.queue.filter((q) => q.page !== page);
+    if (this.queue.length === n) return false;
+    this.tellQueue();
+    this.broadcastUsers();
     return true;
+  }
+
+  private tellQueue() {
+    this.queue.forEach((q, i) => {
+      if (q.told !== i + 1) q.page.send({ type: 'queue', position: (q.told = i + 1), ahead: i });
+    });
+  }
+
+  /** The box has room: start the pages first in line. */
+  private next() {
+    while (this.queue.length && this.sessions < this.maxSessions) {
+      const q = this.queue.shift()!;
+      if (!q.page.open) continue;
+      q.page.send({ type: 'queue', position: 0, started: true });
+      this.log('the next page in line starts');
+      q.go();
+    }
+    this.tellQueue();
+    this.broadcastUsers();
   }
 
   // ---- runs -------------------------------------------------------------------
@@ -273,7 +304,10 @@ export class LiveHub {
   }
 
   private startLive(page: Page, m: { graph: GraphSpec; env?: Record<string, Json>; autosave?: boolean; title?: string }) {
-    if (!this.admit(page, true)) return;
+    this.request(page, true, () => this.runLive(page, m));
+  }
+
+  private runLive(page: Page, m: { graph: GraphSpec; env?: Record<string, Json>; autosave?: boolean; title?: string }) {
     let graph: GraphSpec;
     try {
       graph = checkGraph(m.graph);
@@ -312,7 +346,10 @@ export class LiveHub {
 
   private startReplay(page: Page, h: Header, bundle: Uint8Array) {
     const liveChannels = (h.liveChannels as string[]) ?? [];
-    if (!this.admit(page, liveChannels.length > 0)) return;
+    this.request(page, liveChannels.length > 0, () => this.runReplay(page, h, bundle, liveChannels));
+  }
+
+  private runReplay(page: Page, h: Header, bundle: Uint8Array, liveChannels: string[]) {
     let source: Trajectory;
     try {
       source = decodeBundle(bundle);
@@ -357,7 +394,7 @@ export class LiveHub {
     run.detach();
     if (page.run === run) page.run = null;
     page.micSink = undefined;
-    this.broadcastUsers();
+    this.next();
     const traj = run.rt.trajectory;
     const bytes = encodeBundle(traj);
     page.send({ type: 'ended', id: traj.meta.id, ...(stoppedAt !== undefined ? { stoppedAt } : {}) });

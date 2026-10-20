@@ -27,10 +27,13 @@
 //   {type:'ended', id, stoppedAt?}             the run stopped; its full bundle follows
 //   bin {k:'bundle'} + session bundle
 //   {type:'saved', id, path} {type:'renamed', from, to, path} {type:'notice', text}
-//   {type:'users', pages, sessions, max}       pages connected, sessions using the GPU box, the cap; on connect and on change
-//   {type:'full', sessions, max, text}         a start (or a replay with live channels) refused: the box runs `max` sessions
+//   {type:'users', pages, sessions, max, queued}  pages connected, sessions using the GPU box, the cap (FV_MAX_SESSIONS,
+//                                              default 1), pages waiting; on connect and on change
+//   {type:'queue', position, ahead?}           the box is busy: this page's start (or replay with live channels) waits,
+//                                              `position` in line from 1; it starts by itself when its turn comes.
+//                                              position 0: no longer waiting (started: its turn came; else it left with 'stop')
 //
-// Each page has its own run; pages don't take over each other.
+// Each page has its own run; pages don't take over each other, they queue.
 
 import type { Json } from './core/types';
 

@@ -63,8 +63,8 @@ const SETTINGS: SettingDef[] = [
     name: 'FV_MAX_SESSIONS',
     group: 'Users',
     label: 'Live sessions at once',
-    default: '4',
-    hint: 'Pages beyond this are told the box is full. One L4 serves about 4 (Kyutai batches up to KYUTAI_MAX_BATCH replies)',
+    default: '1',
+    hint: 'More pages wait in a queue. One L4 gives one user the best latency; 2 users add about 1 s to each reply, 4 about 2 s',
   },
 ];
 const SETTING_NAMES = new Set(SETTINGS.map((d) => d.name));
@@ -309,7 +309,7 @@ const server = createServer((req, res) => {
 });
 
 // The page's socket: mic in, agent audio and the run's trajectory out.
-const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR, maxSessions: () => Number(setting('FV_MAX_SESSIONS')) || 4 });
+const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR, maxSessions: () => Number(setting('FV_MAX_SESSIONS')) || 1 });
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');
