@@ -26,6 +26,7 @@ const POS: Record<StageId, [number, number]> = {
   tts: [1010, 88],
   speaker: [1210, 88],
   sched: [1010, 206],
+  workers: [1010, 330],
 };
 const VIEW_W = 1370;
 const VIEW_H = 410;
@@ -135,6 +136,13 @@ export function PipelineView({
         ly: sy + H / 2 - 6,
       });
     }
+  }
+  // System 2: tasks out of the LLM's right side, down the gap before TTS to the workers, and their news back.
+  if (registry[stageType(config, 'llm')].outputs.some((p) => p.name === 'workers')) {
+    const [rx, ry] = [POS.llm[0] + W, POS.llm[1] + H / 2];
+    const [wx, wy] = POS.workers;
+    edges.push({ src: 'llm.workers', d: `M${rx},${ry - 8} L${rx + 10},${ry - 8} L${rx + 10},${wy + H * 0.35} L${wx - 2},${wy + H * 0.35}`, label: 'tasks', lx: wx - 70, ly: wy + H * 0.35 - 4 });
+    edges.push({ src: 'workers.updates', d: `M${wx},${wy + H * 0.7} L${rx + 40},${wy + H * 0.7} L${rx + 40},${ry + 8} L${rx + 2},${ry + 8}`, label: 'news', lx: wx - 70, ly: wy + H * 0.7 + 12 });
   }
   // Playback feedback: up from the speaker, back over the row, down into turn-taking.
   const [ox, oy] = [POS.speaker[0] + W / 2, POS.speaker[1]];

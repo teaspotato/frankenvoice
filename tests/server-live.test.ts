@@ -546,6 +546,60 @@ describe('the pipeline in the server', () => {
     expect(readdirSync(cannedDir)).toHaveLength(1);
   });
 
+  it('runs System 2 over ACP: a local agent process per worker, or a remote endpoint with its token', async () => {
+    const { serverDrivers } = await import('../server/drivers');
+    const cwd = mkdtempSync(join(tmpdir(), 'fv-acp-'));
+    const fixture = join(__dirname, 'fixtures', 'fake-acp-agent.mjs');
+    /** initialize, session/new and one prompt through the acp driver; what came back. */
+    const talk = (acp: () => import('../server/drivers/acp').AcpConfig) =>
+      new Promise<Json[]>((resolve, reject) => {
+        const d = serverDrivers(() => ({ headers: {}, missing: 'off' }), { modelsDir: sessions, cannedDir: sessions, acp });
+        const got: Json[] = [];
+        const conn = d.acp({ worker: 'w1' }, {
+          recv: (m) => {
+            got.push(m);
+            const r = m as { id?: number; result?: { stopReason?: string } };
+            if (r.id === 1) conn.send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: '', mcpServers: [] } });
+            if (r.id === 2) conn.send({ jsonrpc: '2.0', id: 3, method: 'session/prompt', params: { sessionId: 's1', prompt: [{ type: 'text', text: 'hi' }] } });
+            if (r.result?.stopReason) (conn.close(), resolve(got));
+          },
+          close: (e) => (e ? reject(new Error(JSON.stringify(e))) : resolve(got)),
+        }, { now: () => 0 });
+        conn.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } });
+      });
+    const local = await talk(() => ({ command: `node ${JSON.stringify(fixture)}`, cwd, env: { ANTHROPIC_API_KEY: 'k-123' } }));
+    expect(local[0]).toMatchObject({ $open: { cwd } });
+    expect(local).toContainEqual({ $stderr: expect.stringContaining('key=k-123') });
+    expect(JSON.stringify(local)).toContain('echo: hi');
+
+    // The same agent behind a WebSocket endpoint: one JSON-RPC message per frame.
+    const { spawn } = await import('node:child_process');
+    const http = createServer();
+    const wss = new WebSocketServer({ server: http });
+    const auth: string[] = [];
+    wss.on('connection', (ws, req) => {
+      auth.push(req.headers.authorization ?? '');
+      const child = spawn(process.execPath, [fixture], { stdio: ['pipe', 'pipe', 'ignore'] });
+      let buf = '';
+      child.stdout.on('data', (b: Buffer) => {
+        buf += b.toString();
+        for (let i; (i = buf.indexOf('\n')) >= 0; buf = buf.slice(i + 1)) ws.send(buf.slice(0, i));
+      });
+      ws.on('message', (d: Buffer) => child.stdin.write(`${d.toString()}\n`));
+      ws.on('close', () => child.kill());
+    });
+    const port = await listen(http);
+    try {
+      const remote = await talk(() => ({ url: `ws://127.0.0.1:${port}/acp`, token: 'tok', cwd, env: {} }));
+      expect(remote[0]).toEqual({ $open: { url: `ws://127.0.0.1:${port}/acp` } });
+      expect(JSON.stringify(remote)).toContain('echo: hi');
+      expect(auth).toEqual(['Bearer tok']);
+    } finally {
+      http.closeAllConnections?.();
+      http.close();
+    }
+  });
+
   it('runs onnxruntime-node VADs: Silero and FireRedVAD', async () => {
     const { serverDrivers } = await import('../server/drivers');
     const d = serverDrivers(() => ({ headers: {}, missing: 'off' }), { modelsDir: sessions, cannedDir: sessions });

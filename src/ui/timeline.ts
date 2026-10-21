@@ -28,6 +28,33 @@ export interface AsrResult {
   seqs: number[];
 }
 
+/** One tool call a worker made, from start to finish. */
+export interface WorkerStep {
+  id: string;
+  t0: number;
+  t1?: number;
+  title: string;
+  kind: string;
+  status: string;
+}
+
+/** A System 2 worker: one agent session, from start to result (and any follow-ups). */
+export interface WorkerSpan extends Span {
+  id: string;
+  status: string;
+  /** Lane row, so workers that overlap in time don't cover each other. */
+  row: number;
+  /** When its session was ready. */
+  readyAt?: number;
+  /** The text of the result, question or error. */
+  result?: string;
+  steps: WorkerStep[];
+  /** When a stretch of reasoning began. */
+  thinking: number[];
+  /** Plan updates, messages from the voice agent, the agent's in-between text, refused permissions, as they happened. */
+  marks: { t: number; kind: 'progress' | 'steer' | 'text' | 'denied' | 'stop'; text: string; seq: number }[];
+}
+
 export interface LlmSpan extends Span {
   rid: string;
   firstToken?: number;
@@ -137,6 +164,7 @@ export class TimelineModel {
   /** TypeSafe's answers on whether the user's words so far end on something complete. */
   interjectGates: (Marker & { go: boolean; failed?: boolean; confidence?: number; ms: number })[] = [];
   interjectChecks: InterjectCheck[] = [];
+  workers: WorkerSpan[] = [];
   ttsRequests: { t: number; seq: number }[] = [];
   tts: (Span & { rid: string; seg: number })[] = [];
   playback: (Span & { rid: string; interrupted?: boolean; heard?: string })[] = [];
@@ -192,6 +220,14 @@ export class TimelineModel {
   /** Session time of mic peak `i` (peaks are equally spaced in audio time). */
   peakToT(i: number): number {
     return this.sampleToT((i + 0.5) * this.micRate * (PEAK_MS / 1000));
+  }
+
+  /** The first System 2 lane row with no bar open at `t`. */
+  private freeRow(t: number): number {
+    const busy = new Set(this.workers.filter((w) => w.t1 === undefined || w.t1 > t).map((w) => w.row));
+    let row = 0;
+    while (busy.has(row)) row++;
+    return row;
   }
 
   private closeHold(at: number, seq: number) {
@@ -427,6 +463,56 @@ export class TimelineModel {
       case 'tape.cut':
         this.tapeCuts.push({ t: e.t, text: d.heard ?? '', unsaid: d.unsaid ?? [], seq: e.seq });
         break;
+      case 'worker.started':
+        this.workers.push({ id: d.workerId, t0: e.t, text: d.task ?? '', status: 'starting', row: this.freeRow(e.t), steps: [], thinking: [], marks: [], seqs: [e.seq] });
+        break;
+      case 'worker.ready':
+      case 'worker.thinking':
+      case 'worker.text':
+      case 'worker.tool':
+      case 'worker.tool_done':
+      case 'worker.permission':
+      case 'worker.progress':
+      case 'worker.steer':
+      case 'worker.done':
+      case 'worker.question':
+      case 'worker.error':
+      case 'worker.stopped': {
+        const w = [...this.workers].reverse().find((x) => x.id === d.workerId);
+        if (!w) break;
+        w.seqs.push(e.seq);
+        if (d.type === 'worker.ready') {
+          w.readyAt = e.t;
+          w.status = 'running';
+        } else if (d.type === 'worker.thinking') w.thinking.push(e.t);
+        else if (d.type === 'worker.text') w.marks.push({ t: e.t, kind: 'text', text: d.text ?? '', seq: e.seq });
+        else if (d.type === 'worker.tool') w.steps.push({ id: d.toolCallId, t0: e.t, title: d.title ?? '', kind: d.kind ?? 'other', status: d.status ?? 'pending' });
+        else if (d.type === 'worker.tool_done') {
+          const s = [...w.steps].reverse().find((x) => x.id === d.toolCallId);
+          if (s) {
+            s.t1 = e.t;
+            s.status = d.status;
+          }
+        } else if (d.type === 'worker.permission') {
+          if (!d.allowed) w.marks.push({ t: e.t, kind: 'denied', text: `refused: ${d.title} (${d.kind})`, seq: e.seq });
+        } else if (d.type === 'worker.progress') w.marks.push({ t: e.t, kind: 'progress', text: d.text ?? '', seq: e.seq });
+        else if (d.type === 'worker.steer') {
+          if (d.followUp) {
+            // A follow-up is a new bar for the same worker, in whichever row is free now.
+            this.workers.push({ id: w.id, t0: e.t, text: `follow-up: ${d.text ?? ''}`, status: 'running', row: this.freeRow(e.t), steps: [], thinking: [], marks: [], seqs: [e.seq] });
+          } else w.marks.push({ t: e.t, kind: 'steer', text: d.text ?? '', seq: e.seq });
+        } else if (d.type === 'worker.stopped' && w.t1 !== undefined) {
+          // Stopped after it finished: its result stands.
+          w.marks.push({ t: e.t, kind: 'stop', text: 'stopped', seq: e.seq });
+        } else {
+          w.t1 = e.t;
+          w.status = d.type === 'worker.done' ? 'done' : d.type === 'worker.question' ? 'question' : d.type === 'worker.error' ? 'error' : 'stopped';
+          w.result = d.type === 'worker.question' ? `asks: ${d.text}` : d.text;
+          for (const s of w.steps) s.t1 ??= e.t;
+          if (d.type === 'worker.stopped') w.marks.push({ t: e.t, kind: 'stop', text: 'stopped', seq: e.seq });
+        }
+        break;
+      }
       case 'turn.eot_check':
         this.eotChecks.push({ t: e.t, text: d.text ?? '', seq: e.seq, ms: d.ms ?? 0, ...(d.failed ? { failed: true } : { p: d.p, hold: !!d.hold }) });
         break;

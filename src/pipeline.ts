@@ -9,7 +9,7 @@ import type { Json } from './core/types';
 import { registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'interject' | 'backchannel' | 'llm' | 'tts' | 'speaker' | 'sched';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'interject' | 'backchannel' | 'llm' | 'workers' | 'tts' | 'speaker' | 'sched';
 
 export interface StageDef {
   id: StageId;
@@ -39,6 +39,7 @@ export const STAGES: StageDef[] = [
   { id: 'interject', label: 'Interjection', variants: { off: 'interject.off', typesafe: 'interject' } },
   { id: 'backchannel', label: 'Backchannels', variants: { on: 'backchannel', off: 'backchannel.off' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
+  { id: 'workers', label: 'System 2', variants: { acp: 'workers', mock: 'workers.mock', off: 'workers.off' } },
   { id: 'tts', label: 'TTS', variants: { 'kyutai-gpubox': 'tts.kyutai', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
   { id: 'sched', label: 'Scheduler', variants: { tick: 'sched' } },
@@ -91,6 +92,7 @@ const COLUMN: Record<StageId, [number, number]> = {
   interject: [630, 200],
   backchannel: [840, 20],
   llm: [840, 110],
+  workers: [1050, 290],
   tts: [1050, 110],
   speaker: [1260, 110],
   sched: [1050, 200],
@@ -148,6 +150,10 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
       : []),
     e('llm', 'text', 'tts', 'text'),
     ...(registry[stageType(c, 'turn')].outputs.some((p) => p.name === 'text') ? [e('turn', 'text', 'tts', 'text')] : []),
+    // System 2: the voice agent hands tasks to workers and hears back from them.
+    ...(registry[stageType(c, 'llm')].outputs.some((p) => p.name === 'workers')
+      ? [e('llm', 'workers', 'workers', 'workers'), e('workers', 'updates', 'llm', 'updates')]
+      : []),
     e('tts', 'audio', 'speaker', 'audio'),
     e('speaker', 'playback', 'turn', 'playback'),
     // The tick scheduler watches the reply (LLM, TTS queue, playback, ASR) and paces the LLM.
@@ -180,7 +186,10 @@ export function configFromGraph(graph: GraphSpec): PipelineConfig {
 /** Proxy upstreams (API keys) the configured pipeline needs. */
 export function requiredUpstreams(c: PipelineConfig): string[] {
   const out = new Set<string>();
+  const delegates = registry[stageType(c, 'llm')].outputs.some((p) => p.name === 'workers');
   for (const s of STAGES) {
+    // System 2 is only asked for when the LLM stage hands it work.
+    if (s.id === 'workers' && !delegates) continue;
     const def = registry[stageType(c, s.id)];
     for (const u of def.requires?.(resolveParams(def, stageParams(c, s.id))) ?? []) out.add(u);
   }
