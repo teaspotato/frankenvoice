@@ -45,6 +45,9 @@ interface TapeParams {
   idleKeep: number;
   answerAfterS: number;
   respondToWords: boolean;
+  draftGate: boolean;
+  gateMinS: number;
+  gateMaxS: number;
   greeting: string;
 }
 
@@ -161,6 +164,16 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       default: true,
       description: 'In silent cells, respond is allowed only once the user has said something since the last answer. Off, Gemma often answers itself right after finishing, playing the user’s next line.',
     },
+    {
+      key: 'draftGate',
+      label: 'Draft, then gate',
+      type: 'boolean',
+      default: true,
+      description:
+        'Gemma never decides alone when to answer: once the user’s words are unanswered, silent cells before “Gate: earliest” only listen (no call), cells from “Gate: latest” on may only respond, and in between Gemma chooses. The reply is written ahead and held in TTS (Write ahead), so it plays the moment its cell comes. Off: Gemma chooses each cell, with the bias and the backstop.',
+    },
+    { key: 'gateMinS', label: 'Gate: earliest (s)', type: 'number', default: 0.6, when: { draftGate: [true] }, description: 'No answer before this much silence after the user’s last words (rounded to cells).' },
+    { key: 'gateMaxS', label: 'Gate: latest (s)', type: 'number', default: 1.3, when: { draftGate: [true] }, description: 'Answer by this much silence at the latest (rounded to cells).' },
     { key: 'idleCells', label: 'Stop calling after silent cells', type: 'number', default: 6, description: 'No calls (listen) once this many cells in a row had no user words or voice, unless the agent is speaking. 0: always call.' },
     {
       key: 'cutOverCells',
@@ -343,7 +356,18 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
 
     const defaultAction = (s: TapeState) => (s === 'speaking' ? 'continue' : 'listen');
     /** The backstop: the user said something, then stayed silent `answerAfterS` without an answer. */
-    const mustAnswer = (s: Side) => s.state === 'silent' && s.owed && p.answerAfterS > 0 && s.idle >= Math.max(1, Math.round((p.answerAfterS * 1000) / cellMs));
+    const mustAnswer = (s: Side) => s.state === 'silent' && s.owed && (gate(s) === 'respond' || (p.answerAfterS > 0 && s.idle >= Math.max(1, Math.round((p.answerAfterS * 1000) / cellMs))));
+    /**
+     * Draft, then gate (Rin, 2026-10-21): Gemma answers well but can't tell when to. With words unanswered,
+     * a silent cell only listens before `gateMinS` of silence and may only respond from `gateMaxS` on;
+     * Gemma chooses only in between. The reply is drafted ahead (speculation) and held until its cell.
+     */
+    const gate = (s: Side): 'listen' | 'respond' | null => {
+      if (!p.draftGate || s.state !== 'silent' || !s.owed) return null;
+      if (s.idle < Math.round((p.gateMinS * 1000) / cellMs)) return 'listen';
+      if (s.idle >= Math.max(1, Math.round((p.gateMaxS * 1000) / cellMs))) return 'respond';
+      return null;
+    };
 
     /**
      * Cell `n` of side `s`: its line up to the action, and whether a call decides it. The same rules
@@ -356,7 +380,14 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       s.idle = user.length || voice ? 0 : s.idle + 1;
       if (user.length) s.owed = true;
       const room = headroom(at / 1000, s.queueEnd / 1000, p.ttsLeadMs / 1000, cellMs / 1000, Math.max(1, p.maxWords));
-      const forced = s.state === 'speaking' && room === 0 ? 'TTS queue full' : s.state !== 'speaking' && p.idleCells > 0 && s.idle > p.idleCells && !mustAnswer(s) ? 'idle' : null;
+      const forced =
+        s.state === 'speaking' && room === 0
+          ? 'TTS queue full'
+          : gate(s) === 'listen'
+            ? 'gate: too soon'
+            : s.state !== 'speaking' && p.idleCells > 0 && s.idle > p.idleCells && !mustAnswer(s)
+              ? 'idle'
+              : null;
       return { c, forced, maxWords: Math.max(1, room) };
     };
 
@@ -408,7 +439,7 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
         allowed: k.allowed,
         xid: k.io.xid,
         ...(odds ? { odds } : {}),
-        ...(k.answer ? { backstop: 'answer after silence' } : {}),
+        ...(k.answer ? { backstop: p.draftGate ? 'gate: answer now' : 'answer after silence' } : {}),
         ...(timings ? { promptN: timings.prompt_n ?? null, promptMs: timings.prompt_ms ?? null, predictedN: timings.predicted_n ?? null, predictedMs: timings.predicted_ms ?? null } : {}),
       };
       ctx.setState('lastMs', stats.ms);
