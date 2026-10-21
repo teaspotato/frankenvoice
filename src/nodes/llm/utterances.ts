@@ -45,7 +45,7 @@ export function styledGrammar(prefix: string): string {
   if (prefix.includes('\n')) return tagGrammar(prefix);
   const rest = 'line ("\\n" line)*';
   if (prefix.endsWith(')')) return `root ::= "\\n" ${rest}\n${RULES}`;
-  return `root ::= [^)\\n]* ")\\n" ${rest}\n${RULES}`;
+  return `root ::= [^()\\n]* ")\\n" ${rest}\n${RULES}`;
 }
 
 const TAG = ['"["', '"i"', '[01]', '"g"', '[01]', '"]"', '" "'];

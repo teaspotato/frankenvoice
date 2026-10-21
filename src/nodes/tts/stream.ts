@@ -48,9 +48,10 @@ export function cutAt(buf: string, firstClauseChars: number): number {
  */
 export const kyutaiTtsNode: NodeDef<StreamParams> = {
   type: 'tts.kyutai',
-  title: 'TTS (Kyutai on the GPU box)',
+  title: 'TTS on the GPU box (Kyutai or Qwen3-TTS)',
   category: 'tts',
-  description: 'Kyutai TTS on the GPU box over a WebSocket: words stream in as the LLM writes them, audio and word timings stream back.',
+  description:
+    'Streaming TTS on the GPU box over a WebSocket: words stream in as the LLM writes them, audio and word timings stream back. The box runs Kyutai or Qwen3-TTS (setup.sh tts kyutai|qwen); the stage shows which as “engine”. Voice directions (llm.style) reach Qwen3-TTS 1.7B only.',
   inputs: [
     { name: 'text', type: 'text' },
     { name: 'control', type: 'control' },
@@ -408,6 +409,8 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
               return;
             }
             const m = (data ?? {}) as JsonObject;
+            // The box says which engine answers the socket (Kyutai or Qwen3-TTS, swapped with setup.sh tts).
+            if (m.type === 'Ready' && typeof m.engine === 'string') ctx.setState('engine', [m.engine, m.model].filter(Boolean).join(' '));
             if (m.type === 'Words') {
               if (!p.alignWords) return;
               const words = ((m.words ?? []) as { word: string; start: number; end: number }[]).map((w) => ({

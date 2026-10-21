@@ -593,7 +593,7 @@ def build_app(engine: Engine, default_voice: str, default_cfg: float) -> FastAPI
         job = Job(voice=voice, cfg=cfg, loop=asyncio.get_running_loop(), out=asyncio.Queue(),
                   background=ws.query_params.get("priority") == "background")
         engine.submit(job)
-        await ws.send_text(json.dumps({"type": "Ready", "sample_rate": SR}))
+        await ws.send_text(json.dumps({"type": "Ready", "sample_rate": SR, "engine": "kyutai"}))
 
         async def pump_out():
             while True:

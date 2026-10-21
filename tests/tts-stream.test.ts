@@ -75,6 +75,14 @@ describe('streaming TTS (Kyutai on the GPU box)', () => {
     expect(h.ios[0].sent.filter((m) => (m as { type: string }).type === 'Close')).toHaveLength(1);
   });
 
+  it("sends the reply's voice direction as Instruct before its first word", () => {
+    const h = kyutai();
+    h.llm(0, 'start');
+    h.llm(50, 'style', 'warm, unhurried');
+    h.llm(100, 'delta', 'Sure thing. ');
+    expect(h.ios[0].sent.slice(0, 2)).toEqual([{ type: 'Instruct', text: 'warm, unhurried' }, { type: 'Speak', text: 'Sure thing. ' }]);
+  });
+
   it('plays the audio after the last Flushed (the model speaks on), and ends the reply on Done', () => {
     const h = kyutai();
     h.llm(0, 'start');

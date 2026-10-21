@@ -541,7 +541,7 @@ def build_app(engine: Engine) -> FastAPI:
         job = Job(voice=voice, loop=asyncio.get_running_loop(), out=asyncio.Queue(), instruct=ws.query_params.get("instruct") or "",
                   background=ws.query_params.get("priority") == "background")
         engine.submit(job)
-        await ws.send_text(json.dumps({"type": "Ready", "sample_rate": SR}))
+        await ws.send_text(json.dumps({"type": "Ready", "sample_rate": SR, "engine": "qwen3-tts", "model": engine.model_name}))
 
         async def pump_out():
             while True:

@@ -220,7 +220,7 @@ describe('styled replies', () => {
   });
 
   it('grammar: the rest of the direction line, then tagged lines', () => {
-    expect(styledGrammar('(warm')).toContain('root ::= [^)\\n]* ")\\n" line');
+    expect(styledGrammar('(warm')).toContain('root ::= [^()\\n]* ")\\n" line');
     expect(styledGrammar('(warm)')).toContain('root ::= "\\n" line');
     expect(styledGrammar('(warm)\n[i')).toBe(tagGrammar('(warm)\n[i'));
   });
