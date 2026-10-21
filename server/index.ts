@@ -21,6 +21,7 @@ try {
 }
 
 const PORT = Number(process.env.FV_PROXY_PORT ?? 8787);
+const HOST = process.env.FV_PROXY_HOST || '127.0.0.1'; // 0.0.0.0 in the Docker image, where the host token guards access
 /**
  * Hosted mode (e.g. on the GPU box, behind a tunnel): the proxy also serves the built UI from
  * FV_STATIC_DIR, and instead of local-only access every request needs FV_HOST_TOKEN, given once as
@@ -372,10 +373,10 @@ server.on('upgrade', (req, socket, head) => {
 // Last resort: one bad request must not stop the proxy, which would drop every connection of a live session.
 process.on('uncaughtException', (e) => console.error('[server] uncaught error, still running:', e));
 
-server.listen(PORT, '127.0.0.1', () => {
+server.listen(PORT, HOST, () => {
   const keys = Object.entries(upstreams)
     .map(([k, u]) => `${k}:${configured(u) ? 'ok' : 'off'}`)
     .join(' ');
   const mode = HOST_TOKEN ? `  hosted (token)${STATIC_DIR ? `, UI from ${STATIC_DIR}` : ''}` : '';
-  console.log(`frankenvoice server on http://127.0.0.1:${PORT}${mode}  [${keys}]  sessions -> ${sessionsDir()}  settings -> ${SETTINGS_FILE}`);
+  console.log(`frankenvoice server on http://${HOST}:${PORT}${mode}  [${keys}]  sessions -> ${sessionsDir()}  settings -> ${SETTINGS_FILE}`);
 });

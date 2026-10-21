@@ -43,16 +43,17 @@ bash gpubox/setup.sh            # install (about 3 min) + start (about 3 min the
 bash gpubox/setup.sh status     # prints GPUBOX_URL and GPUBOX_TOKEN
 ```
 
-Other commands: `setup.sh install | start | stop | restart | status | ui` (see [Hosted UI](#hosted-ui)). `start` only starts what isn't already
+Other commands: `setup.sh install | fetch | start | stop | restart | status | ui` (see [Hosted UI](#hosted-ui)). `start` only starts what isn't already
 running. To restart just one process, kill its process group (`kill -- -$(cat $ROOT/tts.pid)`) and run `start` again.
 The tunnel keeps its URL as long as the `tunnel` process lives.
 
-Environment variables: `GPUBOX_ROOT` (venvs, logs, pid files; default `/content` if it exists, else `~/gpubox`),
-`GPUBOX_TOKEN` (default: random, saved in `$ROOT/gpubox.token`), `ASR_MODEL` (`Qwen/Qwen3-ASR-1.7B`, or
+Environment variables: `GPUBOX_ROOT` (venvs, llama.cpp, pid files; default `/content` if it exists, else `~/gpubox`),
+`GPUBOX_DATA` (token, logs, LLM weights, UI settings and sessions; default `GPUBOX_ROOT`),
+`GPUBOX_TOKEN` (default: random, saved in `$DATA/gpubox.token`), `ASR_MODEL` (`Qwen/Qwen3-ASR-1.7B`, or
 `Qwen/Qwen3-ASR-0.6B`), `ASR_MEM` (0.15), `NO_LLM=1`, `LLM_CTX` (8192, shared by the slots), `LLM_SLOTS` (2), `LLM_SWA_FULL` (1; at 32k it needs 5.4 GB),
 `LLM_MTP` (1), `CUDA_MPS` (1: GPU services share the GPU through a CUDA MPS daemon), `LLM_MPS_PRIO` (1: Gemma is a below-normal MPS client, so Kyutai and ASR kernels go first), `LLM_MPS_PCT` (unset: optional cap on Gemma's SMs), `NO_TUNNEL=1`, `KYUTAI_NQ` (codebooks, 32), `KYUTAI_WORD_OFFSET_S` (-0.04), `KYUTAI_IDLE_CLOSE_S` (30),
 `KYUTAI_MAX_BATCH` (1: replies rendered at once; the app serves one user at a time and queues the rest), `NO_UI=1`, `FV_APP` (app archive, default `$ROOT/frankenvoice.tar.gz`).
-Logs are in `$ROOT/logs/{asr,llm,tts,gateway,tunnel,ui,ui-tunnel}.log`. Model files for the LLM are in `$ROOT/models`, llama.cpp
+Logs are in `$DATA/logs/{asr,llm,tts,gateway,tunnel,ui,ui-tunnel}.log`. Model files for the LLM are in `$DATA/models`, llama.cpp
 in `$ROOT/llama.cpp`.
 `setup.sh restart-gpu` restarts only the GPU services (and MPS), keeping the tunnels' URLs.
 
@@ -107,6 +108,35 @@ the driver's `libcuda` through Colab's `LD_LIBRARY_PATH` (`/usr/lib64-nvidia`), 
 there, because it can match your own shell; kill by pid. The VM (and so the tunnel URL) goes away when the
 runtime is recycled.
 
+## Docker
+
+The `Dockerfile` at the repo root packs all of it, web UI included, into one image: the three venvs, llama.cpp,
+cloudflared and the built app are in the image; model weights (about 15 GB) download into the `/data` volume on
+the first start, and later starts reuse them.
+
+```bash
+docker build -t frankenvoice .
+docker run -d --name frankenvoice --gpus all -p 8787:8787 -v frankenvoice:/data --restart unless-stopped frankenvoice
+docker logs -f frankenvoice     # first start: weights download, then about 3 min to load; prints the UI link
+```
+
+Needs an NVIDIA GPU with 24 GB, a driver for CUDA 12.8 or newer, and the NVIDIA Container Toolkit. When it is up the
+log prints the link to open once (it sets the token cookie):
+
+- `http://localhost:8787/?token=...` on the GPU machine itself, or through `ssh -L 8787:localhost:8787 <gpu-host>`;
+- `https://<random>.trycloudflare.com/?token=...` from anywhere (a quick tunnel for the UI only; `-e NO_TUNNEL=1`
+  turns it off). The browser only allows the microphone over https or on localhost, so a plain
+  `http://<server-ip>:8787` link won't work.
+
+Everything is preset: the UI talks to ASR, TTS and Gemma over localhost inside the container, and TypeSafe's key
+goes in Settings as usual. Settings, recorded sessions, the token and the logs live in `/data`
+(`/data/logs/*.log`), so they survive `docker rm` and image updates. The setup.sh variables work as `-e`
+options, for example `-e GPUBOX_TOKEN=...` for a fixed token, `-e ASR_MODEL=Qwen/Qwen3-ASR-0.6B`, `-e NO_LLM=1`,
+or `-e CUDA_MPS=0` to run without the CUDA MPS daemon (on by default, as on Colab; the daemon runs inside the
+container, which hasn't been tried on a GPU yet). Add `-p 8000:8000`
+to reach the gateway's ASR/TTS/LLM API directly. If any process exits, the container stops (and
+`--restart unless-stopped` brings it back).
+
 ## Hosted UI
 
 `setup.sh` can also serve the Frankenvoice web UI from the box, so the whole thing is one https URL and the
@@ -136,12 +166,12 @@ Preset from the environment (shown as `env` in Settings):
 |---|---|
 | `GPUBOX_BASE_URL`, `GPUBOX_TOKEN` | `ws://127.0.0.1:8000` and the gpubox token: the GPU box ASR/TTS stages work as is |
 | `OPENAI_COMPAT_BASE_URL` | `http://127.0.0.1:8103/v1` (llama.cpp directly; it needs no key): the LLM stage's default model `gemma-4-12b-it` works as is |
-| `FV_SESSIONS_DIR` | `$ROOT/fv-sessions` |
+| `FV_SESSIONS_DIR` | `$DATA/fv-sessions` |
 
 Other keys (TypeSafe) are entered in the UI's Settings on the box and saved in
-`$ROOT/fv-settings.json` (mode 600), which overrides the environment. The token itself is never written to the
-app folder or the settings file; `setup.sh` reads it from `$ROOT/gpubox.token` and passes it in the environment.
-`NO_UI=1` skips all of this. Log: `$ROOT/logs/ui.log`, install log `$ROOT/logs/install-ui.log`.
+`$DATA/fv-settings.json` (mode 600), which overrides the environment. The token itself is never written to the
+app folder or the settings file; `setup.sh` reads it from `$DATA/gpubox.token` and passes it in the environment.
+`NO_UI=1` skips all of this. Log: `$DATA/logs/ui.log`, install log `$DATA/logs/install-ui.log`.
 
 ## Point Frankenvoice at it
 

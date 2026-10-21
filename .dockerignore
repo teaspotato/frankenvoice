@@ -1,0 +1,10 @@
+.git
+node_modules
+dist
+sessions
+.frankenvoice
+.env
+*.log
+*.fvs
+Dockerfile
+.dockerignore
