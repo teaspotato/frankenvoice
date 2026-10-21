@@ -67,8 +67,8 @@ install() {
   local t0=$SECONDS
   command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH=$HOME/.local/bin:$PATH; }
   command -v ffmpeg >/dev/null || { (apt-get update -qq && apt-get install -y -qq ffmpeg) >/dev/null 2>&1 || true; }
-  # The venvs are the slow part (~19 GB unpacked, bound by CPU and disk rather than the network), so the
-  # small downloads (cloudflared, llama.cpp, node + the UI) run alongside them
+  # The venvs are the slow part (~19 GB), so the small downloads (cloudflared, llama.cpp, node + the UI) run alongside
+  # them. With 8 vCPUs, install is bound by the network (issue #32)
   log "installing venvs (asr: sglang-omni, gw: gateway + forced aligner, tts: moshi) in parallel"
   venv asr --prerelease=allow sglang-omni==0.1.8 > "$DATA/logs/install-asr.log" 2>&1 &
   local a=$!
@@ -95,7 +95,8 @@ install() {
 }
 
 fetch() {  # model weights: Hugging Face cache (HF_HOME) for ASR/aligner/TTS, $DATA/models for the LLM
-  # One file at a time: ~130-160 MB/s from Hugging Face on Colab; parallel downloads were slower (disk/CPU bound)
+  # One file at a time already fills the link (~340 MB/s on an 8-vCPU Colab). Parallel files, HF_XET_HIGH_PERFORMANCE
+  # and fetching while the venvs install were no faster (issue #32)
   local t0=$SECONDS
   log "fetching weights"
   "$ROOT/v-gw/bin/python" - <<EOF || { log "weight download failed"; return 1; }
