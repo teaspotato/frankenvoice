@@ -678,4 +678,42 @@ describe('VAD rules end of turn (turn-1-mini, single channel)', () => {
     h.send(2900, 'transcript', { type: 'asr.final', text: 'Where was it recorded?', start: 1000 * h.sr, end: 2000 * h.sr, speechFinal: true, fromFinalize: true });
     expect(h.last('turn.user')?.text).toBe('Where was it recorded?');
   });
+
+  it('commits a short floor take whose speech ended before the agent yielded, timed from its end', () => {
+    const h = rules({ overlap: 'classify' });
+    speech(h, 1000, 2000);
+    h.user(2400, 'Tell me about dub.');
+    h.advance(3000);
+    expect(h.last('turn.user')?.text).toBe('Tell me about dub.');
+    h.send(3500, 'playback', { type: 'playback.start', rid: 'r1' });
+    // A short "wait, ..." over the agent: its speech ends before its words are in.
+    speech(h, 5000, 5400, 300);
+    expect(h.states().at(-1)).toBe('speaking+user');
+    h.send(5800, 'transcript', { type: 'asr.final', text: 'wait, what about reggae', start: 5000 * h.sr, end: 5400 * h.sr, speechFinal: true });
+    expect(h.decisions().at(-1)).toBe('interrupt');
+    expect(h.states().at(-1)).toBe('listening');
+    h.send(6000, 'transcript', { type: 'asr.utterance_end' });
+    h.advance(6199);
+    expect(h.last('turn.user')?.text).toBe('Tell me about dub.');
+    h.advance(6200);
+    expect(h.last('turn.user')?.text).toBe('wait, what about reggae');
+    expect(h.last('turn.eot_rule')).toMatchObject({ event: 'commit', silenceMs: 800 });
+  });
+
+  it('commits speech that ended over the agent when its playback ends', () => {
+    const h = rules({ overlap: 'classify' });
+    speech(h, 1000, 2000);
+    h.user(2400, 'Tell me about dub.');
+    h.advance(3000);
+    h.send(3500, 'playback', { type: 'playback.start', rid: 'r1' });
+    speech(h, 5000, 5400, 300);
+    h.send(5750, 'transcript', { type: 'asr.final', text: 'the one with the horns', start: 5000 * h.sr, end: 5300 * h.sr, speechFinal: false });
+    // The agent finishes while those words are still being judged.
+    h.send(5760, 'playback', { type: 'playback.end', rid: 'r1' });
+    expect(h.states().at(-1)).toBe('listening');
+    h.advance(6199);
+    expect(h.out.filter((o) => o.msg.type === 'turn.user')).toHaveLength(1);
+    h.advance(6200);
+    expect(h.last('turn.user')?.text).toBe('the one with the horns');
+  });
 });

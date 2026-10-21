@@ -541,6 +541,30 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
      */
     let vadEot: { stop: number; at: number; timer?: TimerHandle; resumed?: TimerHandle; due?: boolean } | null = null;
     const vadRules = () => p.eotCheck === 'vad-rules' && !useModel();
+    /**
+     * vad-rules: the user's speech ended while the agent held the floor, so no end of turn opened
+     * (its real end on the session clock, and in media samples). Opened once they have the floor.
+     */
+    let overStop: { stop: number; at: number } | null = null;
+    /** vad-rules: opens the end of turn from when the user's speech stopped (the silence since then counts). */
+    const openVadEot = (stop: number, at: number) => {
+      closeVadEot(null);
+      overStop = null;
+      const v: NonNullable<typeof vadEot> = { stop, at };
+      vadEot = v;
+      ctx.emit('turn', { type: 'turn.eot_rule', event: 'open', at: v.at });
+      v.timer = ctx.setTimer(Math.max(0, p.eotSilenceMs - (ctx.now() - stop)), vadEotDue, 'eot-silence');
+    };
+    /**
+     * vad-rules, on a move into listening (or words arriving after it): speech that ended while the
+     * agent held the floor (a short floor take, or speech playback ended over) opened no end of turn,
+     * so open it now, from that speech's end.
+     */
+    const listenAfterOverlap = () => {
+      if (!vadRules() || state !== 'listening' || speaking || vadEot || backoff || !overStop) return;
+      if (!parts.length && !partial) return;
+      openVadEot(overStop.stop, overStop.at);
+    };
     const closeVadEot = (why: string | null) => {
       const v = vadEot;
       if (!v) return;
@@ -805,6 +829,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     const commit = (why: string, tail?: Partial_, extra: Record<string, Json> = {}) => {
       heldFinal = false;
       closeVadEot(null);
+      overStop = null;
       eotWait?.timer.clear();
       eotWait = null;
       eotHold?.timer.clear();
@@ -888,7 +913,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
      */
     const endpoint = (why: string) => {
       // vad-rules: the VAD's silence ends the turn, not ASR endpointing; the words only refresh the draft.
-      if (vadRules() && !backoff) return maybeDraft(why);
+      if (vadRules() && !backoff) {
+        // Words of speech that ended before the user had the floor: their silence ends the turn.
+        listenAfterOverlap();
+        return maybeDraft(why);
+      }
       const text = parts.join(' ').trim();
       if (!eotOn() || !text || state !== 'listening' || backoff) return commit(why);
       const key = draftKey(text);
@@ -960,6 +989,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         collect(f.text, f.start, f.end);
       }
       armSilence();
+      listenAfterOverlap();
     };
 
     /** A held aside becomes the start of the user's next turn. */
@@ -1196,6 +1226,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             takeAside();
             if (!c) commit('aside, after the agent finished', undefined, { aside: true });
           }
+          listenAfterOverlap();
         } else if (msg.type === 'playback.paused' && msg.gate) {
           pageStopped(msg);
         } else if (msg.type === 'playback.interrupted') {
@@ -1266,20 +1297,15 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         } else if (msg.type === 'vad.speech_end') {
           ctx.setState('userSpeaking', false);
           speaking = false;
+          const stop = { stop: ctx.now() - (typeof msg.silentMs === 'number' ? msg.silentMs : VAD_HANGOVER_MS), at: msg.at as number };
           clearProtected();
           if (vadEot?.resumed) {
             // A short sound in the silence: the end of turn stays open, timed from the first stop.
             vadEot.resumed.clear();
             vadEot.resumed = undefined;
             if (vadEot.due) vadEotDue();
-          } else if (vadRules() && state === 'listening') {
-            closeVadEot(null);
-            const heard = typeof msg.silentMs === 'number' ? msg.silentMs : VAD_HANGOVER_MS;
-            const v: NonNullable<typeof vadEot> = { stop: ctx.now() - heard, at: msg.at as number };
-            vadEot = v;
-            ctx.emit('turn', { type: 'turn.eot_rule', event: 'open', at: v.at });
-            v.timer = ctx.setTimer(Math.max(0, p.eotSilenceMs - heard), vadEotDue, 'eot-silence');
-          }
+          } else if (vadRules() && state === 'listening') openVadEot(stop.stop, stop.at);
+          else overStop = state === 'listening' ? null : stop;
           // A partial from before the silence usually lacks the last words: wait for ASR to catch up.
           caughtUp = !partial;
           if (state === 'listening') {
