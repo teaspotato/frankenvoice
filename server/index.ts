@@ -8,8 +8,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve, sep } from 'node:path';
 import { WebSocketServer } from 'ws';
-import { LiveHub } from './live';
+import { HOST_MAX_MESSAGE, LiveHub, VISITOR_MAX_MESSAGE } from './live';
 import type { UpstreamName, Upstreams } from './drivers';
+import { checkGraph, type GraphSpec } from '../src/core/graph';
+import { buildGraph, defaultConfig } from '../src/pipeline';
 import { preloadTurnModel, type TurnModelRequest } from './drivers/turn-model';
 
 try {
@@ -60,6 +62,27 @@ const SETTINGS: SettingDef[] = [
   { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'API key', secret: true },
   { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
   { name: 'FV_SESSIONS_DIR', group: 'Storage', label: 'Sessions folder', default: 'sessions', hint: 'Relative to where the proxy runs' },
+  {
+    name: 'FV_MAX_SESSIONS',
+    group: 'Users',
+    label: 'Live sessions at once',
+    default: '1',
+    hint: 'More pages wait in a queue. One L4 gives one user the best latency; 2 users add about 1 s to each reply, 4 about 2 s',
+  },
+  {
+    name: 'FV_MAX_SESSION_S',
+    group: 'Users',
+    label: 'Longest live session (s)',
+    default: '180',
+    hint: 'A live session is stopped (and saved) after this long, so a stuck page can\'t hold the box. 0 = no limit',
+  },
+  {
+    name: 'FV_PUBLIC',
+    group: 'Users',
+    label: 'Public demo (1 = on)',
+    default: '0',
+    hint: 'Hosted mode: anyone with the link (no token) can talk to the agent. Visitors run the pipeline you started last and see no settings, recordings or replays; with the token you stay the host',
+  },
 ];
 const SETTING_NAMES = new Set(SETTINGS.map((d) => d.name));
 const SETTINGS_FILE = resolve(process.env.FV_SETTINGS_FILE ?? '.frankenvoice/settings.json');
@@ -114,6 +137,8 @@ async function updateSettings(patch: Record<string, unknown>) {
 const sessionsDir = () => resolve(setting('FV_SESSIONS_DIR')!);
 /** Downloaded models (the turn model), next to the settings file so a redeployed app keeps them. */
 const MODELS_DIR = resolve(process.env.FV_MODELS_DIR ?? join(dirname(SETTINGS_FILE), 'fv-models'));
+/** Canned lines' audio, rendered once per GPU box and kept across sessions and redeploys. */
+const CANNED_DIR = resolve(process.env.FV_TTS_CACHE_DIR ?? join(dirname(SETTINGS_FILE), 'fv-tts-cache'));
 
 interface Upstream {
   baseVar: string;
@@ -166,18 +191,29 @@ const sameToken = (got: string) => {
 };
 const cookieToken = (req: IncomingMessage) => /(?:^|;\s*)fv_token=([^;]*)/.exec(req.headers.cookie ?? '')?.[1] ?? '';
 
-/** Hosted mode: same-origin requests carrying the token cookie. Otherwise only the local UI. */
-function allowed(req: IncomingMessage): boolean {
-  if (!HOST_TOKEN) return localOnly(req);
+const sameOrigin = (req: IncomingMessage) => {
   const origin = req.headers.origin;
-  if (origin) {
-    try {
-      if (new URL(origin).host !== req.headers.host) return false;
-    } catch {
-      return false;
-    }
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch {
+    return false;
   }
-  return sameToken(decodeURIComponent(cookieToken(req)));
+};
+
+/** The host: in hosted mode, same-origin requests carrying the token cookie; otherwise only the local UI. */
+function isHost(req: IncomingMessage): boolean {
+  if (!HOST_TOKEN) return localOnly(req);
+  return sameOrigin(req) && sameToken(decodeURIComponent(cookieToken(req)));
+}
+
+/** Public demo (hosted mode only): anyone may load the page and talk; settings, recordings and the turn model stay the host's. */
+const isPublic = () => !!HOST_TOKEN && setting('FV_PUBLIC') === '1';
+const VISITOR_PATHS = new Set(['/api/health', '/api/me', '/api/live']);
+
+function allowed(req: IncomingMessage, p: string): boolean {
+  if (isHost(req)) return true;
+  return isPublic() && sameOrigin(req) && (VISITOR_PATHS.has(p) || (!!STATIC_DIR && !p.startsWith('/api/') && (req.method === 'GET' || req.method === 'HEAD')));
 }
 
 const TYPES: Record<string, string> = {
@@ -251,6 +287,15 @@ async function sessions(req: IncomingMessage, res: ServerResponse, id: string | 
   json(res, 405, { error: 'method not allowed' });
 }
 
+/** What demo visitors run: the pipeline the host started last (kept across restarts). */
+const DEMO_GRAPH_FILE = join(dirname(SETTINGS_FILE), 'demo-graph.json');
+let demoGraph: GraphSpec | undefined;
+try {
+  demoGraph = checkGraph(JSON.parse(await readFile(DEMO_GRAPH_FILE, 'utf8')) as GraphSpec);
+} catch {
+  // none yet, or an outdated format: visitors get the default pipeline
+}
+
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://local');
   const p = url.pathname;
@@ -266,7 +311,7 @@ const server = createServer((req, res) => {
     });
     return res.end();
   }
-  if (!allowed(req)) {
+  if (!allowed(req, p)) {
     return json(res, 403, { error: HOST_TOKEN ? 'open this page with ?token=<FV_HOST_TOKEN> first' : 'the proxy only accepts requests from the local UI' });
   }
   const handle = async () => {
@@ -279,6 +324,11 @@ const server = createServer((req, res) => {
         }
       } else if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' });
       return json(res, 200, { file: SETTINGS_FILE, settings: describeSettings() });
+    }
+    if (p === '/api/me') {
+      // A visitor sees the pipeline it will talk to.
+      const host = isHost(req);
+      return json(res, 200, { host, public: isPublic(), ...(host ? {} : { graph: demoGraph ?? buildGraph(defaultConfig()) }) });
     }
     if (p === '/api/health') {
       return json(res, 200, Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])));
@@ -301,12 +351,23 @@ const server = createServer((req, res) => {
 });
 
 // The page's socket: mic in, agent audio and the run's trajectory out.
-const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR });
-const wss = new WebSocketServer({ noServer: true });
+const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR, maxSessions: () => Number(setting('FV_MAX_SESSIONS')) || 1,
+  maxSessionMs: () => Math.max(0, Number(setting('FV_MAX_SESSION_S') ?? 180) || 0) * 1000,
+  demoGraph: () => demoGraph ?? buildGraph(defaultConfig()),
+  hostGraph: (g) => {
+    demoGraph = g;
+    void writeFile(DEMO_GRAPH_FILE, JSON.stringify(g)).catch((e) => console.error('[server] could not save the demo pipeline:', e));
+  },
+});
+// ws buffers a whole message before handing it over, so the cap must hold at the socket: a visitor sends mic frames
+// and controls (small), the host also replay bundles (large).
+const hostWss = new WebSocketServer({ noServer: true, maxPayload: HOST_MAX_MESSAGE });
+const visitorWss = new WebSocketServer({ noServer: true, maxPayload: VISITOR_MAX_MESSAGE });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');
-  if (url.pathname !== '/api/live' || !allowed(req)) return socket.destroy();
-  wss.handleUpgrade(req, socket, head, (ws) => live.handle(ws));
+  if (url.pathname !== '/api/live' || !allowed(req, url.pathname)) return socket.destroy();
+  const host = isHost(req);
+  (host ? hostWss : visitorWss).handleUpgrade(req, socket, head, (ws) => live.handle(ws, { host }));
 });
 
 // Last resort: one bad request must not stop the proxy, which would drop every connection of a live session.

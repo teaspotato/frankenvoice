@@ -98,17 +98,23 @@ interface DuplexParams {
   onset: string;
   holdAfterMs: number;
   yieldWithinMs: number;
+  pageGate: boolean;
+  pageGateWaitMs: number;
   duckDb: number;
   floorWords: string;
   asides: boolean;
   classifyWaitMs: number;
   eotCheck: string;
+  eotSilenceMs: number;
+  eotResumeGapMs: number;
+  eotResumeMs: number;
   eotYield: number;
   eotHoldMs: number;
   eotOptions: string;
   eotInstructions: string;
   backoffAfter: number;
   backoffLines: string;
+  greeting: string;
   backoffWords: number;
   backoffSilenceMs: number;
 }
@@ -156,7 +162,14 @@ type Candidate = {
   check?: () => void;
   /** Cuts the agent off (or ducks it) once the speech has gone on for `holdAfterMs`. */
   holdTimer?: TimerHandle;
+  /** The page stopped the agent on its own VAD: waiting for the VAD here to hear the speech too. */
+  gate?: TimerHandle;
 };
+
+/** Media samples per ms (16 kHz). */
+const SR_MS = 16;
+/** The VAD's hangover, for speech ends that don't say how long they waited. */
+const VAD_HANGOVER_MS = 320;
 
 /** How long before the VAD's speech end a held end of turn still counts (the VAD's hangover and some). */
 const EOT_HOLD_MS = 600;
@@ -355,6 +368,23 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       when: { bargeIn: [true] },
     },
     {
+      key: 'pageGate',
+      label: 'Stop in the page',
+      type: 'boolean',
+      default: true,
+      description:
+        'While a quick yield is allowed (the first yieldWithinMs of a reply), the page runs its own FireRedVAD on the mic and stops playback the moment it hears the user, without the round trip to the server. The yield waits for the VAD here: if it hears no speech in time, the agent goes on from where it stopped. Needs browser echo cancellation.',
+      when: { bargeIn: [true] },
+    },
+    {
+      key: 'pageGateWaitMs',
+      label: 'Confirm within (ms)',
+      type: 'number',
+      default: 600,
+      description: 'After the page stopped the agent, how long the VAD here has to hear the speech too; else the agent plays on.',
+      when: { bargeIn: [true], pageGate: [true] },
+    },
+    {
       key: 'holdAfterMs',
       label: 'Cut after (ms)',
       type: 'number',
@@ -400,10 +430,36 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       key: 'eotCheck',
       label: 'Done or pausing?',
       type: 'select',
-      options: ['typesafe', 'off'],
+      options: ['typesafe', 'vad-rules', 'off'],
       default: 'typesafe',
       description:
-        'Without the turn model, ASR endpointing ends the turn at the first pause. typesafe: TypeSafe Choice reads the words when the user pauses; unless it thinks they are handing the turn over, the commit waits for more silence (a draft still starts, so the reply is ready).',
+        'Without the turn model, ASR endpointing ends the turn at the first pause. typesafe: TypeSafe Choice reads the words when the user pauses; unless it thinks they are handing the turn over, the commit waits for more silence (a draft still starts, so the reply is ready). vad-rules: ignore ASR endpointing and end the turn on the VAD alone, with turn-1-mini’s single-channel rules: a fixed silence, where a short sound (a laugh, a "yeah") doesn’t restart the count.',
+    },
+    {
+      key: 'eotSilenceMs',
+      label: 'Commit after silence (ms)',
+      type: 'number',
+      default: 800,
+      description:
+        'Silence after the user’s speech stops (timed from its real end, before the VAD’s hangover) that ends their turn. turn-1-mini never commits before 600 ms.',
+      when: { eotCheck: ['vad-rules'] },
+    },
+    {
+      key: 'eotResumeGapMs',
+      label: 'Resume gap that continues the turn (ms)',
+      type: 'number',
+      default: 200,
+      description: 'Speech that starts again within this long of stopping cancels the end of turn at once (the VAD’s hangover usually bridges such gaps already).',
+      when: { eotCheck: ['vad-rules'] },
+    },
+    {
+      key: 'eotResumeMs',
+      label: 'Resumed speech that continues the turn (ms)',
+      type: 'number',
+      default: 500,
+      description:
+        'Later speech cancels the end of turn only once it lasts this long; shorter sounds (a laugh, a "yeah") leave it open, and if its silence ran out meanwhile the turn ends when they stop.',
+      when: { eotCheck: ['vad-rules'] },
     },
     {
       key: 'eotYield',
@@ -416,6 +472,13 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     { key: 'eotHoldMs', label: 'Hold (ms)', type: 'number', default: 1500, description: 'More silence needed before committing words TypeSafe thinks are not done.', when: { eotCheck: ['typesafe'] } },
     { key: 'eotOptions', label: 'Done/pausing options', type: 'text', default: DEFAULT_EOT_OPTIONS, description: 'Sent to TypeSafe as the Choice criteria; the first option means done.', when: { eotCheck: ['typesafe'] } },
     { key: 'eotInstructions', label: 'Done/pausing question', type: 'text', default: DEFAULT_EOT_INSTRUCTIONS, when: { eotCheck: ['typesafe'] } },
+    {
+      key: 'greeting',
+      label: 'Opening line',
+      type: 'string',
+      default: "Hi! What's on your mind?",
+      description: 'What the agent says first, as soon as the ASR is connected (so the user can answer). It opens the LLM transcript. Empty: wait for the user. Needs a TTS that plays canned lines (Kyutai).',
+    },
     {
       key: 'backoffAfter',
       label: 'Back off after interruptions',
@@ -471,6 +534,58 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     /** TypeSafe's p(done) for the words at a pause, by their key: undefined while it answers, null if it failed. */
     const eotAnswers = new Map<string, number | null | undefined>();
     const eotOpts = p.eotCheck === 'typesafe' ? parseChoiceOptions(String(p.eotOptions)) : [];
+    /**
+     * vad-rules: an end of turn opened when the user's speech stopped (`stop`: its real end, on the session
+     * clock; `at`: in media samples). `resumed`: the user is making a sound that hasn't lasted `eotResumeMs`
+     * yet; `due`: the silence ran out during it, so the turn ends when it stops.
+     */
+    let vadEot: { stop: number; at: number; timer?: TimerHandle; resumed?: TimerHandle; due?: boolean } | null = null;
+    const vadRules = () => p.eotCheck === 'vad-rules' && !useModel();
+    /**
+     * vad-rules: the user's speech ended while the agent held the floor, so no end of turn opened
+     * (its real end on the session clock, and in media samples). Opened once they have the floor.
+     */
+    let overStop: { stop: number; at: number } | null = null;
+    /** vad-rules: opens the end of turn from when the user's speech stopped (the silence since then counts). */
+    const openVadEot = (stop: number, at: number) => {
+      closeVadEot(null);
+      overStop = null;
+      const v: NonNullable<typeof vadEot> = { stop, at };
+      vadEot = v;
+      ctx.emit('turn', { type: 'turn.eot_rule', event: 'open', at: v.at });
+      v.timer = ctx.setTimer(Math.max(0, p.eotSilenceMs - (ctx.now() - stop)), vadEotDue, 'eot-silence');
+    };
+    /**
+     * vad-rules, on a move into listening (or words arriving after it): speech that ended while the
+     * agent held the floor (a short floor take, or speech playback ended over) opened no end of turn,
+     * so open it now, from that speech's end.
+     */
+    const listenAfterOverlap = () => {
+      if (!vadRules() || state !== 'listening' || speaking || vadEot || backoff || !overStop) return;
+      if (!parts.length && !partial) return;
+      openVadEot(overStop.stop, overStop.at);
+    };
+    const closeVadEot = (why: string | null) => {
+      const v = vadEot;
+      if (!v) return;
+      v.timer?.clear();
+      v.resumed?.clear();
+      vadEot = null;
+      if (why) ctx.emit('turn', { type: 'turn.eot_rule', event: 'cancel', why });
+    };
+    /** vad-rules: the silence ran out, so the user's turn is over (once ASR has the words). */
+    const vadEotDue = () => {
+      const v = vadEot;
+      if (!v || state !== 'listening') return closeVadEot(null);
+      if (v.resumed) {
+        v.due = true;
+        return;
+      }
+      const ms = Math.round(ctx.now() - v.stop);
+      closeVadEot(null);
+      ctx.emit('turn', { type: 'turn.eot_rule', event: 'commit', silenceMs: ms });
+      endOfTurn(`VAD rules: ${ms} ms of silence`);
+    };
     /** The rules ended the turn but TypeSafe thinks the user is going on: commit after more silence. */
     let eotHold: { why: string; key: string; timer: TimerHandle } | null = null;
     /** The turn model is loaded and scoring. */
@@ -488,6 +603,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       .split('|')
       .map((l) => l.trim())
       .filter(Boolean);
+    let greeted = false;
     /** The user is talking (VAD). */
     let speaking = false;
     /** ASR has caught up with the silence: a result arrived during it, or the words before it were all final. */
@@ -501,6 +617,46 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     let held = false;
     /** When the agent's current reply started playing. */
     let playingSince: number | null = null;
+    /** Until when (session time) the page may stop playback on its own VAD; null: it may not. */
+    let gateUntil: number | null = null;
+    /**
+     * The playing reply's utterances (tagged replies): from when each plays, whether the user may cut
+     * it off and whether the quick yield applies. Speech that starts in one that may not be cut off is
+     * let be (no pause, no yield); if it is still going when an interruptible one starts, it counts from then.
+     */
+    let utts: { rid: string | null; list: { at: number; interruptible: boolean; gate: boolean }[] } = { rid: null, list: [] };
+    let playingRid: string | null = null;
+    const flagsAt = (t: number) => {
+      const list = utts.rid === playingRid ? utts.list : [];
+      return list.findLast((u) => u.at <= t) ?? list[0] ?? { interruptible: true, gate: true };
+    };
+    /** Speech that started in an utterance that may not be cut off, and the look at the next utterance. */
+    let protectedOnset: { at: number; timer?: TimerHandle } | null = null;
+    const clearProtected = () => {
+      protectedOnset?.timer?.clear();
+      protectedOnset = null;
+    };
+    /** At `t`, if the user is still talking over an utterance that may be cut off now, it counts as their onset. */
+    const lookAgainAt = (t: number) => {
+      const o = protectedOnset;
+      if (!o) return;
+      o.timer?.clear();
+      o.timer = ctx.setTimer(
+        Math.max(0, t - ctx.now()),
+        () => {
+          o.timer = undefined;
+          if (protectedOnset !== o || !speaking || state !== 'speaking' || !flagsAt(ctx.now()).interruptible) return;
+          clearProtected();
+          overlap(o.at, 'user speech (VAD), still going when an interruptible utterance started');
+        },
+        'protected',
+      );
+    };
+    const arm = (until: number | null) => {
+      if (until === gateUntil) return;
+      gateUntil = until;
+      ctx.emit('control', { type: 'gate', until });
+    };
     /** Words said over the agent that it should take in, held until its current sentence ends. */
     let aside: { text: string; from: number; to: number; timer?: TimerHandle; cutting?: boolean } | null = null;
     const useModel = () => p.useModel && model;
@@ -531,7 +687,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       return false;
     };
     const hold = () => {
-      if (held) return;
+      if (held || !flagsAt(ctx.now()).interruptible) return;
       if (p.onset === 'cut') ctx.emit('control', { type: 'pause' });
       else if (p.onset === 'duck' && p.duckDb > 0) ctx.emit('control', { type: 'duck', db: p.duckDb });
       else return;
@@ -583,6 +739,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       state = next;
       ctx.emit('turn', { type: 'turn.transition', from: prev, to: next, on, why });
       ctx.setState('state', next);
+      if (next !== 'speaking') arm(null);
       if (holder(next) !== holder(prev)) {
         ctx.setState('floor', holder(next));
         ctx.log('info', `floor -> ${holder(next)}`, { why });
@@ -671,6 +828,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     /** Commit the turn. `tail`: its last words are an ASR partial whose final may still come. */
     const commit = (why: string, tail?: Partial_, extra: Record<string, Json> = {}) => {
       heldFinal = false;
+      closeVadEot(null);
+      overStop = null;
       eotWait?.timer.clear();
       eotWait = null;
       eotHold?.timer.clear();
@@ -753,6 +912,12 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
      * goes out in the pause, so the reply is ready if it does commit.
      */
     const endpoint = (why: string) => {
+      // vad-rules: the VAD's silence ends the turn, not ASR endpointing; the words only refresh the draft.
+      if (vadRules() && !backoff) {
+        // Words of speech that ended before the user had the floor: their silence ends the turn.
+        listenAfterOverlap();
+        return maybeDraft(why);
+      }
       const text = parts.join(' ').trim();
       if (!eotOn() || !text || state !== 'listening' || backoff) return commit(why);
       const key = draftKey(text);
@@ -798,6 +963,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     const yieldFloor = (c: Candidate, why: string, quick = false) => {
       c.timer?.clear();
       c.wait?.clear();
+      c.gate?.clear();
       candidate = null;
       // Cancelling drops the held audio; the speaker restores its volume for the next reply.
       held = false;
@@ -823,6 +989,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         collect(f.text, f.start, f.end);
       }
       armSilence();
+      listenAfterOverlap();
     };
 
     /** A held aside becomes the start of the user's next turn. */
@@ -871,6 +1038,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       if (c.text && opensFloor(c.text)) return yieldFloor(c, 'floor-taking opener');
       c.timer?.clear();
       c.wait?.clear();
+      c.gate?.clear();
       candidate = null;
       const kind = !words(c.text).length ? 'noise' : isBackchannel(c.text) || !p.asides ? 'backchannel' : 'aside';
       if (kind !== 'aside') release();
@@ -922,6 +1090,44 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       c.check = check;
       c.timer = ctx.setTimer(classifies() || modelDecides() ? p.maxBackchannelMs : p.minSpeechMs, check, 'barge-in');
       return c;
+    };
+
+    /**
+     * The page heard the user start within the quick-yield window and stopped playback itself (the
+     * speaker is paused where it stopped). The VAD here decides: speech within `pageGateWaitMs` is
+     * the quick yield; none, and the agent plays on from where it stopped (noise, or echo the page heard).
+     */
+    const pageStopped = (msg: Msg) => {
+      gateUntil = null;
+      const f = flagsAt(typeof msg.cut === 'number' ? msg.cut : ctx.now());
+      if (!f.interruptible || !f.gate) {
+        // The page stopped an utterance that isn't subject to the quick yield (a race with disarming it).
+        ctx.log('debug', 'page stop in an utterance without the quick yield: resumed');
+        return void ctx.emit('control', { type: 'resume' });
+      }
+      const why = `the page heard the user ${Math.round((msg.cut as number) - (playingSince ?? 0))} ms after the agent started`;
+      if (state === 'speaking+user' && candidate) return yieldFloor(candidate, why, true);
+      const c = state === 'speaking' ? overlap(msg.pos as number, 'user speech (page VAD)') : null;
+      if (!c) return void ctx.emit('control', { type: 'resume' });
+      if (speaking) return yieldFloor(c, why, true);
+      // Nothing to judge until the VAD here hears it.
+      c.timer?.clear();
+      c.holdTimer?.clear();
+      c.timer = c.holdTimer = undefined;
+      held = true;
+      c.gate = ctx.setTimer(
+        p.pageGateWaitMs,
+        () => {
+          c.gate = undefined;
+          if (candidate !== c) return;
+          candidate = null;
+          decide('noise', { ms: ctx.now() - c.since, text: c.text, why: `the page heard speech, the VAD here none in ${p.pageGateWaitMs} ms` });
+          go('backchannel', 'page stop not confirmed');
+          held = false;
+          ctx.emit('control', { type: 'resume' });
+        },
+        'page-gate',
+      );
     };
 
     ctx.setState('floor', holder(state));
@@ -984,12 +1190,27 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         return;
       }
       if (port === 'playback') {
+        if (msg.type === 'playback.segment') {
+          const rid = (msg.rid as string) ?? null;
+          if (utts.rid !== rid) utts = { rid, list: [] };
+          const u = { at: msg.at as number, interruptible: msg.interruptible !== false, gate: msg.gate !== false };
+          utts.list = [...utts.list.filter((x) => x.at < u.at), u];
+          // The quick yield doesn't reach into an utterance it doesn't apply to.
+          if (rid === playingRid && gateUntil !== null && (!u.interruptible || !u.gate)) arm(u.at <= ctx.now() ? null : Math.min(gateUntil, u.at));
+          if (protectedOnset && rid === playingRid) lookAgainAt(u.at);
+          return;
+        }
         if (msg.type === 'playback.start') {
           playingSince = ctx.now();
+          playingRid = (msg.rid as string) ?? null;
+          clearProtected();
           go('playback_start', 'playback started');
+          const f = flagsAt(playingSince);
+          if (state === 'speaking' && p.bargeIn && p.pageGate && p.yieldWithinMs > 0 && f.interruptible && f.gate) arm(playingSince + p.yieldWithinMs);
           // They started talking while it was thinking: don't talk over them while their words are judged.
           if (candidate) holdWhenSustained(candidate);
         } else if (msg.type === 'playback.end') {
+          clearProtected();
           const c = candidate;
           if (!go('playback_end', 'playback ended')) return;
           held = false;
@@ -1005,6 +1226,9 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             takeAside();
             if (!c) commit('aside, after the agent finished', undefined, { aside: true });
           }
+          listenAfterOverlap();
+        } else if (msg.type === 'playback.paused' && msg.gate) {
+          pageStopped(msg);
         } else if (msg.type === 'playback.interrupted') {
           // Stopped before a word of it was heard: not a fight over the floor.
           if (countIfHeard) {
@@ -1021,12 +1245,33 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         if (msg.type === 'vad.speech_start') {
           ctx.setState('userSpeaking', true);
           speaking = true;
+          if (vadEot) {
+            const v = vadEot;
+            const gap = ((msg.at as number) - v.at) / SR_MS;
+            if (gap <= p.eotResumeGapMs) closeVadEot(`speech again after ${Math.round(gap)} ms`);
+            else {
+              ctx.emit('turn', { type: 'turn.eot_rule', event: 'resume', gapMs: Math.round(gap) });
+              v.resumed?.clear();
+              v.resumed = ctx.setTimer(p.eotResumeMs, () => vadEot === v && closeVadEot(`speech went on for ${p.eotResumeMs} ms`), 'eot-resume');
+            }
+          }
           caughtUp = false;
           eotHeld = null;
           silence?.clear();
           silence = null;
           backoff?.timer?.clear();
-          if (state === 'speaking' && p.yieldWithinMs > 0 && playingSince !== null && ctx.now() - playingSince < p.yieldWithinMs) {
+          if (candidate?.gate) {
+            // The page already stopped the agent on this speech.
+            const c = candidate;
+            yieldFloor(c, `user speech (VAD), ${Math.round(ctx.now() - c.since)} ms after the page stopped the agent`, true);
+          } else if (state === 'speaking' && p.bargeIn && !flagsAt(ctx.now()).interruptible) {
+            // The agent is saying something that must be heard to the end: let them talk over it.
+            clearProtected();
+            protectedOnset = { at: msg.at as number };
+            decide('protected', { at: msg.at as Json, why: 'the utterance playing may not be cut off' });
+            const next = (utts.rid === playingRid ? utts.list : []).find((u) => u.at > ctx.now());
+            if (next) lookAgainAt(next.at);
+          } else if (state === 'speaking' && p.yieldWithinMs > 0 && playingSince !== null && ctx.now() - playingSince < p.yieldWithinMs && flagsAt(ctx.now()).gate) {
             // Both started into the same silence: the agent backs off at once rather than fight over the floor.
             const c = overlap(msg.at as number, 'user speech (VAD)');
             if (c && candidate === c) yieldFloor(c, `user spoke ${Math.round(ctx.now() - playingSince)} ms after the agent started`, true);
@@ -1052,6 +1297,15 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         } else if (msg.type === 'vad.speech_end') {
           ctx.setState('userSpeaking', false);
           speaking = false;
+          const stop = { stop: ctx.now() - (typeof msg.silentMs === 'number' ? msg.silentMs : VAD_HANGOVER_MS), at: msg.at as number };
+          clearProtected();
+          if (vadEot?.resumed) {
+            // A short sound in the silence: the end of turn stays open, timed from the first stop.
+            vadEot.resumed.clear();
+            vadEot.resumed = undefined;
+            if (vadEot.due) vadEotDue();
+          } else if (vadRules() && state === 'listening') openVadEot(stop.stop, stop.at);
+          else overStop = state === 'listening' ? null : stop;
           // A partial from before the silence usually lacks the last words: wait for ASR to catch up.
           caughtUp = !partial;
           if (state === 'listening') {
@@ -1084,6 +1338,16 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             go('backchannel', why);
           }
         }
+        return;
+      }
+      if (msg.type === 'asr.open') {
+        // The user can be heard now: the agent opens the conversation.
+        const line = p.greeting.trim();
+        if (greeted || !line) return;
+        greeted = true;
+        decide('greet', { why: 'ASR connected' });
+        ctx.emit('turn', { type: 'turn.greet', text: line });
+        ctx.emit('text', { type: 'bc.say', id: `${ctx.id}-greet`, line, take: line, tailMs: 150, why: 'greeting' });
         return;
       }
       const text = ((msg.text as string) ?? '').trim();
@@ -1130,6 +1394,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       start() {
         // Render the back-off lines ahead, so one plays at once when needed.
         if (p.bargeIn && p.backoffAfter > 0 && yieldLines.length) ctx.emit('text', { type: 'bc.lines', lines: yieldLines.flatMap((l) => takes(l, 3)) });
+        const greeting = p.greeting.trim();
+        if (greeting) ctx.emit('text', { type: 'bc.lines', lines: [greeting] });
       },
       onInput(port, msg) {
         handle(port, msg);

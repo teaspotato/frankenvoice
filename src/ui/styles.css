@@ -205,3 +205,9 @@ button.danger-link { color: var(--danger); margin-left: auto; }
 .bubble-thinking summary { cursor: pointer; }
 .bubble-other { font: 11px var(--mono); color: var(--muted); }
 .bubble-note { font-size: 10px; color: var(--muted); margin-top: 3px; }
+
+.queue-page { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 24px 16px; text-align: center; background: var(--bg); }
+.queue-page .brand { font-weight: 700; letter-spacing: 0.02em; color: var(--muted); }
+.queue-page h1 { margin: 0; font-size: 1.5rem; }
+.queue-page p { margin: 0; max-width: 32rem; }
+.queue-page .eta b { font-size: 1.6rem; font-variant-numeric: tabular-nums; }

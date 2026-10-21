@@ -30,6 +30,37 @@ export const DEFAULT_BC_INSTRUCTIONS =
 export const BC_CONTEXT_NOTE =
   'The first line, in brackets, is not speech: it says when the agent last backchannelled. Only avoid a backchannel within about 2 s of the last one; otherwise judge from the words alone.';
 
+/**
+ * The last user turn of a generated backchannel's request starts with this, then the user's words so
+ * far: first, so it stays in llama.cpp's prompt cache (from the last request) and only the newest
+ * words need a prefill.
+ */
+export const DEFAULT_BC_PROMPT =
+  "(They're still talking. Reply with only a brief backchannel, one to three words, that fits what they just said. No question.)";
+
+/**
+ * The start of the assistant's turn for a generated backchannel: the utterance tag with its flags
+ * (not interruptible, not gated), so the model writes only the words.
+ */
+export const DEFAULT_BC_PREFILL = '[i0g0] ';
+
+/** The words Gemma may write after the prefill: 1 to `maxWords` words, then at most one . or !. */
+export function bcGrammar(maxWords: number): string {
+  const n = Math.max(1, Math.round(maxWords));
+  return `root ::= w (","? " " w){0,${n - 1}} [.!]?\nw ::= [A-Za-z'-]+\n`;
+}
+
+/** A generated backchannel cleaned up, or null when it isn't one (empty, too long, a question). */
+export function cleanBackchannel(raw: string, maxWords: number): string | null {
+  let s = raw.replace(/^\s*\[[^\]]*\]\s*/, '').split('\n')[0];
+  s = s.replace(/[*_"“”()]/g, '').trim();
+  if (!s || s.includes('?')) return null;
+  const ws = s.match(/[\p{L}\p{N}']+/gu) ?? [];
+  if (!ws.length || ws.length > maxWords) return null;
+  if (!/[.!…]$/.test(s)) s = `${s.replace(/[,;:—–-]+$/, '')}.`;
+  return s;
+}
+
 /** The state TypeSafe reads: the last backchannel (if `context`), then the user's words. */
 export function bcState(text: string, last: { line: string; agoMs: number } | null, context: boolean): string {
   if (!context) return text;
@@ -110,6 +141,14 @@ export const allLines = (l: BackchannelLines) => [...new Set([...l.continuers, .
 
 interface BackchannelParams {
   source: string;
+  say: string;
+  prompt: string;
+  prefill: string;
+  speculate: boolean;
+  maxWords: number;
+  temperature: number;
+  waitMs: number;
+  fallback: string;
   decide: string;
   options: string;
   instructions: string;
@@ -132,27 +171,39 @@ interface BackchannelParams {
 const words = (s: string) => s.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? [];
 
 /**
- * Backchannels: short canned lines ("mm-hmm", "oh wow") the agent says while
+ * Backchannels: short lines ("mm-hmm", "oh no") the agent says while
  * the user holds the floor, to show it is listening. Something proposes a
  * moment (the turn model's backchannel score, or a pause in the user's speech),
  * and rules gate it: the user has the floor and has talked for a while, isn't
  * about to hand over (the VAD heard them recently, ASR hasn't endpointed,
  * end-of-turn score low, no draft reply out), and the last
- * backchannel was long enough ago. The line is rendered ahead by TTS and played
- * as a cue that doesn't start a reply, so turn-taking keeps listening.
+ * backchannel was long enough ago.
+ *
+ * What to say: generated (the default), Gemma writes it at that moment (`bc.ask` to the LLM stage,
+ * which sends the conversation so far plus the user's words with `prompt` as their turn, on its own
+ * llama.cpp slot, and never keeps it), while TTS opens a socket for it (`bc.prep`); `bc.say` with
+ * `gen` speaks it there. An answer that isn't a backchannel, or none within `waitMs`, says a
+ * canned `fallback` line instead. canned: lines rendered ahead by TTS.
+ * Either way it plays as a cue that doesn't start a reply: turn-taking keeps listening, and nothing
+ * the user does stops it once it sounds. A generated line whose audio hasn't started when the
+ * user's turn ends is dropped (`bc.drop`).
  */
 export const backchannelNode: NodeDef<BackchannelParams> = {
   type: 'backchannel',
   title: 'Backchannels',
   category: 'control',
-  description: 'Says "mm-hmm"-style lines while the user keeps talking: when, from the turn model or pauses; what, from canned lines.',
+  description: 'Says "mm-hmm"-style lines while the user keeps talking: when, from the turn model or pauses; what, written by the LLM there and then, or canned lines.',
   inputs: [
     { name: 'vad', type: 'vad' },
     { name: 'scores', type: 'turnscores' },
     { name: 'turn', type: 'turn' },
     { name: 'transcript', type: 'transcript' },
+    { name: 'llm', type: 'text', description: 'llm.bc: the backchannel the LLM wrote' },
   ],
-  outputs: [{ name: 'text', type: 'text', description: 'bc.lines (render these ahead) and bc.say (play one now) for TTS' }],
+  outputs: [
+    { name: 'text', type: 'text', description: 'bc.lines (render these ahead), bc.prep (open a socket), bc.say (play one now) and bc.drop for TTS' },
+    { name: 'ask', type: 'backchannel', description: 'bc.ask / bc.drop: have the LLM write a backchannel' },
+  ],
   params: [
     {
       key: 'source',
@@ -162,6 +213,58 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       default: 'pause',
       description:
         'turn model: when its backchannel score fires (needs a turn model with a backchannel head). pause: when the user pauses mid-turn and the end-of-turn score (if any) is low.',
+    },
+    {
+      key: 'say',
+      label: 'Say',
+      type: 'select',
+      options: ['generated', 'canned'],
+      default: 'generated',
+      description:
+        "generated: the LLM writes the line when it's time, from the conversation and the user's words so far, and TTS speaks it at once. canned: lines rendered ahead.",
+    },
+    {
+      key: 'prompt',
+      label: 'Instruction',
+      type: 'text',
+      default: DEFAULT_BC_PROMPT,
+      when: { say: ['generated'] },
+      description: "Appended to the user's words so far, as the request's last user turn (the system prompt and history stay the reply's, so the cached prefix is reused).",
+    },
+    {
+      key: 'prefill',
+      label: 'Prefill',
+      type: 'string',
+      default: DEFAULT_BC_PREFILL,
+      when: { say: ['generated'] },
+      description: "The start of the LLM's answer, written for it: the utterance tag (not interruptible, not gated), so it writes only the words.",
+    },
+    {
+      key: 'speculate',
+      label: 'Write ahead',
+      type: 'boolean',
+      default: true,
+      when: { say: ['generated'] },
+      description:
+        "While the user talks, have the LLM write a line from their words so far (one at a time, at most every 300 ms, on the backchannel slot). When it's time, a line written from the same words (but for the last two) is said at once, without waiting for the LLM.",
+    },
+    { key: 'maxWords', label: 'Max words', type: 'number', default: 4, when: { say: ['generated'] }, description: 'A grammar caps the line at this many words (and no question).' },
+    { key: 'temperature', label: 'Temperature', type: 'number', default: 0.3, when: { say: ['generated'] } },
+    {
+      key: 'waitMs',
+      label: 'Wait for the LLM (ms)',
+      type: 'number',
+      default: 500,
+      when: { say: ['generated'] },
+      description: 'Say a fallback line instead when the LLM has not written one by then.',
+    },
+    {
+      key: 'fallback',
+      label: 'Fallback lines',
+      type: 'string',
+      default: 'Mm-hmm. | Yeah. | Right.',
+      when: { say: ['generated'] },
+      description: "Canned lines, taken in turn, when the LLM's line is late or isn't a backchannel.",
     },
     {
       key: 'decide',
@@ -204,8 +307,8 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       when: { decide: ['rules'] },
       description: "The VAD has heard the user within this long: most backchannels go over the user's speech, and a long silence means they may be done, whatever the turn model says.",
     },
-    { key: 'lines', label: 'Lines', type: 'text', default: DEFAULT_BACKCHANNEL_LINES, when: { decide: ['rules'] }, description: 'Bare lines are rotated; "line = example | …" is picked by meaning from the user\'s recent words.' },
-    { key: 'minScore', label: 'Min similarity', type: 'number', default: 0.45, when: { decide: ['rules'] }, description: 'A line with examples is said only when the recent words are at least this close; else a continuer.' },
+    { key: 'lines', label: 'Lines', type: 'text', default: DEFAULT_BACKCHANNEL_LINES, when: { decide: ['rules'], say: ['canned'] }, description: 'Bare lines are rotated; "line = example | …" is picked by meaning from the user\'s recent words.' },
+    { key: 'minScore', label: 'Min similarity', type: 'number', default: 0.45, when: { decide: ['rules'], say: ['canned'] }, description: 'A line with examples is said only when the recent words are at least this close; else a continuer.' },
     {
       key: 'takes',
       label: 'Takes per line',
@@ -219,7 +322,7 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       label: 'Encoder',
       type: 'string',
       default: 'Xenova/all-MiniLM-L6-v2',
-      when: { decide: ['rules'] },
+      when: { decide: ['rules'], say: ['canned'] },
       description: 'Sentence encoder for picking lines. Runs in the browser.',
     },
   ],
@@ -231,7 +334,14 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
   create(ctx) {
     const p = ctx.params;
     const typesafe = p.decide === 'typesafe';
-    const lines = typesafe ? { continuers: [], examples: [] } : parseBackchannelLines(String(p.lines));
+    const gen = p.say === 'generated';
+    const lines = typesafe || gen ? { continuers: [], examples: [] } : parseBackchannelLines(String(p.lines));
+    const fallbacks = gen ? String(p.fallback).split('|').map((l) => l.trim()).filter(Boolean) : [];
+    let fallbackNo = 0;
+    /** A line the LLM is writing: its id, the turn it is for, and the wait for it. */
+    let pending: { id: string; why: string; data: JsonObject; t0: number; prevBc: number; timer: TimerHandle } | undefined;
+    /** Generated lines said this turn: TTS drops one whose audio hasn't started when the turn ends. */
+    const said = new Set<string>();
     const opts = typesafe ? parseChoiceOptions(String(p.options)) : [];
     const nextLine = rotator();
     let exampleVecs: number[][] | undefined;
@@ -297,14 +407,13 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       return null;
     };
 
-    const say = (line: string, why: string, extra: JsonObject = {}) => {
-      const id = `${ctx.id}-bc${n++}`;
+    const say = (line: string, why: string, extra: JsonObject = {}, id = `${ctx.id}-bc${n++}`) => {
       lastBc = ctx.now();
       // A take other than the one this line used last, drawn from the id so a replay draws the same.
       const all = takes(line, p.takes);
       const prev = lastTake.get(line);
       const pool = all.length > 1 ? all.filter((t) => t !== prev) : all;
-      const take = pool[Math.floor(seededRandom(id)() * pool.length)];
+      const take = extra.gen ? line : pool[Math.floor(seededRandom(id)() * pool.length)];
       lastTake.set(line, take);
       lastLine = line;
       ctx.emit('text', { type: 'bc.say', id, line, take, tailMs: p.tailMs, why, ...extra });
@@ -330,6 +439,7 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
       lastBc = now;
       const turn = turnNo;
       if (typesafe) return decide(why, data, prevBc, turn);
+      if (gen) return generate(why, data, prevBc);
       const recent = words(`${finals} ${partial}`).slice(-12).join(' ');
       if (!recent || !exampleVecs || !lines.examples.length) {
         const c = nextContinuer();
@@ -372,11 +482,126 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
           lastBc = prevBc;
           return void ctx.emit('text', { type: 'bc.skip', why, reason: no ?? 'nothing picked', ...data, ...pickData });
         }
-        say(nextLine(got.option), why, { ...data, ...pickData });
+        if (gen) generate(why, { ...data, ...pickData }, prevBc);
+        else say(nextLine(got.option), why, { ...data, ...pickData });
       });
     };
 
+    /** The user's words so far, for the LLM. */
+    const userWords = () => `${finals} ${partial}`.trim().split(/\s+/).slice(-80).join(' ');
+    const maxWords = () => Math.max(1, Math.round(Number(p.maxWords) || 3));
+    const askFor = (id: string, text: string, draft: boolean) =>
+      ctx.emit('ask', {
+        type: 'bc.ask',
+        id,
+        text,
+        prompt: String(p.prompt),
+        prefill: String(p.prefill),
+        // A word is a token or two, and the grammar ends it.
+        body: { max_tokens: maxWords() * 3 + 3, temperature: Number(p.temperature), grammar: bcGrammar(maxWords()) },
+        ...(draft ? { draft: true } : {}),
+      });
+    /**
+     * A line written ahead from the words so far (`speculate`): its words, and the line once written
+     * (null: not a backchannel). At the moment, it is said at once if the words haven't moved on.
+     */
+    let draft: { id: string; text: string; inFlight: boolean; t0: number; line?: string | null; raw?: string; ms?: number } | undefined;
+    let draftNo = 0;
+    /** The draft was written from (nearly) these words: at most 2 words fewer, the rest the same but for the last 2. */
+    const fits = (d: { text: string }, text: string) => {
+      const a = words(d.text);
+      const b = words(text);
+      const k = Math.max(0, a.length - 2);
+      return b.length - a.length <= 2 && b.length >= a.length - 1 && a.slice(0, k).join(' ') === b.slice(0, k).join(' ');
+    };
+    /** Write a line ahead from the words so far: one at a time, at most every 300 ms. */
+    const speculate = () => {
+      if (!gen || !p.speculate || pending || floor !== 'listening' || turnStart === null) return;
+      if (draft && (draft.inFlight || ctx.now() - draft.t0 < 300)) return;
+      const text = userWords();
+      if (!text || text === draft?.text) return;
+      draft = { id: `${ctx.id}-d${draftNo++}`, text, inFlight: true, t0: ctx.now() };
+      askFor(draft.id, text, true);
+    };
+    const drafted = (msg: JsonObject) => {
+      if (msg.id !== draft?.id) return;
+      draft.inFlight = false;
+      draft.raw = String(msg.text ?? '');
+      draft.ms = Math.round(ctx.now() - draft.t0);
+      draft.line = msg.status === 'done' ? cleanBackchannel(draft.raw, maxWords()) : null;
+      // The user talked on meanwhile: write again from where they are.
+      speculate();
+    };
+
+    /** Have the LLM write the line now, while TTS opens a socket for it. */
+    const generate = (why: string, data: JsonObject, prevBc: number) => {
+      const text = userWords();
+      if (!text) {
+        lastBc = prevBc;
+        return void ctx.emit('text', { type: 'bc.skip', why, reason: 'no words yet', ...data });
+      }
+      dropPending('asked again');
+      const d = draft;
+      draft = undefined;
+      if (d && fits(d, text) && !d.inFlight && d.line) {
+        // Written ahead from these words: say it now.
+        const id = `${ctx.id}-bc${n++}`;
+        ctx.emit('text', { type: 'bc.prep', id });
+        said.add(id);
+        return say(d.line, why, { ...data, gen: true, raw: d.raw ?? '', ms: 0, draft: { text: d.text, ms: d.ms ?? null }, askedAt: ctx.now() }, id);
+      }
+      // Being written from these words: wait for it. Else write it now.
+      const ahead = d && fits(d, text) && d.inFlight;
+      const id = ahead ? d.id : `${ctx.id}-bc${n++}`;
+      ctx.emit('text', { type: 'bc.prep', id });
+      if (!ahead) askFor(id, text, false);
+      const timer = ctx.setTimer(Math.max(0, Number(p.waitMs)), () => fallback(`the LLM took over ${p.waitMs} ms`), 'bc-wait');
+      pending = { id, why, data, t0: ctx.now(), prevBc, timer };
+    };
+    /** Stop waiting for the LLM's line: the request and the socket are closed. */
+    const dropPending = (why: string) => {
+      const q = pending;
+      if (!q) return;
+      pending = undefined;
+      q.timer.clear();
+      ctx.emit('ask', { type: 'bc.drop', id: q.id, why });
+      ctx.emit('text', { type: 'bc.drop', id: q.id, why });
+      return q;
+    };
+    /** A canned line in place of the LLM's. */
+    const fallback = (reason: string, extra: JsonObject = {}) => {
+      const q = dropPending(reason);
+      if (!q) return;
+      const line = fallbacks.length ? fallbacks[fallbackNo++ % fallbacks.length] : null;
+      if (!line) return void ctx.emit('text', { type: 'bc.skip', why: q.why, reason, ...q.data, ...extra });
+      say(line, q.why, { ...q.data, ...extra, fallback: reason });
+    };
+    /** The LLM's line: said at once on the socket TTS opened, unless it isn't a backchannel. */
+    const written = (msg: JsonObject) => {
+      const q = pending;
+      if (!q || msg.id !== q.id) return;
+      const raw = String(msg.text ?? '');
+      const ms = Math.round(ctx.now() - q.t0);
+      const line = msg.status === 'done' ? cleanBackchannel(raw, maxWords()) : null;
+      if (!line) return fallback(msg.status === 'done' ? `not a backchannel: "${raw}"` : `the LLM failed (${String(msg.status)})`, { raw, ms });
+      pending = undefined;
+      q.timer.clear();
+      said.add(q.id);
+      say(line, q.why, { ...q.data, gen: true, raw, ms, askedAt: q.t0 }, q.id);
+    };
+
     const endTurn = () => {
+      if (pending) {
+        const q = pending;
+        dropPending('the turn ended');
+        lastBc = q.prevBc;
+        ctx.emit('text', { type: 'bc.skip', why: q.why, reason: 'moment passed: the turn ended', ...q.data });
+      }
+      // Said, but not heard yet: too late now.
+      for (const id of said) ctx.emit('text', { type: 'bc.drop', id, why: 'the turn ended', unheard: true });
+      said.clear();
+      if (draft?.inFlight) ctx.emit('ask', { type: 'bc.drop', id: draft.id, why: 'the turn ended' });
+      draft = undefined;
       turnNo++;
       turnStart = null;
       silentSince = null;
@@ -390,7 +615,7 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
 
     return {
       start() {
-        const all = typesafe ? optionLines(opts) : allLines(lines);
+        const all = gen ? fallbacks : typesafe ? optionLines(opts) : allLines(lines);
         if (!all.length) return;
         ctx.emit('text', { type: 'bc.lines', lines: all.flatMap((l) => takes(l, p.takes)) });
         if (lines.examples.length)
@@ -442,16 +667,28 @@ export const backchannelNode: NodeDef<BackchannelParams> = {
           else if (msg.type === 'turnmodel.bc' && p.source === 'turn model') propose('turn model', { p: msg.p as Json });
           return;
         }
+        if (port === 'llm') {
+          if (msg.type === 'llm.bc') {
+            if (msg.id === draft?.id) drafted(msg as JsonObject);
+            else written(msg as JsonObject);
+          }
+          return;
+        }
         if (port === 'transcript' && turnStart !== null) {
           if (msg.type === 'asr.final') {
             finals = `${finals} ${String(msg.text ?? '')}`.trim();
             partial = '';
             if (msg.speechFinal && silentSince !== null) asrDone = true;
-          } else if (msg.type === 'asr.partial') partial = String(msg.text ?? '');
+            speculate();
+          } else if (msg.type === 'asr.partial') {
+            partial = String(msg.text ?? '');
+            speculate();
+          }
         }
       },
       stop() {
         pause?.clear();
+        pending?.timer.clear();
       },
     };
   },

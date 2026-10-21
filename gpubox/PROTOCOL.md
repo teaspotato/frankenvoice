@@ -9,6 +9,11 @@ messages are text frames; audio is binary frames.
 
 Returns `{"ok": true, "asr": "<model>", "tts": "<model>"}`.
 
+## `GET /v1/tts/config`
+
+What decides a TTS render besides its text: `{"model", "n_q", "temp", "voice", "cfg", "sample_rate"}`
+(`voice` and `cfg` are the defaults a connection gets without them). Clients that cache renders key them on this.
+
 ## ASR: `WS /v1/asr`
 
 Query: `language` (`English`, default), `sample_rate` (16000), `context` (optional
@@ -37,7 +42,16 @@ Server to client (times are seconds from the first sample received on this conne
 
 ## TTS: `WS /v1/tts`
 
-One connection per reply. Query: `voice` (Kyutai voice path, optional), `cfg` (optional).
+One connection per reply. Query: `voice` (Kyutai voice path, optional), `cfg` (optional),
+`priority` (optional: `background` for audio rendered ahead, such as canned lines).
+
+The box renders up to `KYUTAI_MAX_BATCH` (default 1) utterances at once, stepping them together as
+one batch, 80 ms of audio per utterance per step; each connection's messages are exactly as if it
+were alone (only the step takes longer as the batch grows). Connections beyond that wait for a free
+place, in order. A `background` connection only takes a place no other connection is waiting for:
+when a connection finds every place taken and one of them is a background render, that render stops
+at its next model step and starts over once a place is free again. Its messages and audio are held
+until it is done, so the client sees one uninterrupted render, only later.
 
 Client to server:
 - `{"type": "Speak", "text": "..."}`: more text of the reply, as it streams.
@@ -52,6 +66,9 @@ Server to client:
 - binary: 16-bit little-endian mono PCM at 24 kHz, in order.
 - `{"type": "Words", "words": [{"word", "start", "end"}]}`: word timings in seconds
   from this connection's first audio sample, sent as words are spoken.
+- `{"type": "Consumed", "words": n, "queued": q}`: the model has read `n` words, and `q` whole words it
+  has been sent wait to be read. It reads a word about a second before it is heard; `q` is the text it
+  still has to go on (a client pacing its text source keeps it above the lookahead). Sent when either changes.
 - `{"type": "Flushed"}`, `{"type": "Done", "stats": {...}}`, `{"type": "Error", "message": "..."}`.
 
 The model needs the current word plus 2 words of lookahead, so it waits until 3 words are

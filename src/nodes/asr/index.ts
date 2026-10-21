@@ -80,6 +80,7 @@ export const asrNode: NodeDef = {
                 switch (ev.type) {
                   case 'open':
                     ctx.setState('status', 'streaming');
+                    ctx.emit('transcript', { type: 'asr.open', track });
                     break;
                   case 'meta':
                     ctx.setState(ev.key, ev.value);

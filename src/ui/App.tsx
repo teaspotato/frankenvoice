@@ -83,6 +83,22 @@ function describeComparison(s: Session): string {
 export function App() {
   const [config, setConfig] = useState<PipelineConfig>(loadConfig);
   const [selected, setSelected] = useState<StageId | null>(null);
+  /**
+   * Who this page is to the server: the host (settings, recordings, any pipeline) or a public demo visitor, who
+   * runs the host's pipeline and sees it read-only.
+   */
+  const [me, setMe] = useState<{ host: boolean; public: boolean }>({ host: true, public: false });
+  useEffect(() => {
+    fetch('/api/me')
+      .then((r) => (r.ok ? (r.json() as Promise<{ host: boolean; public: boolean; graph?: GraphSpec }>) : null))
+      .then((m) => {
+        if (!m) return;
+        setMe({ host: m.host, public: m.public });
+        if (!m.host && m.graph) setConfig(configFromGraph(m.graph));
+      })
+      .catch(() => {});
+  }, []);
+  const host = me.host;
   // The turn model is big: the server downloads and compiles it as soon as it is configured, not when a session starts.
   const turnModelReq =
     stageType(config, 'turnmodel') === 'turnmodel.ssl'
@@ -92,7 +108,7 @@ export function App() {
   const [turnModel, setTurnModel] = useState<TurnModelLoad | undefined>();
   useEffect(() => {
     setTurnModel(undefined);
-    if (!turnModelReq) return;
+    if (!turnModelReq || !host) return;
     let done = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = () =>
@@ -110,7 +126,7 @@ export function App() {
       clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [turnModelKey]);
+  }, [turnModelKey, host]);
   const [running, setRunning] = useState<'live' | 'replay' | null>(null);
   /** Where the running run runs: the server (live sessions, replays with live channels) or the page (other replays). */
   const [runWhere, setRunWhere] = useState<'server' | 'page'>('page');
@@ -191,6 +207,21 @@ export function App() {
   const nowRef = useRef<() => number>(() => 0);
   const simRef = useRef<SimScheduler | null>(null);
   const clientRef = useRef<LiveClient | null>(null);
+  /** Who else is on the server (from its live socket, opened at load). */
+  const [users, setUsers] = useState<{ pages: number; sessions: number; max: number; queued: number } | null>(null);
+  /** This page's place in the queue for the box (0: not waiting). */
+  const [queuePos, setQueuePos] = useState(0);
+  /** When this page's wait ends at the latest, and when its live session hits the time limit (Date.now() ms). */
+  const [queueEta, setQueueEta] = useState<number | null>(null);
+  const [endsAt, setEndsAt] = useState<number | null>(null);
+  /** Ticks each second while a countdown shows. */
+  const [clockNow, setClockNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (queueEta === null && endsAt === null) return;
+    const t = setInterval(() => setClockNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [queueEta, endsAt]);
+  const reconnectRef = useRef<() => void>(() => {});
   /** The server run in progress: the session it replays, whether its result is kept, where it stopped. */
   const serverRun = useRef<{ origin?: Session; keep: boolean; stoppedAt?: number } | null>(null);
 
@@ -216,11 +247,12 @@ export function App() {
       .then((r) => r.json())
       .then(setHealth)
       .catch(() => setHealth(null));
+    if (!host) return setServerSessions([]);
     fetch('/api/sessions')
       .then((r) => (r.ok ? r.json() : []))
       .then((list: { id: string }[]) => setServerSessions(list.map((s) => s.id)))
       .catch(() => {});
-  }, []);
+  }, [host]);
   useEffect(refreshProxy, [refreshProxy]);
 
   // ---- running ----------------------------------------------------------------
@@ -294,6 +326,7 @@ export function App() {
   handlers.current = {
     session(traj) {
       const run = serverRun.current;
+      if (!host && traj.meta.mode === 'live') setConfig(configFromGraph(traj.meta.graph));
       attach(traj, () => clientRef.current?.now() ?? 0);
       if (run?.keep !== false) setCurrent({ traj });
       setPlayingBack(run?.keep === false);
@@ -305,6 +338,7 @@ export function App() {
       for (const [node, state] of Object.entries(states)) pushState(node, state);
     },
     ended(info) {
+      setEndsAt(null);
       if (serverRun.current) serverRun.current.stoppedAt = info.stoppedAt;
     },
     bundle(bytes) {
@@ -321,6 +355,7 @@ export function App() {
       finishSession(traj, run?.origin, run?.keep ?? true, run?.stoppedAt);
     },
     saved(id, path) {
+      if (!host) return;
       setSessions((ss) => {
         const s = ss.find((x) => x.traj.meta.id === id && x.traj.meta.mode === 'live');
         if (s) s.saved = path;
@@ -340,7 +375,22 @@ export function App() {
       setServerSessions((l) => l.map((x) => (x === from ? to : x)));
     },
     notice: (text) => setNotice(text),
+    users: (u) => setUsers(u),
+    limit: (leftMs) => setEndsAt(Date.now() + leftMs),
+    queue(position, started, waitMs) {
+      setQueuePos(position);
+      setQueueEta(position && waitMs !== null ? Date.now() + waitMs : null);
+      if (position) setNotice(`The GPU box is busy: you're ${position === 1 ? 'next' : `number ${position}`} in line. Your session starts by itself.`);
+      else if (started) setNotice('');
+      // Left the queue: nothing will start.
+      else serverRun.current = null;
+    },
     closed(reason) {
+      setUsers(null);
+      setQueuePos(0);
+      setQueueEta(null);
+      setEndsAt(null);
+      reconnectRef.current();
       if (!serverRun.current) return;
       serverRun.current = null;
       setRunning(null);
@@ -360,9 +410,34 @@ export function App() {
       saved: (id, p) => h.current.saved(id, p),
       renamed: (f, t, p) => h.current.renamed(f, t, p),
       notice: (t) => h.current.notice(t),
+      users: (u) => h.current.users(u),
+      queue: (p, s, w) => h.current.queue(p, s, w),
+      limit: (l) => h.current.limit(l),
       closed: (r) => h.current.closed(r),
     }));
   };
+
+  // Connect at load to show who else is on the server; after losing it, try again now and then.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let alive = true;
+    const tryConnect = () =>
+      client()
+        .connect()
+        .catch(() => {
+          if (alive) timer = setTimeout(tryConnect, 5000);
+        });
+    reconnectRef.current = () => {
+      clearTimeout(timer);
+      if (alive) timer = setTimeout(tryConnect, 5000);
+    };
+    tryConnect();
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /** Start a run on the server; `send` asks for it once connected. */
   const runOnServer = async (run: { origin?: Session; keep: boolean }, send: (c: LiveClient) => void) => {
@@ -648,6 +723,34 @@ export function App() {
   const stageOf = (lane: string | null): StageId | null =>
     lane === null ? null : STAGES.some((s) => s.id === lane) ? (lane as StageId) : 'tts';
 
+  const mmss = (until: number) => {
+    const s = Math.max(0, Math.round((until - clockNow) / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  };
+
+  // Waiting for the box: only the queue shows; the session starts by itself when its turn comes.
+  if (queuePos > 0 && !running)
+    return (
+      <div className="queue-page">
+        <span className="brand">frankenvoice</span>
+        <h1>The GPU box is busy</h1>
+        <p>
+          You're {queuePos === 1 ? 'next' : `number ${queuePos}`} in line. Your session starts by itself; keep this tab open.
+        </p>
+        {queueEta !== null && (
+          <p className="eta">
+            starts in at most <b>{mmss(queueEta)}</b>
+          </p>
+        )}
+        {users && (
+          <p className="muted">
+            {users.pages} user{users.pages === 1 ? '' : 's'} connected · {users.sessions}/{users.max} live · {users.queued} waiting
+          </p>
+        )}
+        <button onClick={() => clientRef.current?.stop()}>✕ Leave queue</button>
+      </div>
+    );
+
   return (
     <div
       className={`app${layout.logOpen ? '' : ' log-collapsed'}${layout.sideOpen ? '' : ' side-collapsed'}`}
@@ -655,7 +758,11 @@ export function App() {
     >
       <header className="toolbar">
         <span className="brand">frankenvoice</span>
-        {!running ? (
+        {queuePos > 0 && !running ? (
+          <button onClick={() => clientRef.current?.stop()} title="Your session starts by itself when the one ahead ends">
+            ✕ Leave queue ({queuePos === 1 ? 'next' : `${queuePos - 1} ahead`})
+          </button>
+        ) : !running ? (
           <button className="primary" onClick={runLive}>
             ● Run live
           </button>
@@ -663,6 +770,11 @@ export function App() {
           <button className="danger" onClick={stop}>
             ■ Stop {running}
           </button>
+        )}
+        {running === 'live' && endsAt !== null && (
+          <span className={endsAt - clockNow < 30_000 ? 'warn' : 'muted'} title="Live sessions stop (and are saved) at the time limit, so others in line get their turn">
+            {mmss(endsAt)} left
+          </span>
         )}
         <button
           onClick={() => download('frankenvoice-pipeline.json', JSON.stringify({ format: CONFIG_FORMAT, formatVersion: CONFIG_FORMAT_VERSION, stages: config }, null, 2), 'application/json')}
@@ -676,10 +788,18 @@ export function App() {
         <button disabled={!!running || !current} onClick={newSession} title="Clear the dashboard; past sessions stay in the list">
           New session
         </button>
-        <button disabled={!!running} onClick={() => confirm('Reset every stage to its default settings?') && setConfig(defaultConfig())}>Reset config</button>
+        {host && (
+          <button disabled={!!running} onClick={() => confirm('Reset every stage to its default settings?') && setConfig(defaultConfig())}>
+            Reset config
+          </button>
+        )}
         <span className="spacer" />
         {health === null ? (
           <span className="warn">server not reachable: run `pnpm dev`</span>
+        ) : !host ? (
+          <span className="muted" title="Conversations are recorded for research">
+            demo · conversations are recorded
+          </span>
         ) : missingKeys.length ? (
           <button className="link warn" onClick={() => setShowSettings(true)}>
             needs keys: {missingKeys.join(', ')}
@@ -687,7 +807,15 @@ export function App() {
         ) : (
           <span className="ok">server ok</span>
         )}
-        <button onClick={() => setShowSettings(true)}>Settings</button>
+        {users && (
+          <span
+            className={users.sessions >= users.max ? 'warn' : 'muted'}
+            title={`${users.pages} page${users.pages === 1 ? '' : 's'} connected; ${users.sessions} of ${users.max} sessions running on the GPU box; ${users.queued} waiting`}
+          >
+            {users.pages} user{users.pages === 1 ? '' : 's'} · {users.sessions}/{users.max} live{users.queued ? ` · ${users.queued} waiting` : ''}
+          </span>
+        )}
+        {host && <button onClick={() => setShowSettings(true)}>Settings</button>}
         <button
           onClick={() => setLayout({ ...layout, sideOpen: !layout.sideOpen })}
           title={layout.sideOpen ? 'Hide the side panel' : 'Show the side panel (stage settings, sessions)'}
@@ -695,7 +823,7 @@ export function App() {
           {layout.sideOpen ? 'Hide panel ⇥' : '⇤ Show panel'}
         </button>
       </header>
-      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} onSaved={refreshProxy} />}
+      {showSettings && host && <SettingsPanel onClose={() => setShowSettings(false)} onSaved={refreshProxy} />}
 
       <section className="diagram">
         <Splitter layout={layout} onChange={setLayout} field="diagram" axis="y" sign={1} max={() => window.innerHeight - 260} />
@@ -725,19 +853,27 @@ export function App() {
       <aside className="inspector">
         {picked && current && <SpanDetails trajectory={current.traj} seqs={picked} onClose={() => setPicked(null)} />}
         {selected ? (
-          <StagePanel config={config} stage={selected} state={stateTypes[selected] === stageType(config, selected) ? nodeStates[selected] : undefined} disabled={!!running} onChange={setConfig} />
+          <StagePanel config={config} stage={selected} state={stateTypes[selected] === stageType(config, selected) ? nodeStates[selected] : undefined} disabled={!!running || !host} onChange={setConfig} />
         ) : (
-          <p className="muted">Click a stage in the diagram or a lane in the dashboard to configure it. The pipeline's wiring is defined in code (src/pipeline.ts).</p>
+          <p className="muted">
+            {host
+              ? "Click a stage in the diagram or a lane in the dashboard to configure it. The pipeline's wiring is defined in code (src/pipeline.ts)."
+              : 'Click a stage in the diagram or a lane in the dashboard to see its settings and what it is doing.'}
+          </p>
         )}
 
         <h3>Sessions</h3>
-        <label className="autosave" title="The server saves each live session to its sessions folder when it stops (set when a session starts)">
-          <input type="checkbox" checked={autosave} onChange={(e) => setAutosave(e.target.checked)} /> autosave live sessions
-        </label>
-        <label className="autosave" title="When a live session stops, the server asks this model on the LLM endpoint for a short title and renames the saved session to it">
-          <input type="checkbox" checked={titleOn} onChange={(e) => setTitleOn(e.target.checked)} /> name sessions with{' '}
-          <input className="title-model" value={autoTitle} disabled={!titleOn} onChange={(e) => setAutoTitle(e.target.value)} />
-        </label>
+        {host && (
+          <>
+            <label className="autosave" title="The server saves each live session to its sessions folder when it stops (set when a session starts)">
+              <input type="checkbox" checked={autosave} onChange={(e) => setAutosave(e.target.checked)} /> autosave live sessions
+            </label>
+            <label className="autosave" title="When a live session stops, the server asks this model on the LLM endpoint for a short title and renames the saved session to it">
+              <input type="checkbox" checked={titleOn} onChange={(e) => setTitleOn(e.target.checked)} /> name sessions with{' '}
+              <input className="title-model" value={autoTitle} disabled={!titleOn} onChange={(e) => setAutoTitle(e.target.value)} />
+            </label>
+          </>
+        )}
         <div className="replay-opts">
           <label>
             <input type="checkbox" checked={replayOpts.realtime} onChange={(e) => setReplayOpts({ ...replayOpts, realtime: e.target.checked })} /> real time
@@ -753,7 +889,7 @@ export function App() {
             />{' '}
             replay with current config
           </label>
-          <label title="Channels served live by the server's drivers instead of the recording; such a replay runs on the server, in real time">
+          <label hidden={!host} title="Channels served live by the server's drivers instead of the recording; such a replay runs on the server, in real time">
             live channels{' '}
             <input
               placeholder="e.g. openai,gpubox-tts"
@@ -784,13 +920,13 @@ export function App() {
                 <button disabled={!!running} onClick={() => replay(s)}>
                   Replay
                 </button>
-                {!s.saved && s.traj.meta.mode === 'live' && (
+                {host && !s.saved && s.traj.meta.mode === 'live' && (
                   <button onClick={() => saveSession(s)} title="Save to the server's sessions folder">
                     Save
                   </button>
                 )}
                 <button onClick={() => download(`${s.traj.meta.id}.fvs`, encodeBundle(s.traj) as BlobPart, 'application/zip')}>Export</button>
-                <button disabled={!!running} onClick={() => setConfig(configFromGraph(s.traj.meta.graph))} title="Set every stage to what this session ran with">
+                <button hidden={!host} disabled={!!running} onClick={() => setConfig(configFromGraph(s.traj.meta.graph))} title="Set every stage to what this session ran with">
                   Use its config
                 </button>
                 <button className="danger-link" disabled={!!running && current === s} onClick={() => deleteSession(s.traj.meta.id, s)}>

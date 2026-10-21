@@ -1,5 +1,6 @@
 // FireRedVAD streaming VAD (FireRedTeam/FireRedVAD, Stream-VAD, Apache-2.0): Kaldi fbank features
-// and the causal DFSMN model on onnxruntime-node. No DOM imports, so tests run the same code the server driver does.
+// and the causal DFSMN model on onnxruntime (node in the server, web in the page's playback gate). No DOM
+// imports, so tests run the same code the server driver does.
 //
 //   const vad = new FireRedStream(ort, session);
 //   for each chunk of 16 kHz float samples: const probs = await vad.push(chunk)  // one per 10 ms frame
@@ -130,7 +131,9 @@ export function applyCmvn(feat: Float32Array): Float32Array {
   return feat;
 }
 
-type OrtModule = typeof Ort;
+/** What it needs of onnxruntime: onnxruntime-node and onnxruntime-web both fit. */
+type OrtModule = Pick<typeof Ort, 'Tensor'>;
+type Session = Pick<Ort.InferenceSession, 'run'>;
 
 /** Streaming FireRedVAD on an onnxruntime session of stream_vad.onnx: audio in, a speech probability per 10 ms frame out. */
 export class FireRedStream {
@@ -139,7 +142,7 @@ export class FireRedStream {
 
   constructor(
     private ort: OrtModule,
-    private session: Ort.InferenceSession,
+    private session: Session,
   ) {
     this.cache = this.zeroCache();
   }

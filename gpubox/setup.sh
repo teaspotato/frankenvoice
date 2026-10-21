@@ -39,7 +39,8 @@ ASR_PORT=8101; TTS_PORT=8102; LLM_PORT=8103; GW_PORT=8000; UI_PORT=8787
 NODE_VERSION=v22.22.0
 FV_APP=${FV_APP:-$ROOT/frankenvoice.tar.gz}
 APP=$ROOT/frankenvoice
-ASR_MEM=${ASR_MEM:-0.15}
+ASR_MEM=${ASR_MEM:-0.15}                           # of the whole GPU, counting what other processes hold: restarting asr alone
+                                                   # after the others are up needs ~0.46 for the same 4.6 GB
 LLAMA_CPP=b11753                                   # llama.cpp release (prebuilt CUDA binaries)
 LLM_REPO=google/gemma-4-12B-it-qat-q4_0-gguf       # official QAT Q4_0 GGUF, with the audio/vision projector
 LLM_FILE=gemma-4-12b-it-qat-q4_0.gguf
@@ -48,6 +49,7 @@ LLM_MTP_REPO=ggml-org/gemma-4-12B-it-GGUF          # MTP draft head for speculat
 LLM_MTP_FILE=mtp-gemma-4-12B-it-Q4_0.gguf
 LLM_NAME=gemma-4-12b-it
 CUDA_MPS=${CUDA_MPS:-1}                            # CUDA MPS: the GPU services' kernels run concurrently instead of time-sliced
+ASR_MPS_PRIO=${ASR_MPS_PRIO:-1}                    # same for ASR: its partials re-decode whole turns and made Kyutai steps spike (issue #23)
 LLM_MPS_PRIO=${LLM_MPS_PRIO:-1}                    # MPS client priority for the LLM: 1 = below normal, so TTS kernels go first
 LLM_MPS_PCT=${LLM_MPS_PCT:-}                       # optional cap on the LLM's share of SMs (40 helped, priority alone helps more: issue #23)
 LLM_CTX=${LLM_CTX:-8192}; LLM_SLOTS=${LLM_SLOTS:-2}; LLM_MTP=${LLM_MTP:-1}; LLM_SWA_FULL=${LLM_SWA_FULL:-1}
@@ -195,7 +197,9 @@ stop_gpu() {  # the GPU services only; tunnels and the UI keep their URLs
 
 ports_free() {  # wait for the services' ports, so restarted ones don't fall back to random ports
   for _ in $(seq 1 60); do
-    ss -ltn | grep -qE ":($ASR_PORT|$TTS_PORT|$LLM_PORT|$GW_PORT) " || return 0
+    # Any socket, not just listeners: sglang refuses a port with connections still in TIME_WAIT and
+    # silently serves on a random one instead
+    ss -tanH | grep -qE ":($ASR_PORT|$TTS_PORT|$LLM_PORT|$GW_PORT) " || return 0
     sleep 1
   done
   log "ports still busy: $(ss -ltn | grep -oE ":($ASR_PORT|$TTS_PORT|$LLM_PORT|$GW_PORT) " | tr -d '\n')"
@@ -219,7 +223,7 @@ start() {
   [ -f "$DATA/gpubox.token" ] || echo "${GPUBOX_TOKEN:-$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)}" > "$DATA/gpubox.token"
   [ -n "${GPUBOX_TOKEN:-}" ] && echo "$GPUBOX_TOKEN" > "$DATA/gpubox.token"
   local TOKEN; TOKEN=$(cat "$DATA/gpubox.token")
-  alive asr || PATH="$ROOT/v-asr/bin:$PATH" spawn asr "$ROOT/v-asr/bin/sgl-omni" serve --model-path $ASR_MODEL --model-name $ASR_MODEL --port $ASR_PORT \
+  alive asr || PATH="$ROOT/v-asr/bin:$PATH" spawn asr env CUDA_MPS_CLIENT_PRIORITY="$ASR_MPS_PRIO" "$ROOT/v-asr/bin/sgl-omni" serve --model-path $ASR_MODEL --model-name $ASR_MODEL --port $ASR_PORT \
       --asr.engine.quantization fp8 --asr.engine.mem_fraction_static "$ASR_MEM" --asr.engine.max_running_requests 8
   wait_http asr "http://127.0.0.1:$ASR_PORT/health" 900 || return 1
   if [ -z "${NO_LLM:-}" ] && ! alive llm; then

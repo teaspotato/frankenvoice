@@ -133,6 +133,12 @@ export class TimelineModel {
   /** TypeSafe on whether the user is done at a pause (rules endpointing): p(done), and whether the commit was held. */
   eotChecks: (Marker & { p?: number; hold?: boolean; failed?: boolean; ms: number })[] = [];
   llm: LlmSpan[] = [];
+  /** The tape (turn.tape): a cell per decision, from its boundary (`t0`) to when its line was written (`t1`). */
+  tapeCells: (Span & { n: number; action: string; state: string; ms?: number; forced?: string; dropped?: string; failed?: boolean; promptN?: number; promptMs?: number; spec?: string })[] = [];
+  /** Speculation on the tape: cells written ahead (as if the user stays silent), their reply released or dropped. */
+  tapeSpec: (Marker & { event: string; action?: string; ms?: number; why?: string })[] = [];
+  /** Cuts on the tape: words written but never heard, taken off it. */
+  tapeCuts: (Marker & { unsaid: string[] })[] = [];
   drafts: Draft[] = [];
   openers: Opener[] = [];
   /** TypeSafe's answers on whether the user's words so far end on something complete. */
@@ -144,8 +150,10 @@ export class TimelineModel {
   playbackSegments: Marker[] = [];
   /** The agent was cut off (paused) or played quieter (ducked) while turn-taking judged the user's speech over it. */
   holds: Span[] = [];
+  /** The page gate stopped playback on its own VAD: when, and when the user's speech started (mic). */
+  gateStops: (Marker & { onset?: number })[] = [];
   /** Backchannels the agent said while the user talked, and proposals that were gated off. */
-  backchannels: (Span & { id: string; why?: string })[] = [];
+  backchannels: (Span & { id: string; why?: string; gen?: boolean; ahead?: boolean; askedAt?: number; llmMs?: number; firstAudio?: number; fallback?: string; dropped?: string })[] = [];
   bcSkips: (Marker & { why: string })[] = [];
   agentAudio: AudioBlock[] = [];
   errors: (Marker & { node: string })[] = [];
@@ -369,6 +377,11 @@ export class TimelineModel {
           this.bargeIns.push({ t0: e.t, text: '', seqs: [e.seq] });
           break;
         }
+        if (d.decision === 'protected') {
+          // Speech over an utterance that must be heard to the end: let be.
+          this.bargeIns.push({ t0: e.t, t1: e.t, text: '', decision: 'protected', why: d.why, seqs: [e.seq] });
+          break;
+        }
         const b = this.bargeIns[this.bargeIns.length - 1];
         if (b && b.t1 === undefined) {
           b.t1 = e.t;
@@ -397,6 +410,29 @@ export class TimelineModel {
           ...(typeof d.headStartMs === 'number' ? { headStartMs: d.headStartMs } : {}),
           ...(d.interject ? { interject: true } : {}),
         });
+        break;
+      case 'tape.cell':
+        this.tapeCells.push({
+          t0: typeof d.at === 'number' ? d.at : e.t,
+          t1: e.t,
+          n: d.n,
+          action: d.action ?? '',
+          state: d.state ?? '',
+          text: d.line ?? '',
+          seqs: [e.seq],
+          ...(typeof d.ms === 'number' ? { ms: d.ms } : {}),
+          ...(d.forced ? { forced: d.forced } : {}),
+          ...(d.dropped ? { dropped: d.dropped } : {}),
+          ...(d.failed ? { failed: true } : {}),
+          ...(typeof d.promptN === 'number' ? { promptN: d.promptN, promptMs: d.promptMs } : {}),
+          ...(d.spec ? { spec: d.spec } : {}),
+        });
+        break;
+      case 'tape.spec':
+        this.tapeSpec.push({ t: e.t, event: d.event, text: d.line ?? '', seq: e.seq, ...(d.action ? { action: d.action } : {}), ...(typeof d.ms === 'number' ? { ms: d.ms } : {}), ...(d.why ? { why: d.why } : {}) });
+        break;
+      case 'tape.cut':
+        this.tapeCuts.push({ t: e.t, text: d.heard ?? '', unsaid: d.unsaid ?? [], seq: e.seq });
         break;
       case 'turn.eot_check':
         this.eotChecks.push({ t: e.t, text: d.text ?? '', seq: e.seq, ms: d.ms ?? 0, ...(d.failed ? { failed: true } : { p: d.p, hold: !!d.hold }) });
@@ -491,16 +527,33 @@ export class TimelineModel {
         break;
       }
       case 'bc.say':
-        this.backchannels.push({ t0: e.t, text: d.line ?? '', id: d.id ?? '', why: d.why, seqs: [e.seq] });
+        this.backchannels.push({
+          t0: e.t,
+          text: d.line ?? '',
+          id: d.id ?? '',
+          why: d.why,
+          seqs: [e.seq],
+          ...(d.gen ? { gen: true, ahead: !!d.draft, askedAt: d.askedAt, llmMs: d.ms } : {}),
+          ...(d.fallback ? { fallback: d.fallback } : {}),
+        });
         break;
+      case 'tts.cue_dropped': {
+        const b = this.backchannels.find((x) => x.id === d.rid);
+        if (b) {
+          b.dropped = d.why ?? 'dropped';
+          b.seqs.push(e.seq);
+        }
+        break;
+      }
       case 'bc.skip':
         this.bcSkips.push({ t: e.t, text: d.reason ?? '', why: d.why ?? '', seq: e.seq });
         break;
       case 'playback.cue': {
         const b = this.backchannels.find((x) => x.id === d.rid);
         if (b) {
-          b.t0 = d.at ?? b.t0;
-          b.t1 = d.end;
+          // A streamed line plays in pieces: it starts with the first.
+          if (b.firstAudio === undefined) b.t0 = b.firstAudio = d.at ?? b.t0;
+          b.t1 = Math.max(b.t1 ?? 0, d.end ?? 0);
           b.seqs.push(e.seq);
         }
         break;
@@ -509,7 +562,11 @@ export class TimelineModel {
         this.playback.push({ t0: d.at ?? e.t, text: d.rid ?? '', rid: d.rid ?? '', seqs: [e.seq] });
         break;
       case 'playback.segment':
-        this.playbackSegments.push({ t: d.at ?? e.t, text: d.text ?? '', seq: e.seq });
+        this.playbackSegments.push({
+          t: d.at ?? e.t,
+          text: `${d.text ?? ''}${d.interruptible === false ? ' [must be heard to the end]' : ''}${d.gate === false ? ' [no quick yield]' : ''}`,
+          seq: e.seq,
+        });
         break;
       case 'playback.gain':
         this.closeHold(d.at ?? e.t, e.seq);
@@ -518,7 +575,11 @@ export class TimelineModel {
         break;
       case 'playback.paused':
         this.closeHold(d.at ?? e.t, e.seq);
-        this.holds.push({ t0: d.at ?? e.t, text: 'cut off while the user spoke', seqs: [e.seq] });
+        if (d.gate) {
+          const onset = typeof d.pos === 'number' ? this.sampleToT(d.pos) : undefined;
+          this.gateStops.push({ t: d.cut, text: `stopped in the page, ${Math.round(e.t - d.cut)} ms before the server knew`, seq: e.seq, ...(onset !== undefined ? { onset } : {}) });
+        }
+        this.holds.push({ t0: d.gate ? d.cut : (d.at ?? e.t), text: d.gate ? 'stopped by the page on the user’s speech, until the VAD here judged it' : 'cut off while the user spoke', seqs: [e.seq] });
         // Held audio is sent again, at its new times, on resume.
         this.clipAgentAudio(d.at ?? e.t);
         break;

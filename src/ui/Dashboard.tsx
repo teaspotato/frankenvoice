@@ -32,7 +32,7 @@ const LEGEND: Record<string, string> = {
     'Turn model scores per 80 ms frame, placed on the audio they had heard: end of turn (blue) and take the floor (orange). Solid: the user; faint: the agent. Green: the backchannel head (the agent could say mm-hmm), green circles where it fired. Dashed: the thresholds.\nDiamonds: events the model committed for the user (top: end of turn, bottom: take the floor); hollow dots: the same for the agent.',
   asr:
     'Bar: a final transcript, from its first word to its last. Dashed box: the latest partial.\nBottom row: small grey dots are partial results arriving, purple dots are finals arriving. The purple horizontal line runs from the end of the last word to when its result arrived: the ASR latency.',
-  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM. Dots: TypeSafe at a pause in the user\'s speech (green: done, committed; amber: going on, the commit waits for more silence; red: failed).\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.',
+  turn: 'Top: floor state, thinking (amber) or speaking (blue); listening is blank. Vertical line: a user turn handed to the LLM. Dots: TypeSafe at a pause in the user\'s speech (green: done, committed; amber: going on, the commit waits for more silence; red: failed).\nBottom: the user speaking while the agent had the floor, ending in the decision: red diamond = interrupted the agent, amber diamond = the user kept talking while the agent was thinking (its reply was dropped), accent diamond = an aside (the agent finishes its sentence, then answers it), grey dot = backchannel or noise, dropped.\nTape mode (turn.tape): bottom row, one call per cell: grey bar from the cell’s end to Gemma’s answer (its latency), then a mark for what it wrote (dot: listen; accent: respond/resume, with the words; LLM colour: continue/finish; green: backchannel; red: dropped or failed); a tick where no call was made. Red diamond: a cut, the unheard words taken off the tape. Hover a cell for its line. Speculation: hollow diamonds are cells written ahead as if the user stays silent, an accent line is their held reply released when real silence confirmed it, a grey cross a speculation dropped (the user spoke); a real cell taken from the speculation is a mark at its boundary with no latency bar.',
   interject:
     'Early interjection. Dots: TypeSafe judging the user\'s words so far (grey: still going; green: they just completed something). Outlined bar: an "interrupt?" check with the LLM on those words, until it decided (grey: let them go on) or was dropped. Accent diamond: the LLM wanted to cut in (its line next to it); a line from there to where it was taken at the user\'s pause (accent tick: it took the floor and played; red tick: turn-taking refused it; grey tick: taken, but the LLM could not keep it).',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
@@ -40,7 +40,7 @@ const LEGEND: Record<string, string> = {
     'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the TTS server.',
   speaker:
-    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged. Accent boxes: backchannels said while the user talked; small grey dots near the bottom: backchannels held back (hover for why).',
+    'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged. Red dot on a stub: the page stopped playback on its own VAD (page gate). Accent boxes: backchannels said while the user talked; small grey dots near the bottom: backchannels held back (hover for why).',
 };
 
 const AXIS = 20;
@@ -718,6 +718,79 @@ export function Dashboard({
         });
       });
 
+      // The tape (turn.tape): each cell's call, from the cell's end to its answer, and what was written
+      const tapeColor: Record<string, string> = { respond: col.accent, resume: col.accent, continue: col.llm, finish: col.llm, backchannel: col.ok };
+      for (const c of m.tapeCells) {
+        if (c.t1! < t0 || c.t0 > t1) continue;
+        const [ly0, ly1] = laneY.turn;
+        const h = ly1 - ly0;
+        const x0 = x(c.t0);
+        const x1 = Math.max(x(c.t1!), x0 + 1);
+        const color = c.failed || c.dropped ? col.danger : (tapeColor[c.action] ?? col.muted);
+        if (c.spec) mark('turn', c.t0, color, 0.77, c.action === 'listen' ? 'dot' : 'diamond', c.action === 'listen' ? 1.5 : 3.5);
+        else if (c.ms !== undefined) {
+          g.globalAlpha = 0.18;
+          g.fillStyle = col.muted;
+          g.fillRect(x0, ly0 + h * 0.62, x1 - x0, h * 0.3);
+          g.globalAlpha = 1;
+          mark('turn', c.t1!, color, 0.77, c.action === 'listen' ? 'dot' : 'diamond', c.action === 'listen' ? 1.5 : 3.5);
+        } else vline('turn', c.t0, col.border, 0.66, 0.88);
+        if (c.action !== 'listen') {
+          const said = /"([^"]*)"\s*$/.exec(c.text)?.[1] ?? '';
+          const next = m.tapeCells.find((o) => o.n > c.n && o.action !== 'listen' && o.action !== 'continue');
+          label(said || c.action, x1 + 3, next ? x(next.t0) : x1 + 160, ly0 + h * 0.77, color);
+        }
+        hits.push({
+          lane: 'turn',
+          x0: Math.min(x0, x1 - 3),
+          x1: x1 + 3,
+          y0: ly0 + h * 0.6,
+          y1: ly1,
+          text: `${c.text}\n${c.spec ? `written ahead (${c.spec}${c.ms !== undefined ? `, call ${c.ms} ms` : ''})` : c.ms !== undefined ? `call ${c.ms} ms${c.promptN !== undefined ? ` (prefill ${c.promptN} tokens in ${Math.round(c.promptMs ?? 0)} ms)` : ''}` : `no call: ${c.forced ?? ''}`}${c.dropped ? `\ndropped: ${c.dropped}` : ''}${c.failed ? '\ncall failed' : ''}`,
+          seqs: c.seqs,
+        });
+      }
+      // Speculation: cells written ahead (hollow), the held reply released (accent line) or dropped (grey cross)
+      for (const k of m.tapeSpec) {
+        if (k.t < t0 || k.t > t1 || k.event === 'start' || k.event === 'done') continue;
+        const [ly0, ly1] = laneY.turn;
+        const h = ly1 - ly0;
+        const px = x(k.t);
+        if (k.event === 'cell') {
+          const yc = ly0 + h * 0.66;
+          g.strokeStyle = tapeColor[k.action ?? ''] ?? col.muted;
+          g.beginPath();
+          g.moveTo(px, yc - 3);
+          g.lineTo(px + 3, yc);
+          g.lineTo(px, yc + 3);
+          g.lineTo(px - 3, yc);
+          g.closePath();
+          g.stroke();
+        } else if (k.event === 'release') vline('turn', k.t, col.accent, 0.58, 1);
+        else if (k.event === 'drop' || k.event === 'stop') {
+          const yc = ly0 + h * 0.66;
+          g.strokeStyle = col.muted;
+          g.beginPath();
+          g.moveTo(px - 3, yc - 3);
+          g.lineTo(px + 3, yc + 3);
+          g.moveTo(px + 3, yc - 3);
+          g.lineTo(px - 3, yc + 3);
+          g.stroke();
+        }
+        const what =
+          k.event === 'cell'
+            ? `written ahead${k.ms !== undefined ? ` in ${k.ms} ms` : ''}: ${k.text}`
+            : k.event === 'release'
+              ? 'speculative reply released: real silence confirmed the cell, its rendered audio plays'
+              : `speculation dropped: ${k.why ?? ''}`;
+        hits.push({ lane: 'turn', x0: px - 4, x1: px + 4, y0: ly0 + h * 0.55, y1: ly0 + h * 0.75, text: what, seqs: [k.seq] });
+      }
+      for (const k of m.tapeCuts) {
+        if (k.t < t0 || k.t > t1) continue;
+        mark('turn', k.t, col.danger, 0.77, 'diamond', 4);
+        hits.push({ lane: 'turn', x0: x(k.t) - 4, x1: x(k.t) + 4, text: `cut off after “${k.text}”${k.unsaid.length ? `; never heard, off the tape: ${k.unsaid.join(' ')}` : ''}`, seqs: [k.seq] });
+      }
+
       // LLM drafts: a request started on the user's words before the turn was committed (outlined)
       for (const d of m.drafts) {
         const end = d.t1 ?? head;
@@ -922,6 +995,12 @@ export function Dashboard({
         hits[hits.length - 1].text = d.text;
         tag(d.seqs);
       }
+      for (const k of m.gateStops) {
+        if (k.t < t0 || k.t > t1) continue;
+        vline('speaker', k.t, col.danger, 0, 0.35);
+        mark('speaker', k.t, col.danger, 0.35, 'dot', 3);
+        hits.push({ lane: 'speaker', x0: x(k.t) - 4, x1: x(k.t) + 4, text: k.text, seqs: [k.seq], ...(k.onset !== undefined ? { audio: [k.onset, k.t] as [number, number] } : {}) });
+      }
       for (const s of m.playbackSegments) {
         if (s.t < t0 || s.t > t1) continue;
         mark('speaker', s.t, col.text, 0.14, 'diamond');
@@ -932,7 +1011,12 @@ export function Dashboard({
         const end = b.t1 ?? b.t0 + 400;
         if (end < t0 || b.t0 > t1) continue;
         span('speaker', b.t0, end, col.accent, 0.3, b.text, 0.3, 0.7);
-        hits[hits.length - 1].text = `backchannel "${b.text}" (${b.why ?? ''})`;
+        const how = b.gen
+          ? `${b.ahead ? 'written ahead by the LLM' : `written by the LLM in ${b.llmMs ?? '?'} ms`}${b.firstAudio !== undefined && b.askedAt !== undefined ? `, first audio ${Math.round(b.firstAudio - b.askedAt)} ms after the decision` : ''}`
+          : b.fallback
+            ? `canned: ${b.fallback}`
+            : 'canned';
+        hits[hits.length - 1].text = `backchannel "${b.text}" (${b.why ?? ''}; ${how}${b.dropped ? `; dropped: ${b.dropped}` : ''})`;
         tag(b.seqs);
       }
       for (const k of m.bcSkips) {
