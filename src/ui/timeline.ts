@@ -40,37 +40,6 @@ export interface LlmSpan extends Span {
   interject?: boolean;
   /** When the model's first reasoning arrived. */
   thinkingAt?: number;
-  /** A reply the model gave on its own, to the workers' news (these workers). */
-  workers?: string[];
-  /** Worker tools it called, when. */
-  tools: { t: number; name: string; text: string; seq: number; error?: boolean }[];
-}
-
-/** One tool call a worker made, from start to finish. */
-export interface WorkerStep {
-  id: string;
-  t0: number;
-  t1?: number;
-  title: string;
-  kind: string;
-  status: string;
-}
-
-/** A worker the LLM started: one agent session, from start to result (and any follow-ups). */
-export interface WorkerSpan extends Span {
-  id: string;
-  status: string;
-  /** Lane row, so workers that overlap in time don't cover each other. */
-  row: number;
-  /** When its session was ready. */
-  readyAt?: number;
-  /** The text of the result or error. */
-  result?: string;
-  steps: WorkerStep[];
-  /** When a stretch of reasoning began. */
-  thinking: number[];
-  /** Plan updates, messages from the LLM, the agent's in-between text, refused permissions, as they happened. */
-  marks: { t: number; kind: 'progress' | 'steer' | 'text' | 'denied' | 'stop'; text: string; seq: number }[];
 }
 
 /** A reply started on the user's words before their turn was committed. */
@@ -164,22 +133,28 @@ export class TimelineModel {
   /** TypeSafe on whether the user is done at a pause (rules endpointing): p(done), and whether the commit was held. */
   eotChecks: (Marker & { p?: number; hold?: boolean; failed?: boolean; ms: number })[] = [];
   llm: LlmSpan[] = [];
+  /** The tape (turn.tape): a cell per decision, from its boundary (`t0`) to when its line was written (`t1`). */
+  tapeCells: (Span & { n: number; action: string; state: string; ms?: number; forced?: string; dropped?: string; failed?: boolean; promptN?: number; promptMs?: number; spec?: string })[] = [];
+  /** Speculation on the tape: cells written ahead (as if the user stays silent), their reply released or dropped. */
+  tapeSpec: (Marker & { event: string; action?: string; ms?: number; why?: string })[] = [];
+  /** Cuts on the tape: words written but never heard, taken off it. */
+  tapeCuts: (Marker & { unsaid: string[] })[] = [];
   drafts: Draft[] = [];
   openers: Opener[] = [];
   /** TypeSafe's answers on whether the user's words so far end on something complete. */
   interjectGates: (Marker & { go: boolean; failed?: boolean; confidence?: number; ms: number })[] = [];
   interjectChecks: InterjectCheck[] = [];
-  workers: WorkerSpan[] = [];
   ttsRequests: { t: number; seq: number }[] = [];
   tts: (Span & { rid: string; seg: number })[] = [];
   playback: (Span & { rid: string; interrupted?: boolean; heard?: string })[] = [];
   playbackSegments: Marker[] = [];
   /** The agent was cut off (paused) or played quieter (ducked) while turn-taking judged the user's speech over it. */
   holds: Span[] = [];
+  /** The page gate stopped playback on its own VAD: when, and when the user's speech started (mic). */
+  gateStops: (Marker & { onset?: number })[] = [];
   /** Backchannels the agent said while the user talked, and proposals that were gated off. */
-  backchannels: (Span & { id: string; why?: string })[] = [];
+  backchannels: (Span & { id: string; why?: string; gen?: boolean; ahead?: boolean; askedAt?: number; llmMs?: number; firstAudio?: number; fallback?: string; dropped?: string })[] = [];
   bcSkips: (Marker & { why: string })[] = [];
-  boundaries: number[] = [];
   agentAudio: AudioBlock[] = [];
   errors: (Marker & { node: string })[] = [];
   /** Events caused by each event (the inverse of TrajEvent.cause). */
@@ -224,14 +199,6 @@ export class TimelineModel {
   /** Session time of mic peak `i` (peaks are equally spaced in audio time). */
   peakToT(i: number): number {
     return this.sampleToT((i + 0.5) * this.micRate * (PEAK_MS / 1000));
-  }
-
-  /** The first Workers lane row with no bar open at `t`. */
-  private freeRow(t: number): number {
-    const busy = new Set(this.workers.filter((w) => w.t1 === undefined || w.t1 > t).map((w) => w.row));
-    let row = 0;
-    while (busy.has(row)) row++;
-    return row;
   }
 
   private closeHold(at: number, seq: number) {
@@ -410,6 +377,11 @@ export class TimelineModel {
           this.bargeIns.push({ t0: e.t, text: '', seqs: [e.seq] });
           break;
         }
+        if (d.decision === 'protected') {
+          // Speech over an utterance that must be heard to the end: let be.
+          this.bargeIns.push({ t0: e.t, t1: e.t, text: '', decision: 'protected', why: d.why, seqs: [e.seq] });
+          break;
+        }
         const b = this.bargeIns[this.bargeIns.length - 1];
         if (b && b.t1 === undefined) {
           b.t1 = e.t;
@@ -434,69 +406,34 @@ export class TimelineModel {
           t0: e.t,
           text: '',
           chunks: [],
-          tools: [],
           seqs: [e.seq],
           ...(typeof d.headStartMs === 'number' ? { headStartMs: d.headStartMs } : {}),
           ...(d.interject ? { interject: true } : {}),
-          ...(Array.isArray(d.workers) ? { workers: d.workers } : {}),
         });
         break;
-      case 'llm.tool': {
-        const l = this.llm.find((x) => x.rid === d.rid);
-        l?.tools.push({ t: e.t, name: d.name, text: `${d.name}(${JSON.stringify(d.input)})\n→ ${d.result}`, seq: e.seq, ...(d.error ? { error: true } : {}) });
-        l?.seqs.push(e.seq);
+      case 'tape.cell':
+        this.tapeCells.push({
+          t0: typeof d.at === 'number' ? d.at : e.t,
+          t1: e.t,
+          n: d.n,
+          action: d.action ?? '',
+          state: d.state ?? '',
+          text: d.line ?? '',
+          seqs: [e.seq],
+          ...(typeof d.ms === 'number' ? { ms: d.ms } : {}),
+          ...(d.forced ? { forced: d.forced } : {}),
+          ...(d.dropped ? { dropped: d.dropped } : {}),
+          ...(d.failed ? { failed: true } : {}),
+          ...(typeof d.promptN === 'number' ? { promptN: d.promptN, promptMs: d.promptMs } : {}),
+          ...(d.spec ? { spec: d.spec } : {}),
+        });
         break;
-      }
-      case 'worker.started':
-        this.workers.push({ id: d.workerId, t0: e.t, text: d.task ?? '', status: 'starting', row: this.freeRow(e.t), steps: [], thinking: [], marks: [], seqs: [e.seq] });
+      case 'tape.spec':
+        this.tapeSpec.push({ t: e.t, event: d.event, text: d.line ?? '', seq: e.seq, ...(d.action ? { action: d.action } : {}), ...(typeof d.ms === 'number' ? { ms: d.ms } : {}), ...(d.why ? { why: d.why } : {}) });
         break;
-      case 'worker.ready':
-      case 'worker.thinking':
-      case 'worker.text':
-      case 'worker.tool':
-      case 'worker.tool_done':
-      case 'worker.permission':
-      case 'worker.progress':
-      case 'worker.steer':
-      case 'worker.done':
-      case 'worker.error':
-      case 'worker.stopped': {
-        const w = [...this.workers].reverse().find((x) => x.id === d.workerId);
-        if (!w) break;
-        w.seqs.push(e.seq);
-        if (d.type === 'worker.ready') {
-          w.readyAt = e.t;
-          w.status = 'running';
-        } else if (d.type === 'worker.thinking') w.thinking.push(e.t);
-        else if (d.type === 'worker.text') w.marks.push({ t: e.t, kind: 'text', text: d.text ?? '', seq: e.seq });
-        else if (d.type === 'worker.tool') w.steps.push({ id: d.toolCallId, t0: e.t, title: d.title ?? '', kind: d.kind ?? 'other', status: d.status ?? 'pending' });
-        else if (d.type === 'worker.tool_done') {
-          const s = [...w.steps].reverse().find((x) => x.id === d.toolCallId);
-          if (s) {
-            s.t1 = e.t;
-            s.status = d.status;
-          }
-        } else if (d.type === 'worker.permission') {
-          if (!d.allowed) w.marks.push({ t: e.t, kind: 'denied', text: `refused: ${d.title} (${d.kind})`, seq: e.seq });
-        } else if (d.type === 'worker.progress') w.marks.push({ t: e.t, kind: 'progress', text: d.text ?? '', seq: e.seq });
-        else if (d.type === 'worker.steer') {
-          if (d.followUp) {
-            // A follow-up is a new bar for the same worker, in whichever row is free now.
-            const f: WorkerSpan = { id: w.id, t0: e.t, text: `follow-up: ${d.text ?? ''}`, status: 'running', row: this.freeRow(e.t), steps: [], thinking: [], marks: [], seqs: [e.seq] };
-            this.workers.push(f);
-          } else w.marks.push({ t: e.t, kind: 'steer', text: d.text ?? '', seq: e.seq });
-        } else if (d.type === 'worker.stopped' && w.t1 !== undefined) {
-          // Stopped after it finished: its result stands.
-          w.marks.push({ t: e.t, kind: 'stop', text: 'stopped', seq: e.seq });
-        } else {
-          w.t1 = e.t;
-          w.status = d.type === 'worker.done' ? 'done' : d.type === 'worker.error' ? 'error' : 'stopped';
-          w.result = d.text;
-          for (const s of w.steps) s.t1 ??= e.t;
-          if (d.type === 'worker.stopped') w.marks.push({ t: e.t, kind: 'stop', text: 'stopped', seq: e.seq });
-        }
+      case 'tape.cut':
+        this.tapeCuts.push({ t: e.t, text: d.heard ?? '', unsaid: d.unsaid ?? [], seq: e.seq });
         break;
-      }
       case 'turn.eot_check':
         this.eotChecks.push({ t: e.t, text: d.text ?? '', seq: e.seq, ms: d.ms ?? 0, ...(d.failed ? { failed: true } : { p: d.p, hold: !!d.hold }) });
         break;
@@ -573,6 +510,14 @@ export class TimelineModel {
       case 'tts.segment_start':
         this.tts.push({ rid: d.rid, seg: d.seg, t0: e.t, text: d.text ?? '', seqs: [e.seq] });
         break;
+      case 'tts.segment_text': {
+        const s = this.tts.find((x) => x.rid === d.rid && x.seg === d.seg);
+        if (s) {
+          s.text = d.text ?? s.text;
+          s.seqs.push(e.seq);
+        }
+        break;
+      }
       case 'tts.segment_end': {
         const s = this.tts.find((x) => x.rid === d.rid && x.seg === d.seg);
         if (s) {
@@ -582,16 +527,33 @@ export class TimelineModel {
         break;
       }
       case 'bc.say':
-        this.backchannels.push({ t0: e.t, text: d.line ?? '', id: d.id ?? '', why: d.why, seqs: [e.seq] });
+        this.backchannels.push({
+          t0: e.t,
+          text: d.line ?? '',
+          id: d.id ?? '',
+          why: d.why,
+          seqs: [e.seq],
+          ...(d.gen ? { gen: true, ahead: !!d.draft, askedAt: d.askedAt, llmMs: d.ms } : {}),
+          ...(d.fallback ? { fallback: d.fallback } : {}),
+        });
         break;
+      case 'tts.cue_dropped': {
+        const b = this.backchannels.find((x) => x.id === d.rid);
+        if (b) {
+          b.dropped = d.why ?? 'dropped';
+          b.seqs.push(e.seq);
+        }
+        break;
+      }
       case 'bc.skip':
         this.bcSkips.push({ t: e.t, text: d.reason ?? '', why: d.why ?? '', seq: e.seq });
         break;
       case 'playback.cue': {
         const b = this.backchannels.find((x) => x.id === d.rid);
         if (b) {
-          b.t0 = d.at ?? b.t0;
-          b.t1 = d.end;
+          // A streamed line plays in pieces: it starts with the first.
+          if (b.firstAudio === undefined) b.t0 = b.firstAudio = d.at ?? b.t0;
+          b.t1 = Math.max(b.t1 ?? 0, d.end ?? 0);
           b.seqs.push(e.seq);
         }
         break;
@@ -600,7 +562,11 @@ export class TimelineModel {
         this.playback.push({ t0: d.at ?? e.t, text: d.rid ?? '', rid: d.rid ?? '', seqs: [e.seq] });
         break;
       case 'playback.segment':
-        this.playbackSegments.push({ t: d.at ?? e.t, text: d.text ?? '', seq: e.seq });
+        this.playbackSegments.push({
+          t: d.at ?? e.t,
+          text: `${d.text ?? ''}${d.interruptible === false ? ' [must be heard to the end]' : ''}${d.gate === false ? ' [no quick yield]' : ''}`,
+          seq: e.seq,
+        });
         break;
       case 'playback.gain':
         this.closeHold(d.at ?? e.t, e.seq);
@@ -609,15 +575,16 @@ export class TimelineModel {
         break;
       case 'playback.paused':
         this.closeHold(d.at ?? e.t, e.seq);
-        this.holds.push({ t0: d.at ?? e.t, text: 'cut off while the user spoke', seqs: [e.seq] });
+        if (d.gate) {
+          const onset = typeof d.pos === 'number' ? this.sampleToT(d.pos) : undefined;
+          this.gateStops.push({ t: d.cut, text: `stopped in the page, ${Math.round(e.t - d.cut)} ms before the server knew`, seq: e.seq, ...(onset !== undefined ? { onset } : {}) });
+        }
+        this.holds.push({ t0: d.gate ? d.cut : (d.at ?? e.t), text: d.gate ? 'stopped by the page on the user’s speech, until the VAD here judged it' : 'cut off while the user spoke', seqs: [e.seq] });
         // Held audio is sent again, at its new times, on resume.
         this.clipAgentAudio(d.at ?? e.t);
         break;
       case 'playback.resumed':
         this.closeHold(d.at ?? e.t, e.seq);
-        break;
-      case 'playback.boundary':
-        this.boundaries.push(d.at ?? e.t);
         break;
       case 'playback.end':
       case 'playback.interrupted': {

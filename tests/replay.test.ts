@@ -5,14 +5,14 @@ import { LiveWorld, type Delivery } from '../src/core/world';
 import { prepareReplay } from '../src/core/replay';
 import { decodeBundle, encodeBundle } from '../src/core/bundle';
 import { registry } from '../src/nodes';
-import { buildGraph, defaultConfig } from '../src/pipeline';
+import { buildGraph } from '../src/pipeline';
 import type { Trajectory } from '../src/core/trajectory';
 import { GRAPH_FORMAT, GRAPH_FORMAT_VERSION, type GraphSpec } from '../src/core/graph';
 import type { NodeDef } from '../src/core/node';
-import { fakeDrivers } from './fake-drivers';
+import { testConfig, fakeDrivers } from './fake-drivers';
 
 function testGraph(): GraphSpec {
-  const g = buildGraph(defaultConfig());
+  const g = buildGraph(testConfig());
   // Also run the deterministic energy VAD alongside Silero.
   g.nodes.push({ id: 'vad2', type: 'vad.energy', params: {} });
   g.edges.push({ from: { node: 'mic', port: 'audio' }, to: { node: 'vad2', port: 'audio' } });
@@ -41,23 +41,24 @@ describe('record and replay', () => {
     expect(types('transcript')).toContain('asr.final');
     expect(types('turn')).toContain('turn.user');
     expect(types('text')).toContain('llm.delta');
+    // Tagged replies: each utterance's flags before its words.
+    expect(types('text')).toContain('llm.utterance');
     expect(types('audio')).toContain('audio');
     expect(types('playback')).toContain('playback.start');
     expect(types('scores')).toContain('turnmodel.frame');
     expect(types('scores')).toContain('turnmodel.eot');
+    // Kyutai's word timings, placed on the agent's track.
+    expect(types('audio')).toContain('tts.words');
+    // The tick scheduler paced the replies: chunks, grants, and a logged tick every 80 ms.
+    expect(types('text')).toContain('llm.chunk');
+    expect(types('control')).toContain('sched.grant');
+    expect(types('ticks')).toContain('sched.tick');
     // The turn model, not ASR endpointing, ended the user's turns.
     const commits = live.events.filter((e) => e.kind === 'msg' && (e.data as { type: string; on?: string }).on === 'commit');
     expect(commits.length).toBeGreaterThan(0);
     expect(commits.some((e) => String((e.data as { why: string }).why).startsWith('model: end of turn'))).toBe(true);
     expect(count(live, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
   }, 10_000);
-
-  it('starts a worker over ACP and gets its result', () => {
-    const msgs = (type: string) => live.events.filter((e) => e.kind === 'msg' && (e.data as { type: string }).type === type).map((e) => e.data as Record<string, unknown>);
-    expect(msgs('worker.start')).toMatchObject([{ workerId: 'w1', task: 'the question' }]);
-    expect(msgs('worker.permission')).toMatchObject([{ workerId: 'w1', kind: 'fetch', allowed: true }]);
-    expect(msgs('worker.done')).toMatchObject([{ workerId: 'w1', text: 'The answer is 42.' }]);
-  });
 
   it('replays bit-for-bit, including timing, after a bundle round trip', () => {
     const source = decodeBundle(encodeBundle(live));
@@ -111,13 +112,13 @@ describe('record and replay', () => {
     for (const e of live.events) for (const c of e.cause ?? []) expect(bySeq.get(c)!.t).toBeLessThanOrEqual(e.t);
   });
 
-  it('swaps the LLM provider without touching the rest of the graph, and replays it exactly', async () => {
+  it('swaps the LLM model without touching the rest of the graph, and replays it exactly', async () => {
     const g = testGraph();
-    Object.assign(g.nodes.find((n) => n.id === 'llm')!.params, { provider: 'openai-compatible', endpoint: 'openrouter', model: 'some/model' });
+    Object.assign(g.nodes.find((n) => n.id === 'llm')!.params, { model: 'some/model' });
     const run = await recordLive(800, performance, g);
     const opened = run.events.find((e) => e.kind === 'io.open' && e.node === 'llm')!;
     expect((opened.data as { channel: string }).channel).toBe('openai');
-    expect((opened.data as { request: { endpoint: string; body: { model: string } } }).request.body.model).toBe('some/model');
+    expect((opened.data as { request: { body: { model: string } } }).request.body.model).toBe('some/model');
     const deltas = run.events.filter((e) => e.kind === 'msg' && (e.data as { type: string }).type === 'llm.delta');
     expect(deltas.length).toBeGreaterThan(0);
     const { runtime, sim } = prepareReplay(run, { registry });
@@ -126,7 +127,7 @@ describe('record and replay', () => {
   }, 10_000);
 
   it('runs early interjection (TypeSafe gate, LLM check, take) and replays it exactly', async () => {
-    const c = defaultConfig();
+    const c = testConfig();
     c.interject.variant = 'typesafe';
     // From the first word, so the gate runs before the fake session's first turn is committed.
     c.interject.params.typesafe = { minWords: 1 };
@@ -141,12 +142,51 @@ describe('record and replay', () => {
     expect(runtime.trajectory.events).toEqual(run.events);
   }, 15_000);
 
-  it('swaps TTS to Deepgram Aura (16-bit PCM) and replays it exactly', async () => {
-    const g = testGraph();
-    g.nodes.find((n) => n.id === 'tts')!.params = { provider: 'deepgram' };
-    const run = await recordLive(800, performance, g);
-    const opened = run.events.find((e) => e.kind === 'io.open' && e.node === 'tts')!;
-    expect(opened.data).toMatchObject({ channel: 'deepgram-tts', request: { path: '/v1/speak', query: { model: 'aura-2-thalia-en', encoding: 'linear16' } } });
+  it('says backchannels the LLM writes (own slot, own TTS socket) and replays them exactly', async () => {
+    const c = testConfig();
+    // TypeSafe says whether (the fake one always says yes), the LLM what; the fake user's words come just after each pause.
+    c.backchannel.params.on = { decide: 'typesafe', gapMs: 0, pauseMs: 40 };
+    const run = await recordLive(2500, performance, buildGraph(c));
+    const msgs = run.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; gen?: boolean });
+    expect(msgs.map((m) => m.type)).toContain('llm.bc');
+    expect(msgs.some((m) => m.type === 'bc.say' && m.gen)).toBe(true);
+    const asks = run.events.filter((e) => e.kind === 'io.open' && e.node === 'llm' && (e.data as { request: { body: { id_slot?: number } } }).request.body.id_slot === 1);
+    expect(asks.length).toBeGreaterThan(0);
+    expect(msgs.some((m) => m.type === 'playback.cue')).toBe(true);
+    expect(count(run, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
+    const { runtime, sim } = prepareReplay(decodeBundle(encodeBundle(run)), { registry });
+    sim.runFast();
+    expect(count(runtime.trajectory, (e) => e.kind === 'io.diverge')).toBe(0);
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 15_000);
+
+  it('lets the tape decide each cell (llama.cpp /completion), speaks its words, and replays it exactly', async () => {
+    const c = testConfig();
+    c.turn.variant = 'tape';
+    c.turn.params.tape = { cellMs: 100 };
+    const run = await recordLive(2500, performance, buildGraph(c));
+    const msgs = run.events.filter((e) => e.kind === 'msg').map((e) => ({ node: e.node, ...(e.data as { type: string; action?: string; forced?: string }) }));
+    const cells = msgs.filter((m) => m.type === 'tape.cell');
+    expect(cells.length).toBeGreaterThan(5);
+    expect(cells.some((m) => m.action === 'respond' && !m.forced)).toBe(true);
+    expect(cells.some((m) => m.forced === 'greeting')).toBe(true);
+    // The tape speaks; the LLM stage gets no turns.
+    expect(msgs.some((m) => m.type === 'llm.start' && m.node === 'turn')).toBe(true);
+    expect(msgs.some((m) => m.type === 'llm.start' && m.node === 'llm')).toBe(false);
+    expect(msgs.some((m) => m.type === 'playback.start')).toBe(true);
+    expect(run.events.some((e) => e.kind === 'io.open' && e.node === 'turn' && (e.data as { channel: string }).channel === 'llama-completion')).toBe(true);
+    expect(count(run, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
+    const { runtime, sim } = prepareReplay(decodeBundle(encodeBundle(run)), { registry });
+    sim.runFast();
+    expect(count(runtime.trajectory, (e) => e.kind === 'io.diverge')).toBe(0);
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 15_000);
+
+  it('runs the tone TTS mock in place of Kyutai, and replays it exactly', async () => {
+    const c = testConfig();
+    c.tts.variant = 'tone';
+    const run = await recordLive(800, performance, buildGraph(c));
+    expect(run.events.some((e) => e.kind === 'io.open' && e.node === 'tts')).toBe(false);
     expect(run.events.some((e) => e.kind === 'msg' && e.node === 'tts' && (e.data as { type: string }).type === 'audio')).toBe(true);
     expect(run.events.filter((e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toEqual([]);
     const { runtime, sim } = prepareReplay(run, { registry });
@@ -154,26 +194,9 @@ describe('record and replay', () => {
     expect(runtime.trajectory.events).toEqual(run.events);
   }, 10_000);
 
-  it('runs the browser speech-synthesis node in place of tts + speaker, and replays it exactly', async () => {
-    const c = defaultConfig();
-    c.tts.variant = 'browser';
-    const g = buildGraph(c);
-    expect(g.nodes.some((n) => n.id === 'speaker')).toBe(false);
-    const run = await recordLive(1500, performance, g);
-    const playback = run.events.filter((e) => e.kind === 'msg' && e.node === 'tts').map((e) => (e.data as { type: string }).type);
-    expect(playback).toContain('playback.start');
-    expect(playback).toContain('playback.boundary');
-    expect(playback).toContain('playback.end');
-    // The turn node gets the floor back when speech ends.
-    expect(run.events.some((e) => e.node === 'turn' && e.kind === 'log' && JSON.stringify(e.data).includes('playback ended'))).toBe(true);
-    const { runtime, sim } = prepareReplay(run, { registry });
-    sim.runFast();
-    expect(runtime.trajectory.events).toEqual(run.events);
-  }, 10_000);
-
   for (const variant of ['aec', 'rnnoise'] as const) {
     it(`runs the ${variant} cleanup stage and replays it exactly`, async () => {
-      const c = defaultConfig();
+      const c = testConfig();
       c.cleanup.variant = variant;
       const g = buildGraph(c);
       expect(g.nodes.find((n) => n.id === 'mic')!.params).toMatchObject({ noiseSuppression: false, autoGainControl: false });

@@ -40,14 +40,7 @@ function harness() {
   };
   const result = (c: number, start: number, end: number, isFinal: boolean) =>
     conns[c].handlers.onRecv?.(
-      {
-        type: 'Results',
-        is_final: isFinal,
-        speech_final: isFinal,
-        start,
-        duration: end - start,
-        channel: { alternatives: [{ transcript: 'hi', confidence: 1, words: [] }] },
-      },
+      { type: 'Results', is_final: isFinal, speech_final: isFinal, start, end, text: 'hi', words: [] },
       undefined,
     );
   return { conns, logs, frame, result, node };
@@ -88,5 +81,23 @@ describe('ASR connection', () => {
     h.conns[0].handlers.onClose?.(null);
     h.frame(100);
     expect(h.conns).toHaveLength(1);
+  });
+});
+
+describe('GPU box ASR adapter', () => {
+  it('maps the server messages onto ASR events', async () => {
+    const { gpuboxAsrAdapter: a } = await import('../src/nodes/asr/gpubox');
+    expect(a.buildRequest({ language: 'English', partialMs: 250, context: '' }, 16000)).toEqual({
+      path: '/v1/asr',
+      query: { language: 'English', sample_rate: 16000, partial_ms: 250 },
+    });
+    expect(a.parse({ type: 'SpeechStarted', at: 1.2 })).toEqual([{ type: 'speech_started', at: 1.2 }]);
+    expect(
+      a.parse({ type: 'Results', is_final: true, speech_final: true, from_finalize: true, start: 1, end: 2, text: 'hi there', words: [{ word: 'hi', start: 1.1, end: 1.3 }] }),
+    ).toEqual([
+      { type: 'final', text: 'hi there', confidence: null, speechFinal: true, fromFinalize: true, start: 1, end: 2, words: [{ word: 'hi', start: 1.1, end: 1.3 }] },
+    ]);
+    expect(a.parse({ type: 'Results', is_final: false, start: 0, end: 0.5, text: 'hi' })[0]).toMatchObject({ type: 'partial', words: [] });
+    expect(a.finalizeMessage()).toEqual({ type: 'Finalize' });
   });
 });

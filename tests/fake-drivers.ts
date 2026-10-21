@@ -3,6 +3,7 @@
 
 import type { DriverRegistry, LiveDriver } from '../src/core/world';
 import type { Json } from '../src/core/types';
+import { defaultConfig, type PipelineConfig } from '../src/pipeline';
 
 const jitter = (base: number, spread: number) => base + Math.random() * spread;
 const later = (ms: number, fn: () => void) => setTimeout(fn, ms);
@@ -61,104 +62,74 @@ const silero: LiveDriver = (_req, sink) => {
   };
 };
 
+/** FireRedVAD stand-in: one probability per completed 10 ms frame (400-sample windows, 160 hop), from RMS. */
+const firered: LiveDriver = (_req, sink) => {
+  let chain = Promise.resolve();
+  let buf: number[] = [];
+  return {
+    send(_d, bin) {
+      buf.push(...new Float32Array(bin!.slice().buffer));
+      const p: number[] = [];
+      while (buf.length >= 400) {
+        let sum = 0;
+        for (let i = 0; i < 400; i++) sum += buf[i] * buf[i];
+        p.push(Math.round(Math.min(1, Math.sqrt(sum / 400) * 5) * 1000) / 1000);
+        buf = buf.slice(160);
+      }
+      chain = chain.then(() => new Promise((r) => later(jitter(0, 2), () => (sink.recv({ p }), r()))));
+    },
+    close() {},
+  };
+};
+
 const utterances = ['hello there', 'what time is it', 'tell me a joke'];
-const deepgram: LiveDriver = (_req, sink) => {
+const words = (text: string, start: number) => text.split(' ').filter(Boolean).map((w, i) => ({ word: w, start: start + i * 0.2, end: start + i * 0.2 + 0.15 }));
+const results = (text: string, start: number, isFinal: boolean, fromFinalize = false): Json => ({
+  type: 'Results',
+  is_final: isFinal,
+  speech_final: isFinal,
+  from_finalize: fromFinalize,
+  start,
+  end: start + 0.8,
+  text,
+  words: words(text, start),
+  decode_ms: 20,
+});
+
+/** Qwen3-ASR on the GPU box: every ~40 frames an "utterance", as partials then a final (sooner on Finalize). */
+const gpuboxAsr: LiveDriver = (_req, sink) => {
   let sent = 0;
   let utt = 0;
   let closed = false;
-  later(jitter(2, 3), () => sink.recv({ type: '$open' }));
-  later(jitter(3, 3), () => sink.recv({ type: 'Metadata', request_id: 'fake' }));
+  /** The utterance in progress, until its final is sent. */
+  let pending: { text: string; start: number } | undefined;
+  const out = sequence((m) => sink.recv(m), () => closed);
+  out({ type: '$open' }, jitter(2, 3));
+  out({ type: 'Ready', model: 'fake-qwen3-asr' });
+  const final = (fromFinalize: boolean) => {
+    const u = pending;
+    pending = undefined;
+    if (u) out(results(u.text, u.start, true, fromFinalize));
+    else if (fromFinalize) out(results('', sent / 16000, true, true));
+  };
   return {
     send(data, bin) {
-      if (!bin || closed) return;
+      if (closed) return;
+      const m = data as { type?: string } | null;
+      if (m?.type === 'Finalize') return final(true);
+      if (m?.type === 'CloseStream') return final(false);
+      if (!bin) return;
       sent += bin.byteLength / 2;
-      // Every ~40 frames, transcribe one "utterance": two partials, then a final.
       if (sent >= (utt + 1) * 40 * 512 && utt < utterances.length) {
         const text = utterances[utt];
         const start = (utt * 40 * 512) / 16000;
         utt++;
-        const words = text.split(' ');
-        words.forEach((_, i) => {
-          later(jitter(1 + i * 2, 2), () => {
-            if (closed) return;
-            sink.recv(results(words.slice(0, i + 1).join(' '), start, false, false));
-          });
-        });
-        later(jitter(10, 4), () => !closed && sink.recv(results(text, start, true, true)));
+        pending = { text, start };
+        out({ type: 'SpeechStarted', at: start });
+        const ws = text.split(' ');
+        ws.forEach((_, i) => out(() => pending?.text === text && sink.recv(results(ws.slice(0, i + 1).join(' '), start, false)), jitter(1, 2)));
+        out(() => pending?.text === text && final(false), jitter(6, 4));
       }
-      void data;
-    },
-    close: () => void (closed = true),
-  };
-};
-
-function results(text: string, start: number, isFinal: boolean, speechFinal: boolean): Json {
-  return {
-    type: 'Results',
-    is_final: isFinal,
-    speech_final: speechFinal,
-    start,
-    duration: 0.8,
-    channel: { alternatives: [{ transcript: text, confidence: 0.9, words: text.split(' ').map((w, i) => ({ word: w, start: start + i * 0.2, end: start + i * 0.2 + 0.15 })) }] },
-  };
-}
-
-const anthropic: LiveDriver = (req, sink) => {
-  const r = req as { messages: { role: string; content: { type: string }[] }[]; tools?: { name: string }[] };
-  const tools = new Set((r.tools ?? []).map((x) => x.name));
-  const last = r.messages[r.messages.length - 1];
-  // The conversation starts a worker on the first user turn.
-  const delegate = tools.has('spawn_worker') && r.messages.length === 1 && last.content[0]?.type === 'text';
-  const reply = delegate ? 'Let me look that up.' : `Reply number ${r.messages.length}. This is a second sentence! And a third?`;
-  const tokens = reply.match(/\S+\s*/g)!;
-  let closed = false;
-  const ev = sequence((e) => sink.recv(e), () => closed);
-  ev({ type: 'message_start', message: { id: 'msg_fake', role: 'assistant', content: [] } }, jitter(2.5, 4));
-  let i = 0;
-  ev({ type: 'content_block_start', index: i, content_block: { type: 'text', text: '' } });
-  for (const tok of tokens) ev({ type: 'content_block_delta', index: i, delta: { type: 'text_delta', text: tok } });
-  ev({ type: 'content_block_stop', index: i++ });
-  if (delegate) {
-    ev({ type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: 'toolu_fake', name: 'spawn_worker', input: {} } });
-    ev({ type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: '{"task":"the question"}' } });
-    ev({ type: 'content_block_stop', index: i++ });
-  }
-  ev({ type: 'message_delta', delta: { stop_reason: delegate ? 'tool_use' : 'end_turn' } });
-  ev({ type: 'message_stop' });
-  ev(() => sink.close(), 1);
-  return { send() {}, close: () => void (closed = true) };
-};
-
-/** An ACP agent: sets up a session, then answers each prompt after thinking and one web fetch (asking permission first). */
-const acp: LiveDriver = (_req, sink) => {
-  let closed = false;
-  const out = sequence((m) => sink.recv(m), () => closed);
-  const update = (sessionId: string, u: Json) => out({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update: u } });
-  out({ $open: { cwd: '/tmp/fake-workers', command: 'fake-acp', pid: 1 } }, 1);
-  let calls = 0;
-  /** The rest of a prompt's turn, once its permission request is answered. */
-  let pendingPrompt: (() => void) | undefined;
-  return {
-    send(data) {
-      const m = data as { id?: number; method?: string; params?: { sessionId?: string }; result?: unknown };
-      const ok = (result: Json) => out({ jsonrpc: '2.0', id: m.id!, result });
-      if (m.method === 'initialize') ok({ protocolVersion: 1, agentCapabilities: {} });
-      else if (m.method === 'session/new') ok({ sessionId: 'sess-fake', configOptions: ['model', 'effort'].map((id) => ({ id, name: id, type: 'select', currentValue: 'default', options: [] })) });
-      else if (m.method === 'session/set_config_option') ok({ configOptions: [] });
-      else if (m.method === 'session/prompt') {
-        const sid = m.params!.sessionId!;
-        const n = ++calls;
-        update(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Deep thought.' } });
-        update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Let me check.' } });
-        update(sid, { sessionUpdate: 'tool_call', toolCallId: `tc${n}`, title: 'Fetch https://example.com', kind: 'fetch', status: 'pending' });
-        out({ jsonrpc: '2.0', id: 1000 + n, method: 'session/request_permission', params: { sessionId: sid, toolCall: { toolCallId: `tc${n}`, title: 'Fetch https://example.com', kind: 'fetch' }, options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'reject', name: 'Reject', kind: 'reject_once' }] } });
-        const id = m.id!;
-        pendingPrompt = () => {
-          update(sid, { sessionUpdate: 'tool_call_update', toolCallId: `tc${n}`, status: 'completed' });
-          for (const tok of ['The answer ', 'is 42.']) update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: tok } });
-          out({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } }, 100);
-        };
-      } else if (m.id !== undefined && m.method === undefined && m.result) pendingPrompt?.();
     },
     close: () => void (closed = true),
   };
@@ -177,9 +148,25 @@ const typesafe: LiveDriver = (req, sink) => {
   return { send() {}, close: () => void (closed = true) };
 };
 
+/** A chat model: a fixed reply, cut at max_tokens; a last assistant message is continued (llama.cpp's prefill). */
 const openai: LiveDriver = (req, sink) => {
-  const r = req as { body: { messages: unknown[] } };
-  const tokens = `Compat reply ${r.body.messages.length}. Short and sweet!`.match(/\S+\s*/g)!;
+  const r = req as { body: { messages: { role: string; content: string }[]; max_tokens?: number } };
+  const msgs = r.body.messages;
+  const prefill = msgs.at(-1)?.role === 'assistant' ? msgs.at(-1)!.content : '';
+  const users = msgs.filter((m) => m.role !== 'assistant').length;
+  // Backchannels run on slot 1; a reply with a grammar is tagged, one utterance per line.
+  const b = r.body as { grammar?: string; id_slot?: number };
+  const bc = b.id_slot === 1;
+  let tokens: string[] = bc
+    ? ['Oh,', ' okay.']
+    : b.grammar
+      ? ['[i', '1g0] ', 'Reply ', 'number ', `${users}.`, '\n[i', '0g1] ', 'This ', 'is ', 'a ', 'second ', 'sentence!', '\n[i', '1g1] ', 'And ', 'a ', 'third?']
+      : `Reply number ${users}. This is a second sentence! And a third?`.match(/\S+\s*/g)!;
+  let skip = 0;
+  while (prefill && !bc && skip < tokens.length && tokens.slice(0, skip).join('').trimEnd() !== prefill) skip++;
+  tokens = tokens.slice(skip);
+  const cut = r.body.max_tokens !== undefined && tokens.length > r.body.max_tokens;
+  if (cut) tokens = tokens.slice(0, r.body.max_tokens);
   let closed = false;
   let t = jitter(2, 3);
   const ev = (e: Json) => {
@@ -187,64 +174,102 @@ const openai: LiveDriver = (req, sink) => {
     later(t, () => !closed && sink.recv(e));
   };
   for (const tok of tokens) ev({ id: 'c1', choices: [{ index: 0, delta: { content: tok }, finish_reason: null }] });
-  ev({ id: 'c1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+  ev({ id: 'c1', choices: [{ index: 0, delta: {}, finish_reason: cut ? 'length' : 'stop' }] });
   ev({ $done: true });
   later(t + 1, () => !closed && sink.close());
   return { send() {}, close: () => void (closed = true) };
 };
 
-const cartesia: LiveDriver = (req, sink) => {
-  const { body } = req as { body: { transcript: string; output_format: { sample_rate: number } } };
-  const n = Math.round(body.transcript.length * 0.004 * body.output_format.sample_rate);
-  const bytes = new Uint8Array(new Float32Array(n).map((_, i) => Math.sin(i / 10) * 0.1).buffer);
+/**
+ * llama.cpp /completion for the tape: reads the open line and the grammar, and answers like a
+ * plain agent: listens while words come in, responds in the first cell without new words,
+ * continues twice, then finishes. Capped at the grammar's word limit.
+ */
+const llamaCompletion: LiveDriver = (req, sink) => {
+  const { prompt, grammar } = (req as { body: { prompt: string; grammar: string } }).body;
+  const lines = prompt.slice(prompt.lastIndexOf('<channel|>') + '<channel|>'.length).split('\n');
+  const open = lines[lines.length - 1];
+  const max = Number(/\{0,(\d+)\}/.exec(grammar)?.[1] ?? 0) + 1;
+  const cap = (s: string) => `"${s.split(' ').slice(0, max).join(' ')}"`;
+  const lastAnswer = lines.findLastIndex((l) => /: (respond|resume) /.test(l));
+  const heard = lines.slice(lastAnswer + 1, -1).some((l) => /user: "/.test(l));
+  // No new words (the fake mic's noise keeps the VAD busy, so voice doesn't count).
+  const quiet = !/user: "/.test(open);
+  let content = ' listen';
+  if (grammar.includes('" continue "')) {
+    const since = lines.slice(lastAnswer + 1, -1).filter((l) => / continue "/.test(l)).length;
+    content = since >= 2 ? ` finish ${cap('That is all.')}` : ` continue ${cap('and some more words')}`;
+  } else if (heard && quiet) content = ` respond ${cap('Sure, here is an answer')}`;
   let closed = false;
-  let off = 0;
-  let t = jitter(2, 4);
-  while (off < bytes.length) {
-    const len = Math.min(bytes.length - off, 1 + Math.floor(Math.random() * 3000)); // deliberately unaligned
-    const chunk = bytes.slice(off, off + len);
-    off += len;
-    t += jitter(0.2, 1);
-    later(t, () => !closed && sink.recv(null, chunk));
-  }
-  later(t + 0.5, () => !closed && sink.close());
+  later(jitter(3, 4), () => {
+    if (closed) return;
+    sink.recv({ content, stop_type: 'word', timings: { prompt_n: 12, prompt_ms: 4.2, predicted_n: 6, predicted_ms: 30.1 } });
+    sink.close(null);
+  });
   return { send() {}, close: () => void (closed = true) };
 };
 
-/** Deepgram Aura: 16-bit PCM, streamed in chunks that split samples. */
-const deepgramTts: LiveDriver = (req, sink) => {
-  const { body, query } = req as { body: { text: string }; query: { sample_rate: number } };
-  const n = Math.round(body.text.length * 0.004 * query.sample_rate);
-  const pcm = new Int16Array(n).map((_, i) => Math.round(Math.sin(i / 10) * 3000));
-  const bytes = new Uint8Array(pcm.buffer);
+/** Kyutai on the GPU box: audio, word times and Flushed for each flushed segment; Done and close after Close. */
+const gpuboxTts: LiveDriver = (_req, sink) => {
   let closed = false;
-  let off = 0;
-  let t = jitter(2, 4);
-  while (off < bytes.length) {
-    const len = Math.min(bytes.length - off, 1 + Math.floor(Math.random() * 3000));
-    const chunk = bytes.slice(off, off + len);
-    off += len;
-    t += jitter(0.2, 1);
-    later(t, () => !closed && sink.recv(null, chunk));
-  }
-  later(t + 0.5, () => !closed && sink.close());
-  return { send() {}, close: () => void (closed = true) };
+  let text = '';
+  /** Seconds of audio sent on this socket. */
+  let at = 0;
+  /** Words the model has read. */
+  let read = 0;
+  const out = sequence((m) => sink.recv(m), () => closed);
+  out({ type: '$open' }, jitter(2, 3));
+  out({ type: 'Ready', sample_rate: 24000 });
+  const speak = () => {
+    const ws = text.trim().split(/\s+/).filter(Boolean);
+    text = '';
+    if (!ws.length) return;
+    const n = Math.round(ws.join(' ').length * 0.004 * 24000);
+    const pcm = new Int16Array(n).map((_, i) => Math.round(Math.sin(i / 10) * 3000));
+    const bytes = new Uint8Array(pcm.buffer);
+    const per = n / 24000 / ws.length;
+    read += ws.length;
+    out({ type: 'Consumed', words: read, queued: 0 }, jitter(0.5, 1));
+    out({ type: 'Words', words: ws.map((word, i) => ({ word, start: at + i * per, end: at + (i + 1) * per })) }, jitter(1, 2));
+    at += n / 24000;
+    // Deliberately split mid-sample.
+    for (let off = 0; off < bytes.length; ) {
+      const len = Math.min(bytes.length - off, 1 + Math.floor(Math.random() * 3000));
+      const chunk = bytes.slice(off, (off += len));
+      out(() => sink.recv(null, chunk), jitter(0.2, 1));
+    }
+  };
+  return {
+    send(data) {
+      const m = data as { type: string; text?: string };
+      if (closed) return;
+      if (m.type === 'Speak') text += m.text ?? '';
+      else if (m.type === 'Flush') {
+        speak();
+        out({ type: 'Flushed' });
+      } else if (m.type === 'Close') {
+        speak();
+        out({ type: 'Done', stats: {} });
+        out(() => sink.close({ code: 1000, reason: '' }), 0.5);
+      }
+    },
+    close: () => void (closed = true),
+  };
 };
 
-/** Mimics speechSynthesis: start, a boundary per word, end (fast, jittered). */
-const speechSynthesis: LiveDriver = (req, sink) => {
+/** The server's canned-line cache: a tone for the line, from the cache or a background render. */
+const ttsCanned: LiveDriver = (req, sink) => {
   const { text } = req as { text: string };
   let closed = false;
-  let t = jitter(2, 4);
-  later(t, () => !closed && sink.recv({ type: 'start', voice: 'fake' }));
-  let charIndex = 0;
-  for (const word of text.split(' ')) {
-    const at = charIndex;
-    later(t + jitter(0.5, 1), () => !closed && sink.recv({ type: 'boundary', name: 'word', charIndex: at }));
-    charIndex += word.length + 1;
-    t += jitter(1, 2);
-  }
-  later(t + 1, () => !closed && sink.close());
+  const n = Math.round(text.length * 0.004 * 24000);
+  const pcm = new Int16Array(n).map((_, i) => Math.round(Math.sin(i / 7) * 3000));
+  const cached = Math.random() < 0.5;
+  later(jitter(cached ? 0.5 : 5, 3), () => {
+    if (closed) return;
+    sink.recv({ type: 'Canned', cached, key: 'k', sampleRate: 24000 });
+    sink.recv(null, new Uint8Array(pcm.buffer));
+    sink.close(null);
+  });
   return { send() {}, close: () => void (closed = true) };
 };
 
@@ -302,4 +327,15 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, deepgram, anthropic, openai, cartesia, 'deepgram-tts': deepgramTts, 'speech-synthesis': speechSynthesis, rnnoise, speaker, 'turn-model': turnModel, acp, typesafe };
+export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, 'tts-canned': ttsCanned, openai, 'llama-completion': llamaCompletion, rnnoise, speaker, 'turn-model': turnModel, typesafe };
+
+/** The default pipeline with the turn model on (it is off by default, a big download). */
+export function testConfig(): PipelineConfig {
+  const c = defaultConfig();
+  c.turnmodel.variant = 'ssl_turn';
+  // The fake user talks soon after replies start; these tests are about the rest of the floor rules.
+  c.turn.params['full-duplex'] = { yieldWithinMs: 0 };
+  // Small chunks, so replies are paced by the scheduler.
+  c.sched.params.tick = { firstTokens: 3, chunkTokens: 2 };
+  return c;
+}

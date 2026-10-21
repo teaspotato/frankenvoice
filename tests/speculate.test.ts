@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { duplexTurnNode } from '../src/nodes/turn';
+import { duplexTurnNode, FLOOR, halfDuplexTurnNode } from '../src/nodes/turn';
 import { llmNode } from '../src/nodes/llm';
 import { resolveParams, type IOHandlers, type NodeContext, type NodeDef } from '../src/core/node';
 import type { Json, Msg } from '../src/core/types';
@@ -143,7 +143,7 @@ describe('drafting replies before the turn is committed', () => {
 });
 
 describe('the LLM on drafts', () => {
-  const params = { provider: 'openai-compatible', model: 'm', system: 'sys' };
+  const params = { model: 'm', system: 'sys', utterances: 'plain' };
   const tok = (text: string) => ({ choices: [{ index: 0, delta: { content: text } }] });
   const messages = (r: Json) => (r as { body: { messages: { role: string; content: string }[] } }).body.messages.map((m) => m.content);
 
@@ -203,7 +203,7 @@ describe('finalizing ASR on VAD speech end', () => {
     expect(h.of('turn.user')).toMatchObject([{ text: 'what about Osaka?' }]);
   });
 
-  it('asks the ASR provider to finalize on speech end', async () => {
+  it('asks the ASR server to finalize on speech end', async () => {
     const { asrNode } = await import('../src/nodes/asr');
     const h = harness(asrNode);
     h.send(0, 'audio', { type: 'audio', track: 'mic', start: 0, end: 160, sampleRate: 16000, samples: new Float32Array(160) });
@@ -294,5 +294,19 @@ describe('turn-taking fixes from the smoothie session', () => {
     h.send(2000, 'vad', vad(true, 2000));
     h.advance(3000);
     expect(h.of('turn.user')).toHaveLength(0);
+  });
+});
+
+describe('the floor', () => {
+  it('half-duplex turn-taking tells it as it changes', () => {
+    const h = harness(halfDuplexTurnNode);
+    h.send(0, 'transcript', { type: 'asr.final', text: 'hi', start: 0, end: 1, speechFinal: true });
+    h.send(10, 'playback', { type: 'playback.start' });
+    h.send(20, 'playback', { type: 'playback.end' });
+    expect(h.of('turn.transition').map((m) => m.to)).toEqual(['thinking', 'speaking', 'listening']);
+  });
+
+  it('lets the agent take the floor unprompted', () => {
+    expect(FLOOR.listening.playback_start).toBe('speaking');
   });
 });

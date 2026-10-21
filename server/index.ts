@@ -1,16 +1,18 @@
-// Local proxy: keeps API keys out of the browser and avoids CORS. It forwards
-// requests verbatim (adding credentials) and streams responses back untouched,
-// so the browser records exactly what the provider sent. It also stores
-// session bundles and the settings edited in the web UI (keys, base URLs).
+// The server: runs the pipeline (server/live.ts) next to the models and providers, so nothing
+// detours through the browser; the page only captures the mic, plays the agent and shows the run.
+// It also stores session bundles and the settings edited in the web UI (keys, base URLs), and in
+// hosted mode serves the built UI.
 
-import { spawn } from 'node:child_process';
+import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { createInterface } from 'node:readline';
-import { Readable } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
-import { dirname, join, resolve } from 'node:path';
-import { WebSocket, WebSocketServer } from 'ws';
+import { dirname, extname, join, resolve, sep } from 'node:path';
+import { WebSocketServer } from 'ws';
+import { HOST_MAX_MESSAGE, LiveHub, VISITOR_MAX_MESSAGE } from './live';
+import type { UpstreamName, Upstreams } from './drivers';
+import { checkGraph, type GraphSpec } from '../src/core/graph';
+import { buildGraph, defaultConfig } from '../src/pipeline';
+import { preloadTurnModel, type TurnModelRequest } from './drivers/turn-model';
 
 try {
   process.loadEnvFile('.env');
@@ -19,6 +21,13 @@ try {
 }
 
 const PORT = Number(process.env.FV_PROXY_PORT ?? 8787);
+/**
+ * Hosted mode (e.g. on the GPU box, behind a tunnel): the proxy also serves the built UI from
+ * FV_STATIC_DIR, and instead of local-only access every request needs FV_HOST_TOKEN, given once as
+ * `?token=` and kept in a cookie.
+ */
+const HOST_TOKEN = process.env.FV_HOST_TOKEN || '';
+const STATIC_DIR = process.env.FV_STATIC_DIR ? resolve(process.env.FV_STATIC_DIR) : '';
 
 /**
  * Every setting can come from three places, highest first: the web UI (saved
@@ -35,30 +44,44 @@ interface SettingDef {
 }
 
 const SETTINGS: SettingDef[] = [
-  { name: 'DEEPGRAM_API_KEY', group: 'Deepgram (ASR, TTS)', label: 'API key', secret: true },
-  { name: 'DEEPGRAM_BASE_URL', group: 'Deepgram (ASR, TTS)', label: 'Base URL', default: 'wss://api.deepgram.com', hint: 'ws(s) URL; REST calls use the same host over http(s)' },
-  { name: 'ANTHROPIC_API_KEY', group: 'Anthropic (LLM)', label: 'API key', secret: true },
-  { name: 'ANTHROPIC_BASE_URL', group: 'Anthropic (LLM)', label: 'Base URL', default: 'https://api.anthropic.com' },
-  { name: 'OPENROUTER_API_KEY', group: 'OpenRouter (LLM)', label: 'API key', secret: true },
-  { name: 'OPENROUTER_BASE_URL', group: 'OpenRouter (LLM)', label: 'Base URL', default: 'https://openrouter.ai/api/v1' },
-  { name: 'OPENAI_API_KEY', group: 'OpenAI (LLM, TTS)', label: 'API key', secret: true },
-  { name: 'OPENAI_BASE_URL', group: 'OpenAI (LLM, TTS)', label: 'Base URL', default: 'https://api.openai.com/v1' },
-  { name: 'OPENAI_COMPAT_BASE_URL', group: 'Custom OpenAI-compatible (LLM, TTS)', label: 'Base URL', hint: 'e.g. http://localhost:11434/v1 (Ollama), vLLM, LM Studio' },
-  { name: 'OPENAI_COMPAT_API_KEY', group: 'Custom OpenAI-compatible (LLM, TTS)', label: 'API key (optional)', secret: true },
-  { name: 'CARTESIA_API_KEY', group: 'Cartesia (TTS)', label: 'API key', secret: true },
-  { name: 'CARTESIA_BASE_URL', group: 'Cartesia (TTS)', label: 'Base URL', default: 'https://api.cartesia.ai' },
-  { name: 'CARTESIA_VERSION', group: 'Cartesia (TTS)', label: 'API version', default: '2025-04-16' },
+  {
+    name: 'GPUBOX_BASE_URL',
+    group: 'GPU box (Qwen3-ASR, Kyutai TTS)',
+    label: 'Base URL',
+    hint: 'ws(s) URL of gpubox/server.py, e.g. wss://xyz.trycloudflare.com',
+  },
+  { name: 'GPUBOX_TOKEN', group: 'GPU box (Qwen3-ASR, Kyutai TTS)', label: 'Token', secret: true, hint: 'Printed by gpubox/setup.sh' },
+  {
+    name: 'OPENAI_COMPAT_BASE_URL',
+    group: 'LLM (OpenAI-compatible)',
+    label: 'Base URL',
+    hint: 'e.g. http://127.0.0.1:8103/v1 (llama.cpp on the GPU box), or any local server: vLLM, Ollama, LM Studio',
+  },
+  { name: 'OPENAI_COMPAT_API_KEY', group: 'LLM (OpenAI-compatible)', label: 'API key (optional)', secret: true },
   { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'API key', secret: true },
   { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
-  {
-    name: 'FV_ACP_COMMAND',
-    group: 'Workers (ACP agent)',
-    label: 'Agent command',
-    default: 'npx -y @agentclientprotocol/claude-agent-acp@0.85.1',
-    hint: 'Started once per worker; speaks the Agent Client Protocol on stdin/stdout. Gets the Anthropic key and base URL above.',
-  },
-  { name: 'FV_ACP_CWD', group: 'Workers (ACP agent)', label: 'Working folder', default: '.frankenvoice/workers', hint: 'Where workers run; relative to where the proxy runs' },
   { name: 'FV_SESSIONS_DIR', group: 'Storage', label: 'Sessions folder', default: 'sessions', hint: 'Relative to where the proxy runs' },
+  {
+    name: 'FV_MAX_SESSIONS',
+    group: 'Users',
+    label: 'Live sessions at once',
+    default: '1',
+    hint: 'More pages wait in a queue. One L4 gives one user the best latency; 2 users add about 1 s to each reply, 4 about 2 s',
+  },
+  {
+    name: 'FV_MAX_SESSION_S',
+    group: 'Users',
+    label: 'Longest live session (s)',
+    default: '180',
+    hint: 'A live session is stopped (and saved) after this long, so a stuck page can\'t hold the box. 0 = no limit',
+  },
+  {
+    name: 'FV_PUBLIC',
+    group: 'Users',
+    label: 'Public demo (1 = on)',
+    default: '0',
+    hint: 'Hosted mode: anyone with the link (no token) can talk to the agent. Visitors run the pipeline you started last and see no settings, recordings or replays; with the token you stay the host',
+  },
 ];
 const SETTING_NAMES = new Set(SETTINGS.map((d) => d.name));
 const SETTINGS_FILE = resolve(process.env.FV_SETTINGS_FILE ?? '.frankenvoice/settings.json');
@@ -111,6 +134,10 @@ async function updateSettings(patch: Record<string, unknown>) {
 }
 
 const sessionsDir = () => resolve(setting('FV_SESSIONS_DIR')!);
+/** Downloaded models (the turn model), next to the settings file so a redeployed app keeps them. */
+const MODELS_DIR = resolve(process.env.FV_MODELS_DIR ?? join(dirname(SETTINGS_FILE), 'fv-models'));
+/** Canned lines' audio, rendered once per GPU box and kept across sessions and redeploys. */
+const CANNED_DIR = resolve(process.env.FV_TTS_CACHE_DIR ?? join(dirname(SETTINGS_FILE), 'fv-tts-cache'));
 
 interface Upstream {
   baseVar: string;
@@ -122,28 +149,23 @@ interface Upstream {
 
 const bearer = (key: string | undefined): Record<string, string> => (key ? { authorization: `Bearer ${key}` } : {});
 
-const upstreams: Record<string, Upstream> = {
-  anthropic: { baseVar: 'ANTHROPIC_BASE_URL', keyVar: 'ANTHROPIC_API_KEY', headers: (key) => ({ 'x-api-key': key! }) },
-  cartesia: {
-    baseVar: 'CARTESIA_BASE_URL',
-    keyVar: 'CARTESIA_API_KEY',
-    headers: (key) => ({ 'x-api-key': key!, 'cartesia-version': setting('CARTESIA_VERSION')! }),
-  },
-  deepgram: { baseVar: 'DEEPGRAM_BASE_URL', keyVar: 'DEEPGRAM_API_KEY', headers: (key) => ({ authorization: `Token ${key}` }) },
+const upstreams: Record<UpstreamName, Upstream> = {
   typesafe: { baseVar: 'TYPESAFE_BASE_URL', keyVar: 'TYPESAFE_API_KEY', headers: bearer },
-  // OpenAI-compatible endpoints, addressed as /api/openai/<name>/...
-  'openai/openrouter': {
-    baseVar: 'OPENROUTER_BASE_URL',
-    keyVar: 'OPENROUTER_API_KEY',
-    headers: (key) => ({ ...bearer(key), 'x-title': 'frankenvoice' }),
-  },
-  'openai/openai': { baseVar: 'OPENAI_BASE_URL', keyVar: 'OPENAI_API_KEY', headers: bearer },
-  'openai/custom': { baseVar: 'OPENAI_COMPAT_BASE_URL', keyVar: 'OPENAI_COMPAT_API_KEY', keyOptional: true, headers: bearer },
+  gpubox: { baseVar: 'GPUBOX_BASE_URL', keyVar: 'GPUBOX_TOKEN', headers: bearer },
+  // The OpenAI-compatible chat endpoint (llama.cpp on the GPU box).
+  llm: { baseVar: 'OPENAI_COMPAT_BASE_URL', keyVar: 'OPENAI_COMPAT_API_KEY', keyOptional: true, headers: bearer },
 };
 
 const baseOf = (u: Upstream) => setting(u.baseVar);
 const keyOf = (u: Upstream) => setting(u.keyVar);
 const configured = (u: Upstream) => !!baseOf(u) && (!!keyOf(u) || !!u.keyOptional);
+
+/** Read on every request, so a change in Settings applies to the next exchange. */
+const upstream: Upstreams = (name) => {
+  const u = upstreams[name];
+  const missing = !baseOf(u) ? `no base URL configured for "${name}" (${u.baseVar}; set it in Settings)` : !configured(u) ? `${u.keyVar} is not set (set it in Settings)` : undefined;
+  return { base: baseOf(u)?.replace(/\/+$/, ''), headers: u.headers(keyOf(u)), missing };
+};
 
 /**
  * The proxy holds credentials and can repoint upstreams, so only the local UI
@@ -161,8 +183,61 @@ function localOnly(req: IncomingMessage): boolean {
   }
 }
 
-const DROP_REQ = new Set(['host', 'connection', 'content-length', 'x-api-key', 'authorization', 'origin', 'referer', 'cookie', 'anthropic-dangerous-direct-browser-access']);
-const DROP_RES = new Set(['content-encoding', 'content-length', 'transfer-encoding', 'connection']);
+const sameToken = (got: string) => {
+  const a = Buffer.from(got);
+  const b = Buffer.from(HOST_TOKEN);
+  return a.length === b.length && timingSafeEqual(a, b);
+};
+const cookieToken = (req: IncomingMessage) => /(?:^|;\s*)fv_token=([^;]*)/.exec(req.headers.cookie ?? '')?.[1] ?? '';
+
+const sameOrigin = (req: IncomingMessage) => {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch {
+    return false;
+  }
+};
+
+/** The host: in hosted mode, same-origin requests carrying the token cookie; otherwise only the local UI. */
+function isHost(req: IncomingMessage): boolean {
+  if (!HOST_TOKEN) return localOnly(req);
+  return sameOrigin(req) && sameToken(decodeURIComponent(cookieToken(req)));
+}
+
+/** Public demo (hosted mode only): anyone may load the page and talk; settings, recordings and the turn model stay the host's. */
+const isPublic = () => !!HOST_TOKEN && setting('FV_PUBLIC') === '1';
+const VISITOR_PATHS = new Set(['/api/health', '/api/me', '/api/live']);
+
+function allowed(req: IncomingMessage, p: string): boolean {
+  if (isHost(req)) return true;
+  return isPublic() && sameOrigin(req) && (VISITOR_PATHS.has(p) || (!!STATIC_DIR && !p.startsWith('/api/') && (req.method === 'GET' || req.method === 'HEAD')));
+}
+
+const TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript',
+  '.mjs': 'text/javascript',
+  '.css': 'text/css',
+  '.wasm': 'application/wasm',
+  '.json': 'application/json',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.onnx': 'application/octet-stream',
+};
+
+/** The built UI; unknown paths get index.html. */
+async function serveStatic(p: string, res: ServerResponse) {
+  let file = resolve(STATIC_DIR, '.' + decodeURIComponent(p));
+  if (file !== STATIC_DIR && !file.startsWith(STATIC_DIR + sep)) return json(res, 400, { error: 'bad path' });
+  if (!(await stat(file).catch(() => null))?.isFile()) file = join(STATIC_DIR, 'index.html');
+  res.writeHead(200, {
+    'content-type': TYPES[extname(file)] ?? 'application/octet-stream',
+    'cache-control': file.includes(`${sep}assets${sep}`) ? 'public, max-age=31536000, immutable' : 'no-cache',
+  });
+  res.end(await readFile(file));
+}
 
 function json(res: ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { 'content-type': 'application/json' });
@@ -173,42 +248,6 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const c of req) chunks.push(c as Buffer);
   return Buffer.concat(chunks);
-}
-
-async function forward(name: string, rest: string, req: IncomingMessage, res: ServerResponse) {
-  const up = upstreams[name];
-  if (!up) return json(res, 404, { error: `unknown upstream "${name}"` });
-  const upBase = baseOf(up);
-  const key = keyOf(up);
-  if (!upBase) return json(res, 500, { error: `no base URL configured for "${name}" (${up.baseVar}; set it in Settings)` });
-  if (!key && !up.keyOptional) return json(res, 500, { error: `${up.keyVar} is not set (set it in Settings)` });
-  const headers: Record<string, string> = {};
-  for (const [k, v] of Object.entries(req.headers)) if (!DROP_REQ.has(k) && typeof v === 'string') headers[k] = v;
-  Object.assign(headers, up.headers(key));
-  const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : new Uint8Array(await readBody(req));
-  const ac = new AbortController();
-  res.on('close', () => ac.abort());
-  // The Deepgram upstream is a ws(s) URL for streaming ASR; its REST endpoints (TTS) use http(s).
-  const base = upBase.replace(/^ws(s?):/, 'http$1:');
-  const upstream = await fetch(base + rest, { method: req.method, headers, body, signal: ac.signal });
-  const outHeaders: Record<string, string> = {};
-  upstream.headers.forEach((v, k) => {
-    if (!DROP_RES.has(k)) outHeaders[k] = v;
-  });
-  res.writeHead(upstream.status, outHeaders);
-  if (!upstream.body) return res.end();
-  // Errors mid-stream (the browser aborting a reply it no longer wants, the upstream resetting) end
-  // this response only. With a bare .pipe() they were unhandled and took the whole proxy down.
-  await pipeline(Readable.fromWeb(upstream.body as import('node:stream/web').ReadableStream), res).catch((e: unknown) => {
-    if (!ac.signal.aborted) console.warn(`[${name}] response stream failed: ${String(e)}`);
-    res.destroy();
-  });
-}
-
-/** Close codes 1005/1006/1015 are reserved and may not be sent in a close frame. */
-function sendableCode(code: number): number {
-  if (code < 1000 || code >= 5000 || code === 1004 || code === 1005 || code === 1006 || code === 1015) return code === 1005 ? 1000 : 1011;
-  return code;
 }
 
 /** Session ids are file names: no path separators or reserved characters, no leading dot. */
@@ -247,10 +286,33 @@ async function sessions(req: IncomingMessage, res: ServerResponse, id: string | 
   json(res, 405, { error: 'method not allowed' });
 }
 
+/** What demo visitors run: the pipeline the host started last (kept across restarts). */
+const DEMO_GRAPH_FILE = join(dirname(SETTINGS_FILE), 'demo-graph.json');
+let demoGraph: GraphSpec | undefined;
+try {
+  demoGraph = checkGraph(JSON.parse(await readFile(DEMO_GRAPH_FILE, 'utf8')) as GraphSpec);
+} catch {
+  // none yet, or an outdated format: visitors get the default pipeline
+}
+
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://local');
   const p = url.pathname;
-  if (!localOnly(req)) return json(res, 403, { error: 'the proxy only accepts requests from the local UI' });
+  // Hosted mode: `?token=` on a page load sets the cookie, then the token is dropped from the URL.
+  // Lax, not Strict: a Strict cookie isn't sent on the redirect when the link was opened from another site.
+  const given = url.searchParams.get('token');
+  if (HOST_TOKEN && given !== null && req.method === 'GET' && !p.startsWith('/api/')) {
+    if (!sameToken(given)) return json(res, 403, { error: 'wrong token' });
+    url.searchParams.delete('token');
+    res.writeHead(302, {
+      'set-cookie': `fv_token=${encodeURIComponent(given)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`,
+      location: url.pathname + url.search,
+    });
+    return res.end();
+  }
+  if (!allowed(req, p)) {
+    return json(res, 403, { error: HOST_TOKEN ? 'open this page with ?token=<FV_HOST_TOKEN> first' : 'the proxy only accepts requests from the local UI' });
+  }
   const handle = async () => {
     if (p === '/api/settings') {
       if (req.method === 'PUT') {
@@ -262,13 +324,23 @@ const server = createServer((req, res) => {
       } else if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' });
       return json(res, 200, { file: SETTINGS_FILE, settings: describeSettings() });
     }
-    if (p === '/api/health') {
-      return json(res, 200, { ...Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])), acp: !!setting('FV_ACP_COMMAND') });
+    if (p === '/api/me') {
+      // A visitor sees the pipeline it will talk to.
+      const host = isHost(req);
+      return json(res, 200, { host, public: isPublic(), ...(host ? {} : { graph: demoGraph ?? buildGraph(defaultConfig()) }) });
     }
-    let m = /^\/api\/(anthropic|cartesia|deepgram|typesafe|openai\/[\w-]+)(\/.*)$/.exec(p);
-    if (m) return forward(m[1], m[2] + url.search, req, res);
-    m = /^\/api\/sessions(?:\/([^/]+))?$/.exec(p);
+    if (p === '/api/health') {
+      return json(res, 200, Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])));
+    }
+    if (p === '/api/turn-model' && req.method === 'POST') {
+      // Load the turn model ahead of a session; the page polls this while it loads.
+      const r = JSON.parse((await readBody(req)).toString('utf8') || '{}') as TurnModelRequest;
+      if (typeof r.encoderUrl !== 'string' || typeof r.headUrl !== 'string' || typeof r.frames !== 'number') return json(res, 400, { error: 'bad turn model request' });
+      return json(res, 200, preloadTurnModel(MODELS_DIR, r));
+    }
+    const m = /^\/api\/sessions(?:\/([^/]+))?$/.exec(p);
     if (m) return sessions(req, res, m[1] && decodeURIComponent(m[1]));
+    if (STATIC_DIR && !p.startsWith('/api/') && (req.method === 'GET' || req.method === 'HEAD')) return serveStatic(p, res);
     json(res, 404, { error: 'not found' });
   };
   handle().catch((e) => {
@@ -277,117 +349,33 @@ const server = createServer((req, res) => {
   });
 });
 
-// Deepgram streaming: browser <-> proxy <-> Deepgram, frames passed through unchanged.
-const wss = new WebSocketServer({ noServer: true });
+// The page's socket: mic in, agent audio and the run's trajectory out.
+const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR, maxSessions: () => Number(setting('FV_MAX_SESSIONS')) || 1,
+  maxSessionMs: () => Math.max(0, Number(setting('FV_MAX_SESSION_S') ?? 180) || 0) * 1000,
+  demoGraph: () => demoGraph ?? buildGraph(defaultConfig()),
+  hostGraph: (g) => {
+    demoGraph = g;
+    void writeFile(DEMO_GRAPH_FILE, JSON.stringify(g)).catch((e) => console.error('[server] could not save the demo pipeline:', e));
+  },
+});
+// ws buffers a whole message before handing it over, so the cap must hold at the socket: a visitor sends mic frames
+// and controls (small), the host also replay bundles (large).
+const hostWss = new WebSocketServer({ noServer: true, maxPayload: HOST_MAX_MESSAGE });
+const visitorWss = new WebSocketServer({ noServer: true, maxPayload: VISITOR_MAX_MESSAGE });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');
-  if (url.pathname === '/api/acp') {
-    if (!localOnly(req)) return socket.destroy();
-    return wss.handleUpgrade(req, socket, head, (client) => void acp(client).catch((e: unknown) => client.close(1011, String(e).slice(0, 120))));
-  }
-  const m = /^\/api\/deepgram(\/.*)$/.exec(url.pathname);
-  if (!m || !localOnly(req)) return socket.destroy();
-  wss.handleUpgrade(req, socket, head, (client) => {
-    const up = upstreams.deepgram;
-    if (!configured(up)) return client.close(1011, 'DEEPGRAM_API_KEY is not set (set it in Settings)');
-    const remote = new WebSocket(baseOf(up) + m[1] + url.search, { headers: up.headers(keyOf(up)) });
-    const queued: { data: Buffer; binary: boolean }[] = [];
-    client.on('message', (data: Buffer, binary) => {
-      if (remote.readyState === WebSocket.OPEN) remote.send(data, { binary });
-      else queued.push({ data, binary });
-    });
-    remote.on('open', () => {
-      for (const q of queued.splice(0)) remote.send(q.data, { binary: q.binary });
-    });
-    remote.on('message', (data: Buffer, binary) => client.readyState === WebSocket.OPEN && client.send(data, { binary }));
-    remote.on('unexpected-response', (_r, res) => {
-      client.close(1011, `deepgram HTTP ${res.statusCode}`.slice(0, 120));
-    });
-    // A close reason over 123 bytes throws; keep it short.
-    remote.on('close', (code, reason) => client.readyState === WebSocket.OPEN && client.close(sendableCode(code), reason.subarray(0, 120)));
-    remote.on('error', (e) => client.readyState === WebSocket.OPEN && client.close(1011, String(e).slice(0, 120)));
-    client.on('close', () => remote.readyState <= WebSocket.OPEN && remote.close());
-  });
+  if (url.pathname !== '/api/live' || !allowed(req, url.pathname)) return socket.destroy();
+  const host = isHost(req);
+  (host ? hostWss : visitorWss).handleUpgrade(req, socket, head, (ws) => live.handle(ws, { host }));
 });
-
-/**
- * Workers: one agent process per connection, speaking ACP (newline-delimited
- * JSON-RPC) on stdin/stdout. Each line goes to the browser as one text frame
- * and back, unchanged, so the browser records the whole conversation. The
- * first frame is ours, {$open}, with the folder the agent runs in; stderr
- * lines come as {$stderr}, for errors.
- */
-const agents = new Set<number>();
-// Detached agents outlive the proxy unless it takes them down with it.
-process.on('exit', () => {
-  for (const pid of agents) {
-    try {
-      process.kill(-pid, 'SIGTERM');
-    } catch {
-      // already gone
-    }
-  }
-});
-for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]] as const) process.on(sig, () => process.exit(code));
-
-async function acp(client: WebSocket) {
-  // The browser starts talking as soon as the socket opens: hold its lines until the agent is up.
-  const early: string[] = [];
-  let write = (line: string) => void early.push(line);
-  client.on('message', (data: Buffer) => write(data.toString('utf8')));
-  // The browser may hang up while the agent is still starting: stop it as soon as there is one.
-  let hungUp = false;
-  let onHangUp = () => void (hungUp = true);
-  client.on('close', () => onHangUp());
-  const command = setting('FV_ACP_COMMAND');
-  if (!command) return client.close(1011, 'FV_ACP_COMMAND is not set (set it in Settings)');
-  const cwd = resolve(setting('FV_ACP_CWD')!);
-  await mkdir(cwd, { recursive: true });
-  if (hungUp) return;
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  const key = keyOf(upstreams.anthropic);
-  if (key) env.ANTHROPIC_API_KEY = key;
-  if (settingSource('ANTHROPIC_BASE_URL') !== 'default') env.ANTHROPIC_BASE_URL = baseOf(upstreams.anthropic);
-  // Its own process group: the command runs through a shell (npx, pnpm exec …), and stopping must reach the agent under it.
-  const child = spawn(command, { cwd, env, shell: true, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
-  const kill = (sig: NodeJS.Signals) => {
-    try {
-      process.kill(-child.pid!, sig);
-    } catch {
-      // already gone
-    }
-  };
-  if (child.pid) agents.add(child.pid);
-  const send = (line: string) => client.readyState === WebSocket.OPEN && client.send(line);
-  send(JSON.stringify({ $open: { cwd, command, pid: child.pid ?? null } }));
-  createInterface({ input: child.stdout }).on('line', (line) => line.trim() && send(line));
-  createInterface({ input: child.stderr }).on('line', (line) => {
-    console.warn(`[acp ${child.pid}] ${line}`);
-    send(JSON.stringify({ $stderr: line }));
-  });
-  child.stdin.on('error', () => {});
-  write = (line) => void (child.stdin.writable && child.stdin.write(`${line}\n`));
-  for (const line of early.splice(0)) write(line);
-  child.on('error', (e) => client.readyState === WebSocket.OPEN && client.close(1011, `could not start the agent: ${String(e)}`.slice(0, 120)));
-  // 'close', not 'exit': it comes after stdout and stderr are drained, so the last lines go out first.
-  child.on('close', (code, signal) => {
-    agents.delete(child.pid!);
-    if (client.readyState === WebSocket.OPEN) client.close(code === 0 ? 1000 : 1011, `agent exited (${signal ?? code})`);
-  });
-  onHangUp = () => {
-    if (child.exitCode === null && child.pid) {
-      kill('SIGTERM');
-      setTimeout(() => child.exitCode === null && kill('SIGKILL'), 3000).unref();
-    }
-  };
-}
 
 // Last resort: one bad request must not stop the proxy, which would drop every connection of a live session.
-process.on('uncaughtException', (e) => console.error('[proxy] uncaught error, still running:', e));
+process.on('uncaughtException', (e) => console.error('[server] uncaught error, still running:', e));
 
 server.listen(PORT, '127.0.0.1', () => {
   const keys = Object.entries(upstreams)
     .map(([k, u]) => `${k}:${configured(u) ? 'ok' : 'off'}`)
     .join(' ');
-  console.log(`frankenvoice proxy on http://127.0.0.1:${PORT}  [${keys}]  sessions -> ${sessionsDir()}  settings -> ${SETTINGS_FILE}`);
+  const mode = HOST_TOKEN ? `  hosted (token)${STATIC_DIR ? `, UI from ${STATIC_DIR}` : ''}` : '';
+  console.log(`frankenvoice server on http://127.0.0.1:${PORT}${mode}  [${keys}]  sessions -> ${sessionsDir()}  settings -> ${SETTINGS_FILE}`);
 });

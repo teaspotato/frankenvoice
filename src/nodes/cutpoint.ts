@@ -1,6 +1,6 @@
 /**
  * Where to stop agent speech that is cut off, and where to pick it up again, so neither falls in
- * the middle of a sound. Works on the audio alone (Aura gives no word timings): energy in 10 ms
+ * the middle of a sound. Works on the audio alone (word timings may be missing): energy in 10 ms
  * frames, a "quiet point" being a frame well below the speech level around it.
  */
 

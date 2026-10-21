@@ -102,7 +102,7 @@ export const turnModelNode: NodeDef<TurnModelParams> = {
   type: 'turnmodel.ssl',
   title: 'Turn model (ssl_turn)',
   category: 'control',
-  description: 'Streaming turn-taking model (WebGPU or WASM, in-browser): end-of-turn and take-the-floor scores per 80 ms for the user and the agent.',
+  description: 'Streaming turn-taking model (onnxruntime-node on the server CPU): end-of-turn and take-the-floor scores per 80 ms for the user and the agent.',
   ...ports,
   params: [
     {
@@ -110,7 +110,7 @@ export const turnModelNode: NodeDef<TurnModelParams> = {
       label: 'Model files URL',
       type: 'string',
       default: 'https://huggingface.co/spaces/shinohararin/turn-playground/resolve/main/models/',
-      description: 'Folder holding the encoder and head.onnx. Downloaded once, then cached by the browser.',
+      description: 'Folder holding the encoder and head.onnx. Downloaded once, then cached by the server.',
     },
     {
       key: 'encoder',
@@ -120,7 +120,7 @@ export const turnModelNode: NodeDef<TurnModelParams> = {
       default: 'encoder_k2_w16.onnx',
       description: 'k2 runs every 160 ms, k4 every 320 ms (cheaper, later).',
     },
-    { key: 'ep', label: 'Backend', type: 'select', options: ['auto', 'webgpu', 'wasm'], default: 'auto', description: 'auto: WebGPU when the browser has it, else CPU (WASM).' },
+    { key: 'ep', label: 'Backend', type: 'select', options: ['auto', 'cpu'], default: 'auto', description: 'The server runs it on the CPU (onnxruntime-node).' },
     { key: 'eotThreshold', label: 'End-of-turn threshold', type: 'number', default: 0.64, description: 'TurnBench dev operating point.' },
     { key: 'intThreshold', label: 'Take-the-floor threshold', type: 'number', default: 0.18, description: 'TurnBench dev operating point.' },
     { key: 'refractoryMs', label: 'Refractory (ms)', type: 'number', default: 500, description: 'Minimum time between two events of the same kind.' },

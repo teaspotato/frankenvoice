@@ -64,7 +64,8 @@ class Segmenter {
       if (this.silenceFrames >= redemption) {
         this.speaking = false;
         this.ctx.setState('speaking', false);
-        this.ctx.emit('vad', { type: 'vad.speech_end', track, at: this.silenceStart, from: this.candidateStart, p });
+        // silentMs: the silence already heard when this is sent (the hangover), so listeners can time from the speech's real end.
+        this.ctx.emit('vad', { type: 'vad.speech_end', track, at: this.silenceStart, from: this.candidateStart, p, silentMs: this.silenceFrames * this.frameMs });
         this.candidateStart = -1;
         this.speechFrames = 0;
         this.silenceFrames = 0;
@@ -74,6 +75,9 @@ class Segmenter {
     }
   }
 }
+
+/** FireRedVAD defaults: the shared segmenter settings, plus the 5-frame smoothing FireRedVAD's own postprocessor uses. Not tuned yet. */
+const FIRERED_DEFAULTS = { smoothFrames: 5, threshold: 0.5, negThreshold: 0.35, minSpeechMs: 96, redemptionMs: 320 };
 
 interface SileroParams extends SegmenterParams {
   model: string;
@@ -117,6 +121,86 @@ export const sileroVadNode: NodeDef<SileroParams> = {
         framer.push(msg, (frame, track, start, end) => {
           pending.push({ track, start, end });
           io!.send(null, { bin: bytesFromF32(frame), media: { track, start, end }, logBin: false });
+        });
+      },
+      stop() {
+        io?.close();
+      },
+    };
+  },
+};
+
+interface FireRedParams extends SegmenterParams {
+  smoothFrames: number;
+}
+
+/** Shared segmenter params with defaults suited to a model, e.g. one with a different frame rate. */
+const withDefaults = (d: Partial<Record<keyof SegmenterParams, number | boolean>>): ParamDef[] =>
+  segmenterParams.map((p) => (d[p.key as keyof SegmenterParams] !== undefined ? { ...p, default: d[p.key as keyof SegmenterParams]! } : p));
+
+/**
+ * FireRedVAD (streaming DFSMN, FireRedTeam/FireRedVAD, Apache-2.0). Inference runs in the browser behind
+ * the 'firered' channel: 30 ms chunks in, one probability per 10 ms frame out, so its outputs replay as-is.
+ * Frame k of the stream covers samples [160k, 160k + 400); its probability is smoothed over the last
+ * `smoothFrames` frames (as FireRedVAD's own postprocessor does) before the segmenter sees it.
+ */
+export const fireredVadNode: NodeDef<FireRedParams> = {
+  type: 'vad.firered',
+  title: 'FireRedVAD',
+  category: 'vad',
+  description: 'FireRedVAD streaming voice activity detection (ONNX, in-browser): Kaldi fbank, causal DFSMN, 10 ms frames at 16 kHz.',
+  inputs: [{ name: 'audio', type: 'audio' }],
+  outputs: [{ name: 'vad', type: 'vad' }],
+  params: [
+    { key: 'smoothFrames', label: 'Smoothing (frames of 10 ms)', type: 'number', default: FIRERED_DEFAULTS.smoothFrames },
+    ...withDefaults(FIRERED_DEFAULTS),
+  ],
+  channels: [{ name: 'firered', description: 'Audio chunks in, per-frame speech probabilities out' }],
+  create(ctx) {
+    const CHUNK = 480;
+    const HOP = 160;
+    const WINDOW = 400;
+    const framer = new Framer(CHUNK);
+    let seg: Segmenter | undefined;
+    let io: ReturnType<typeof ctx.io.open> | undefined;
+    /** Chunks sent and not yet answered, with where each sits in the stream the model has seen. */
+    const pending: { track: string; start: number; v: number }[] = [];
+    let sent = 0;
+    let frame = 0;
+    const recent: number[] = [];
+    let sum = 0;
+    return {
+      onInput(_port, msg: Msg) {
+        if (!isAudioMsg(msg)) return;
+        if (!io) {
+          if (msg.sampleRate !== 16000) ctx.log('error', `FireRedVAD expects 16 kHz audio, got ${msg.sampleRate}`);
+          seg = new Segmenter(ctx, (HOP / msg.sampleRate) * 1000);
+          io = ctx.io.open('firered', { model: 'stream-vad', sampleRate: msg.sampleRate, chunkSamples: CHUNK }, {
+            onRecv(data) {
+              const { p } = data as { p: number[] };
+              const c = pending.shift();
+              if (!c) return;
+              const n = Math.max(1, Math.round(ctx.params.smoothFrames));
+              for (const x of p) {
+                // This frame's window ends inside the chunk that completed it.
+                const end = c.start + (frame++ * HOP + WINDOW - c.v);
+                recent.push(x);
+                sum += x;
+                while (recent.length > n) sum -= recent.shift()!;
+                seg!.push(Math.round((sum / recent.length) * 1e4) / 1e4, c.track, end - WINDOW, end);
+              }
+            },
+            onClose(data) {
+              ctx.setState('status', 'closed');
+              if (data) ctx.log('warn', 'VAD model closed', data);
+            },
+          });
+          ctx.setState('status', 'running');
+        }
+        framer.push(msg, (chunk, track, start, end) => {
+          pending.push({ track, start, v: sent });
+          sent += chunk.length;
+          io!.send(null, { bin: bytesFromF32(chunk), media: { track, start, end }, logBin: false });
         });
       },
       stop() {

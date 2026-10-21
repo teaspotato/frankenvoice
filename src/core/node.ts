@@ -14,7 +14,7 @@ export interface ParamDef {
   default: Json;
   options?: string[];
   description?: string;
-  /** Show (and use) this param only when other params have one of these values, e.g. {provider: ['deepgram']}. */
+  /** Show (and use) this param only when other params have one of these values, e.g. {decide: ['typesafe']}. */
   when?: Record<string, Json[]>;
 }
 
@@ -92,7 +92,7 @@ export interface NodeDef<P = any> {
   outputs: PortDef[];
   params: ParamDef[];
   channels?: ChannelDef[];
-  /** Proxy upstreams (API keys) this node needs with these params, e.g. ['anthropic'] or ['openai/openrouter']. */
+  /** Proxy upstreams (API keys) this node needs with these params, e.g. ['gpubox'] or ['typesafe']. */
   requires?(params: Record<string, Json>): string[];
   create(ctx: NodeContext<P>): NodeImpl;
 }

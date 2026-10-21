@@ -16,6 +16,9 @@ interface PlayedSegment {
   announced?: number;
   /** Pauses inside it: when, and for how long. */
   gaps?: { at: number; ms: number }[];
+  /** Its utterance's flags (tagged replies): whether the user may cut it off, and whether the quick yield applies. */
+  interruptible?: boolean;
+  gate?: boolean;
 }
 
 /** How long `s` was paused before `at`. */
@@ -66,6 +69,12 @@ export function heardText(segs: PlayedSegment[], at: number): string {
  * sustained and faded over a short tail (or, with no tail, faded out over a release).
  * A resume picks up from the start of the word it stopped in (word timings
  * from tts.words), fading in, so the word is heard whole.
+ *
+ * Turn-taking can let the page stop playback on its own (control `gate`, until
+ * a session time): the page runs a VAD on the mic and, when it hears the user
+ * start, fades the reply out at once and reports when (a speaker recv, so a
+ * replay has it). That is a pause at the reported time (playback.paused with
+ * `gate`); turn-taking then resumes or cancels as for any pause.
  */
 interface SpeakerParams {
   cutoff: 'syllable' | 'hard';
@@ -120,7 +129,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
     },
     { key: 'attackMs', label: 'Attack (ms)', type: 'number', default: 10, description: 'Fade-in when resuming.' },
   ],
-  channels: [{ name: 'speaker', description: 'Scheduled playback through Web Audio', output: true }],
+  channels: [{ name: 'speaker', description: "Scheduled playback, rendered with Web Audio in the page; the page reports late starts", output: true }],
   create(ctx) {
     let io: ReturnType<typeof ctx.io.open> | undefined;
     let endAt = 0;
@@ -193,10 +202,20 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       ctx.emit('played', { type: 'audio', track: c.track, start: c.start, end: c.end, sampleRate: c.sampleRate, samples: c.samples, at: c.at });
     };
     const announce = (r: string | null, s: PlayedSegment) =>
-      ctx.emit('playback', { type: 'playback.segment', rid: r as string, seg: s.seg, text: s.text, at: s.announced! });
+      ctx.emit('playback', {
+        type: 'playback.segment',
+        rid: r as string,
+        seg: s.seg,
+        text: s.text,
+        at: s.announced!,
+        ...(s.interruptible !== undefined ? { interruptible: s.interruptible } : {}),
+        ...(s.gate !== undefined ? { gate: s.gate } : {}),
+      });
 
     /** Backchannels playing or recently played; they play on their own output, which a flush doesn't stop. */
     let cues: Chunk[] = [];
+    /** When each backchannel's audio so far ends, so its next piece follows on. */
+    const cueEnd = new Map<string, number>();
     /** The reply's output was flushed at `at`: cut the echo reference there, but put back the cues still sounding. */
     const flushPlayed = (at: number) => {
       ctx.emit('played', { type: 'played.flush', at });
@@ -244,15 +263,10 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       return { silent, echo: () => flushPlayed(silent) };
     };
 
-    const pause = () => {
-      const at = ctx.now();
-      const cut = cutPoint(at);
-      const { silent, echo } = flushAt(cut);
-      silentAt = silent;
+    /** Hold what hasn't played, from `from` where it resumes; the chunk playing there is split. */
+    const holdFrom = (from: number) => {
       endTimer?.clear();
       endTimer = undefined;
-      // Keep what hasn't played, from where it resumes; the chunk playing there is split.
-      const from = cut.from;
       queued = queued.flatMap((c) => {
         const dur = (c.samples.length / c.sampleRate) * 1000;
         if (c.at + dur <= from) return [];
@@ -263,14 +277,41 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       paused = from;
       endAt = Math.max(endAt, from);
       ctx.setState('paused', true);
+    };
+    const pause = () => {
+      const cut = cutPoint(ctx.now());
+      const { silent, echo } = flushAt(cut);
+      silentAt = silent;
+      holdFrom(cut.from);
       echo();
-      ctx.emit('playback', { type: 'playback.paused', rid, at: silent, ...(from !== silent ? { from } : {}) });
+      ctx.emit('playback', { type: 'playback.paused', rid, at: silent, ...(cut.from !== silent ? { from: cut.from } : {}) });
+    };
+    /** Where the page stopped playback on its own (gate), while paused so: what was heard ends there. */
+    let gateStop: number | null = null;
+    /**
+     * The page heard the user start at `at` and cut playback off as this speaker would: the sound
+     * ended at `stop` (the syllable's end) and was silent at `silent`, after the tail or release.
+     */
+    const pageStop = (d: { at: number; pos?: number; stop?: number | null; silent?: number | null }) => {
+      // The page drops what it is sent after stopping, until this.
+      io?.send({ cmd: 'flush' });
+      if (!playing || paused !== null) return void ctx.log('debug', 'the page stopped playback, nothing playing here', d as unknown as Json);
+      const at = Math.min(d.at, ctx.now());
+      const stop = typeof d.stop === 'number' ? Math.max(at, d.stop) : at;
+      const silent = typeof d.silent === 'number' ? Math.max(stop, d.silent) : at + Math.max(0, p.releaseMs);
+      const from = Math.min(cutPoint(at).from, stop);
+      silentAt = Math.max(silentAt, silent);
+      holdFrom(from);
+      gateStop = stop;
+      flushPlayed(silent);
+      ctx.emit('playback', { type: 'playback.paused', rid, at: silent, from, gate: true, cut: stop, ...(typeof d.pos === 'number' ? { pos: d.pos } : {}) });
     };
     const resume = () => {
       const from = paused!;
       const at = Math.max(ctx.now(), silentAt);
       const shift = at - from;
       paused = null;
+      gateStop = null;
       endAt += shift;
       ctx.setState('paused', false);
       ctx.emit('playback', { type: 'playback.resumed', rid, at, from, shift });
@@ -307,6 +348,7 @@ export const speakerNode: NodeDef<SpeakerParams> = {
     const end = () => {
       setGain(1);
       queued = [];
+      gateStop = null;
       if (paused !== null) {
         paused = null;
         ctx.setState('paused', false);
@@ -335,7 +377,11 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       start() {
         io = ctx.io.open('speaker', {}, {
           onRecv(data) {
-            ctx.setState('device', data);
+            // The page reports how late a run of playback started (its audio arrived after its time).
+            const d = data as { type?: string; ms?: number; at?: number };
+            if (d?.type === 'late') ctx.setState('lateMs', d.ms ?? null);
+            else if (d?.type === 'gate' && typeof d.at === 'number') pageStop(d as { at: number; stop?: number | null; silent?: number | null });
+            else ctx.setState('device', data);
           },
         });
       },
@@ -345,6 +391,8 @@ export const speakerNode: NodeDef<SpeakerParams> = {
           else if (msg.type === 'unduck') setGain(1);
           if (msg.type === 'pause' && playing && paused === null) pause();
           else if (msg.type === 'resume' && paused !== null) resume();
+          if (msg.type === 'gate')
+            io?.send({ cmd: 'gate', until: (msg.until as number | null) ?? null, cutoff: p.cutoff, maxFinishMs: p.maxFinishMs, tailMs: p.tailMs, releaseMs: p.releaseMs });
           if (msg.type === 'cancel') setGain(1);
           if (msg.type === 'cancel' && playing) {
             const wasPaused = paused !== null;
@@ -354,7 +402,8 @@ export const speakerNode: NodeDef<SpeakerParams> = {
             const at = flushed ? flushed.silent : Math.max(ctx.now(), silentAt);
             if (cut) silentAt = at;
             // `heardAt`: keep the reply only up to then (where the user's aside over it started).
-            const until = cut ? cut.stop : clock();
+            const until = cut ? cut.stop : (gateStop ?? clock());
+            gateStop = null;
             const heard = heardText(segs.get(rid) ?? [], typeof msg.heardAt === 'number' ? Math.min(msg.heardAt, until) : until);
             endTimer?.clear();
             endTimer = undefined;
@@ -375,10 +424,22 @@ export const speakerNode: NodeDef<SpeakerParams> = {
         if (msg.type === 'tts.segment_start') {
           const r = (msg.rid as string) ?? null;
           if (!segs.has(r)) segs.set(r, []);
-          const s: PlayedSegment = { seg: msg.seg as number, text: msg.text as string, announced: Math.max(clock(), endAt) };
+          const s: PlayedSegment = {
+            seg: msg.seg as number,
+            text: msg.text as string,
+            announced: Math.max(clock(), endAt),
+            ...(typeof msg.interruptible === 'boolean' ? { interruptible: msg.interruptible } : {}),
+            ...(typeof msg.gate === 'boolean' ? { gate: msg.gate } : {}),
+          };
           segs.get(r)!.push(s);
           // While paused it is announced on resume, when its time is known.
           if (paused === null || r !== rid) announce(r, s);
+          return;
+        }
+        if (msg.type === 'tts.segment_text') {
+          // A segment that started playing before all its words were written (word-streaming TTS).
+          const s = segs.get((msg.rid as string) ?? null)?.find((x) => x.seg === msg.seg);
+          if (s) s.text = msg.text as string;
           return;
         }
         if (msg.type === 'tts.words') {
@@ -394,8 +455,10 @@ export const speakerNode: NodeDef<SpeakerParams> = {
         }
         if (!isAudioMsg(msg)) return;
         if (msg.cue) {
-          // A backchannel: plays now, over whatever is playing, and starts no reply.
-          const at = ctx.now();
+          // A backchannel: plays now, over whatever is playing, and starts no reply; nothing stops it.
+          // A streamed one (generated) comes in pieces: each plays right after the one before.
+          const prev = cueEnd.get(msg.rid as string);
+          const at = Math.max(ctx.now(), prev ?? -Infinity);
           io?.send({ cmd: 'cue', at, sampleRate: msg.sampleRate }, {
             bin: bytesFromF32(msg.samples),
             media: { track: msg.track, start: msg.start, end: msg.end },
@@ -403,7 +466,10 @@ export const speakerNode: NodeDef<SpeakerParams> = {
           });
           ctx.emit('played', { type: 'audio', track: msg.track, start: msg.start, end: msg.end, sampleRate: msg.sampleRate, samples: msg.samples, at, cue: true });
           cues = [...cues.filter((c) => c.at + (c.samples.length / c.sampleRate) * 1000 > at), { at, track: msg.track, start: msg.start, end: msg.end, sampleRate: msg.sampleRate, samples: msg.samples }];
-          ctx.emit('playback', { type: 'playback.cue', rid: msg.rid as Json, at, end: at + (msg.samples.length / msg.sampleRate) * 1000 });
+          const end = at + (msg.samples.length / msg.sampleRate) * 1000;
+          for (const [k, t] of cueEnd) if (t < at - 5000) cueEnd.delete(k);
+          cueEnd.set(msg.rid as string, end);
+          ctx.emit('playback', { type: 'playback.cue', rid: msg.rid as Json, at, end, ...(prev !== undefined ? { more: true } : {}) });
           return;
         }
         const r = (msg.rid as string) ?? null;

@@ -1,9 +1,9 @@
 import { registry } from '../nodes';
 import type { Json } from '../core/types';
 import type { Activity } from './activity';
-import type { TurnModelLoad } from '../drivers';
+import type { TurnModelLoad } from '../live-protocol';
 import { loadingState } from '../nodes/turn-model';
-import { activeStages, STAGES, stageParams, stageType, type PipelineConfig, type StageId } from '../pipeline';
+import { STAGES, stageType, type PipelineConfig, type StageId } from '../pipeline';
 
 const W = 150;
 const H = 64;
@@ -24,9 +24,9 @@ const POS: Record<StageId, [number, number]> = {
   backchannel: [810, 206],
   llm: [810, 88],
   opener: [1010, 88],
-  workers: [1010, 330],
   tts: [1210, 88],
   speaker: [1410, 88],
+  sched: [1210, 206],
 };
 const VIEW_W = 1570;
 const VIEW_H = 410;
@@ -92,8 +92,8 @@ export function PipelineView({
   selected: StageId | null;
   onSelect(id: StageId | null): void;
 }) {
-  const stages = activeStages(config);
-  const out: StageId = stages.some((s) => s.id === 'speaker') ? 'speaker' : 'tts';
+  const stages = STAGES;
+  const r = 10;
   const edges: Edge[] = [
     link('mic.audio', right('mic'), left('cleanup'), 'audio'),
     link('cleanup.audio', right('cleanup'), left('vad'), 'clean'),
@@ -107,8 +107,9 @@ export function PipelineView({
     link('llm.text', right('llm'), left('opener'), 'text'),
     link('opener.text', right('opener'), left('tts'), 'text'),
     // Backchannels hear the user (speech, words, turn model) through turn-taking's view of the floor.
-    ...(stages.some((s) => s.id === 'backchannel') ? [link('turn.turn', right('turn'), left('backchannel'), 'floor'), link('backchannel.text', right('backchannel'), left('tts'), 'lines')] : []),
-    ...(out === 'speaker' ? [link('tts.audio', right('tts'), left('speaker'), 'audio')] : []),
+    link('turn.turn', right('turn'), left('backchannel'), 'floor'),
+    link('backchannel.text', right('backchannel'), left('tts'), 'lines'),
+    link('tts.audio', right('tts'), left('speaker'), 'audio'),
   ];
   // Early interjection, under turn-taking: the words so far down to it, the "interrupt?" check up into the LLM, and the take back up.
   {
@@ -123,20 +124,26 @@ export function PipelineView({
       edges.push({ src: 'interject.check', d: `M${sx},${iy} L${sx},${ky + 8} Q${sx},${ky} ${sx + 8},${ky} L${lx - 8},${ky} Q${lx},${ky} ${lx},${ky - 8} L${lx},${POS.llm[1] + H + 2}`, label: 'interrupt?', lx: lx + 34, ly: POS.llm[1] + H + 12 });
     }
   }
-  // Delegation: tasks out of the LLM's right side, down the gap beside the opener to the workers, and their news back.
+  // The tick scheduler under TTS: the TTS queue down into it, and the pace out of its left up into the LLM.
   {
-    const [rx, ry] = [POS.llm[0] + W, POS.llm[1] + H / 2];
-    const [wx, wy] = POS.workers;
-    const gap = (POS.opener[0] - rx) / 2;
-    edges.push({ src: 'llm.workers', d: `M${rx},${ry - 8} L${rx + gap + 8},${ry - 8} L${rx + gap + 8},${wy + H * 0.35} L${wx - 2},${wy + H * 0.35}`, label: 'tasks', lx: rx + gap + 30, ly: wy - 40 });
-    edges.push({ src: 'workers.updates', d: `M${wx},${wy + H * 0.7} L${rx + gap - 8},${wy + H * 0.7} L${rx + gap - 8},${ry + 8} L${rx + 2},${ry + 8}`, label: 'results', lx: rx + gap - 44, ly: wy + H * 0.7 - 6 });
+    const [sx, sy] = POS.sched;
+    edges.push({ src: 'tts.audio', d: `M${sx + 40},${POS.tts[1] + H} L${sx + 40},${sy - 2}`, label: 'queue', lx: sx + 20, ly: sy - 26 });
+    if (registry[stageType(config, 'llm')].inputs.some((p) => p.name === 'sched')) {
+      const [gx, ky, lx] = [POS.opener[0] - 25, CONTROL_Y - 14, POS.llm[0] + W - 20];
+      edges.push({
+        src: 'sched.control',
+        d: `M${sx},${sy + H / 2} L${gx + r},${sy + H / 2} Q${gx},${sy + H / 2} ${gx},${sy + H / 2 - r} L${gx},${ky + r} Q${gx},${ky} ${gx - r},${ky} L${lx + r},${ky} Q${lx},${ky} ${lx},${ky - r} L${lx},${POS.llm[1] + H + 2}`,
+        label: 'pace',
+        lx: gx + 22,
+        ly: sy + H / 2 - 6,
+      });
+    }
   }
-  // Playback feedback: up from the output stage, back over the row, down into turn-taking.
-  const [ox, oy] = [POS[out][0] + W / 2, POS[out][1]];
+  // Playback feedback: up from the speaker, back over the row, down into turn-taking.
+  const [ox, oy] = [POS.speaker[0] + W / 2, POS.speaker[1]];
   const [tx, ty] = [POS.turn[0] + W / 2, POS.turn[1]];
-  const r = 10;
   edges.push({
-    src: `${out}.playback`,
+    src: 'speaker.playback',
     d: `M${ox},${oy} L${ox},${FEEDBACK_Y + r} Q${ox},${FEEDBACK_Y} ${ox - r},${FEEDBACK_Y} L${tx + r},${FEEDBACK_Y} Q${tx},${FEEDBACK_Y} ${tx},${FEEDBACK_Y + r} L${tx},${ty - 2}`,
     label: 'playback (what was heard)',
     lx: (ox + tx) / 2,
@@ -147,7 +154,7 @@ export function PipelineView({
   if (registry[stageType(config, 'turn')].outputs.some((p) => p.name === 'control')) {
     const sx = POS.turn[0] + W / 2 + 30;
     const by = POS.turn[1] + H;
-    const targets = (['llm', 'tts', ...(out === 'speaker' ? ['speaker'] : [])] as StageId[]).map((id) => POS[id][0] + W / 2 + 30);
+    const targets = (['llm', 'tts', 'speaker'] as StageId[]).map((id) => POS[id][0] + W / 2 + 30);
     const last = targets[targets.length - 1];
     edges.push({
       src: 'turn.control',
@@ -159,7 +166,7 @@ export function PipelineView({
     for (const tx of targets.slice(0, -1)) edges.push({ src: 'turn.control', d: `M${tx},${CONTROL_Y} L${tx},${by + 2}`, label: '', lx: 0, ly: 0 });
   }
 
-  if (out === 'speaker' && registry[stageType(config, 'cleanup')].inputs.some((p) => p.name === 'ref')) {
+  if (registry[stageType(config, 'cleanup')].inputs.some((p) => p.name === 'ref')) {
     const [sx, sy] = [POS.speaker[0] + W / 2, POS.speaker[1] + H];
     const [cx, cy] = [POS.cleanup[0] + W / 2, POS.cleanup[1] + H];
     edges.push({
@@ -172,7 +179,7 @@ export function PipelineView({
   }
 
   // The agent's channel for the turn model: what the speaker played, along the bottom and up the gap left of the column.
-  if (out === 'speaker') {
+  {
     const [sx, sy] = [POS.speaker[0] + W / 2 + 20, POS.speaker[1] + H];
     const gx = POS.turnmodel[0] - 16;
     const ey = POS.turnmodel[1] + H - 12;
@@ -205,14 +212,13 @@ export function PipelineView({
         const type = stageType(config, s.id);
         const def = registry[type];
         const [x, y] = POS[s.id];
-        const params = stageParams(config, s.id);
         const variant = config[s.id].variant;
-        const impl = typeof params.provider === 'string' ? params.provider : Object.keys(STAGES.find((d) => d.id === s.id)!.variants).length > 1 ? variant : '';
+        const impl = Object.keys(s.variants).length > 1 ? variant : '';
         const state = s.id === 'turnmodel' && !running && turnModel ? preloadState(turnModel) : stateTypes[s.id] === type ? states[s.id] : undefined;
         const on = activity.stages.get(s.id);
         const dl = state?.download as { label: string; done: number; total: number; fraction: number | null } | null | undefined;
         const lines = Object.entries(state ?? {})
-          .filter(([k, v]) => k !== 'provider' && k !== 'download' && (typeof v !== 'object' || v === null))
+          .filter(([k, v]) => k !== 'download' && (typeof v !== 'object' || v === null))
           .slice(0, 2);
         return (
           <g

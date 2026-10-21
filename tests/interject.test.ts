@@ -162,17 +162,17 @@ describe('the interjection gate', () => {
 });
 
 describe('the LLM on interjection checks', () => {
-  const params = { provider: 'openai-compatible', model: 'm', system: 'sys' };
+  const params = { model: 'm', system: 'sys', utterances: 'plain' };
   const tok = (text: string) => ({ choices: [{ index: 0, delta: { content: text } }] });
   const messages = (r: Json) => (r as { body: { messages: { role: string; content: string }[] } }).body.messages.map((m) => m.content);
   const check = (text: string) => ({ type: 'interject.check', checkId: 'c0', text, prompt: '[cut in? else [listen]]', pass: '[listen]' });
 
-  it('asks with thinking off and a short token limit', () => {
-    const h = harness(llmNode, { provider: 'anthropic', model: 'claude-haiku-5-5', thinking: 'model default', system: 'sys' });
+  it('asks with a short token limit', () => {
+    const h = harness(llmNode, params);
     h.send(0, 'interject', check('The tower is in Berlin.'));
-    expect(h.ios[0].request).toMatchObject({ thinking: { type: 'disabled' }, max_tokens: 300 });
+    expect(h.ios[0].request).toMatchObject({ body: { max_tokens: 300 } });
     h.send(500, 'turn', { type: 'turn.user', turnId: 'u0', text: 'Hi.' });
-    expect((h.ios[1].request as { thinking?: unknown }).thinking).toBeUndefined();
+    expect(h.ios[1].request).toMatchObject({ body: { max_tokens: 4096 } });
   });
 
   it('passes when the reply is the pass reply', () => {

@@ -1,7 +1,7 @@
 // Streaming ssl_turn model: causal FastConformer encoder + cross-speaker turn head, run with
-// onnxruntime-web. Ported from the turn-playground Space (ssl_turn/web/turn_stream.js).
+// onnxruntime-node on the CPU. Ported from the turn-playground Space (ssl_turn/web/turn_stream.js).
 //
-//   const ts = await TurnStream.create(ort, { encoder, head, frames: 2, ep: 'webgpu' });
+//   const ts = await TurnStream.create(ort, { encoder, head, frames: 2 });
 //   for each 80 ms block: const outs = await ts.push(user, agent)   // two Float32Array(1280), 16 kHz
 //   -> [{ t, eot: [c0, c1], int: [c0, c1], silent: [c0, c1], post, fine: [c0, c1] }, ...]
 //
@@ -9,7 +9,7 @@
 // frames. Frame t's newest audio is block t - 1, so with K > 1 the earlier frames of a chunk wait
 // for the last block of the chunk. The first push also returns frame 0 (its feature is zeros).
 
-import type * as Ort from 'onnxruntime-web';
+import type * as Ort from 'onnxruntime-node';
 
 export const FRAME = 1280; // 80 ms at 16 kHz
 const LAYERS = 17;
@@ -49,25 +49,25 @@ export class TurnStream {
   private vc!: Tensor;
   private started = false;
 
-  /** ep: encoder backend ('webgpu' or 'wasm'). The head (3M params) runs on WASM. */
-  static async create(ort: OrtModule, o: { encoder: Uint8Array; head: Uint8Array; frames: number; ep: string }): Promise<TurnStream> {
+  static async create(ort: OrtModule, o: { encoder: Uint8Array; head: Uint8Array; frames: number }): Promise<TurnStream> {
     const self = new TurnStream();
     self.ort = ort;
     self.K = o.frames;
-    const base = { executionProviders: [o.ep], graphOptimizationLevel: 'all' as const };
-    // Caches stay on the GPU between steps; only the features are read back.
-    self.enc = await ort.InferenceSession.create(
-      o.encoder,
-      o.ep === 'webgpu' ? { ...base, preferredOutputLocation: Object.fromEntries(STATE.slice(1).map((n) => [`${n}_out`, 'gpu-buffer' as const])) } : base,
-    );
-    self.head = await ort.InferenceSession.create(o.head, { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
+    // A few threads, and no spin-waiting between blocks: the GPU services share this CPU.
+    const opts = {
+      executionProviders: ['cpu'],
+      graphOptimizationLevel: 'all' as const,
+      intraOpNumThreads: 4,
+      extra: { session: { intra_op: { allow_spinning: '0' }, inter_op: { allow_spinning: '0' } } },
+    };
+    self.enc = await ort.InferenceSession.create(o.encoder, opts);
+    self.head = await ort.InferenceSession.create(o.head, opts);
     self.reset();
     return self;
   }
 
   reset() {
     const T = this.ort.Tensor;
-    for (const s of Object.values(this.state)) if (s.location === 'gpu-buffer') s.dispose();
     this.back = win(this.K) + 1024; // samples kept per channel: the window plus the 1024 it skips
     this.buf = [new Float32Array(this.back), new Float32Array(this.back)];
     this.pending = 0;
@@ -90,7 +90,7 @@ export class TurnStream {
     const o = await this.head.run({ feat: new T('float32', feat, [2, K, FEAT]), n, kcache: this.kc, vcache: this.vc });
     this.kc = o.kcache_out;
     this.vc = o.vcache_out;
-    const [eot, intr, silent, post, fine] = (await Promise.all(['eot', 'int', 'silent', 'post', 'fine'].map((k) => o[k].getData()))) as Float32Array[];
+    const [eot, intr, silent, post, fine] = ['eot', 'int', 'silent', 'post', 'fine'].map((k) => o[k].data) as Float32Array[];
     const out: TurnFrame[] = [];
     for (let j = 0; j < K; j++) {
       out.push({
@@ -129,12 +129,8 @@ export class TurnStream {
       t: new T('int64', BigInt64Array.from([BigInt(this.t)]), [1]),
       ...this.state,
     });
-    for (const name of STATE) {
-      const prev = this.state[name];
-      if (prev.location === 'gpu-buffer') prev.dispose();
-      this.state[name] = o[`${name}_out`];
-    }
-    const feat = (await o.feat.getData(true)) as Float32Array; // [2, K, 1024]; true releases a GPU buffer
+    for (const name of STATE) this.state[name] = o[`${name}_out`];
+    const feat = o.feat.data as Float32Array; // [2, K, 1024]
     out = out.concat(await this.headStep(feat, this.t, K));
     this.t += K;
     return out;

@@ -1,16 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { cutAt, streamingTtsNode } from '../src/nodes/tts/stream';
+import { cutAt, kyutaiTtsNode } from '../src/nodes/tts/stream';
 import { resolveParams, type IOHandlers, type NodeContext } from '../src/core/node';
 import type { Json, Msg } from '../src/core/types';
 
-function harness(params: Record<string, unknown> = {}) {
+function harness(params: Record<string, unknown> = {}, def = kyutaiTtsNode) {
   let now = 0;
   const out: Msg[] = [];
   const ios: { request: Json; h: IOHandlers; closed: boolean; sent: Json[] }[] = [];
   let media = 0;
   const ctx: NodeContext = {
     id: 'tts',
-    params: resolveParams(streamingTtsNode, { alignWords: false, ...params } as never),
+    params: resolveParams(def, { alignWords: false, ...params } as never),
     now: () => now,
     cause: undefined,
     emit: (_port, msg) => (out.push(msg), out.length),
@@ -28,82 +28,186 @@ function harness(params: Record<string, unknown> = {}) {
       append: (track, samples) => ({ track, start: media, end: (media += samples.length) }),
     },
   };
-  const node = streamingTtsNode.create(ctx as never);
+  const node = def.create(ctx as never);
   const send = (t: number, port: string, msg: Msg) => ((now = t), node.onInput?.(port, msg));
   const llm = (t: number, type: string, text = '') => send(t, 'text', { type: `llm.${type}`, rid: 'r0', text });
   const pcm = (n: number) => new Uint8Array(n * 2);
-  const types = () => out.map((m) => m.type);
+  const types = () => out.map((m) => m.type).filter((t) => t !== 'tts.sent');
   return { send, llm, ios, out, pcm, types };
 }
 
-describe('streaming TTS (Deepgram WebSocket)', () => {
+describe('segment cuts', () => {
   it('cuts at sentence ends, and at the first clause of a reply once it is long enough', () => {
     expect(cutAt('Hey, nice', 20)).toBe(-1);
     expect(cutAt('Sure, I can help with that, ', 20)).toBe('Sure, I can help with that, '.length);
     expect(cutAt('Hi there. How', 0)).toBe('Hi there. '.length);
     expect(cutAt('It costs 3.', 0)).toBe(-1);
   });
+});
 
-  it('opens the socket when the LLM starts, then speaks and flushes as text streams in', () => {
-    const h = harness();
+describe('streaming TTS (Kyutai on the GPU box)', () => {
+  const kyutai = (params: Record<string, unknown> = {}) => harness(params, kyutaiTtsNode);
+
+  it('sends whole words as they come, flushes at sentence ends, and closes the text when the LLM ends', () => {
+    const h = kyutai();
     h.llm(0, 'start');
-    expect(h.ios).toHaveLength(1);
-    expect(h.ios[0].request).toEqual({ path: '/v1/speak', query: { model: 'aura-2-thalia-en', encoding: 'linear16', sample_rate: 24000 } });
-    h.llm(100, 'delta', 'Sure, I can help with that');
-    expect(h.ios[0].sent).toEqual([]);
-    h.llm(150, 'delta', ', and more. Then');
-    expect(h.ios[0].sent).toEqual([{ type: 'Speak', text: 'Sure, I can help with that, and more.' }, { type: 'Flush' }]);
+    expect(h.ios[0].request).toEqual({ path: '/v1/tts', query: {} });
+    h.llm(100, 'delta', 'Sure, I can he');
+    expect(h.ios[0].sent).toEqual([{ type: 'Speak', text: 'Sure, I can ' }]);
     h.ios[0].h.onRecv!(null, h.pcm(100));
-    h.ios[0].h.onRecv!(null, new Uint8Array(3)); // odd bytes carry over
-    h.ios[0].h.onRecv!(null, new Uint8Array(1));
+    h.llm(150, 'delta', 'lp. Then');
+    expect(h.ios[0].sent.slice(1)).toEqual([{ type: 'Speak', text: 'help. ' }, { type: 'Flush' }]);
     h.llm(300, 'delta', ' bye.');
     h.llm(310, 'end');
-    expect(h.ios[0].sent.slice(2)).toEqual([{ type: 'Speak', text: 'Then bye.' }, { type: 'Flush' }]);
-    h.ios[0].h.onRecv!({ type: 'Flushed', sequence_id: 0 }, undefined);
+    expect(h.ios[0].sent.slice(3)).toEqual([{ type: 'Speak', text: 'Then ' }, { type: 'Speak', text: 'bye.' }, { type: 'Flush' }, { type: 'Close' }]);
     h.ios[0].h.onRecv!(null, h.pcm(50));
-    h.ios[0].h.onRecv!({ type: 'Flushed', sequence_id: 1 }, undefined);
-    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'audio', 'audio', 'tts.segment_end', 'tts.segment_start', 'audio', 'tts.segment_end', 'tts.response_end']);
-    expect(h.out.filter((m) => m.type === 'audio').map((m) => (m.samples as Float32Array).length)).toEqual([100, 1, 1, 50]);
-    expect(h.out[0]).toMatchObject({ rid: 'r0', seg: 0, text: 'Sure, I can help with that, and more.' });
-    expect(h.ios[0].sent.at(-1)).toEqual({ type: 'Close' });
+    h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
+    h.ios[0].h.onRecv!(null, h.pcm(30));
+    h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
+    expect(h.ios[0].closed).toBe(false);
+    h.ios[0].h.onRecv!({ type: 'Done' }, undefined);
+    h.ios[0].h.onClose!(null);
+    // The first audio plays at once, before its sentence is all written; the rest of its text follows.
+    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.segment_text', 'audio', 'tts.segment_end', 'tts.segment_start', 'audio', 'tts.segment_end', 'tts.response_end']);
+    expect(h.out.filter((m) => m.type === 'tts.segment_start').map((m) => m.text)).toEqual(['Sure, I can', 'Then bye.']);
+    expect(h.out.find((m) => m.type === 'tts.segment_text')).toMatchObject({ seg: 0, text: 'Sure, I can help.' });
+    // Close went out with the end of the text; it is not sent again.
+    expect(h.ios[0].sent.filter((m) => (m as { type: string }).type === 'Close')).toHaveLength(1);
+  });
+
+  it('plays the audio after the last Flushed (the model speaks on), and ends the reply on Done', () => {
+    const h = kyutai();
+    h.llm(0, 'start');
+    h.llm(100, 'delta', 'Reggae it is.');
+    h.llm(110, 'end');
+    h.ios[0].h.onRecv!(null, h.pcm(100));
+    // Flushed comes a little early, and the model's last frames follow it.
+    h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
+    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.segment_end']);
+    expect(h.ios[0].closed).toBe(false);
+    h.ios[0].h.onRecv!(null, h.pcm(40));
+    h.ios[0].h.onRecv!(null, h.pcm(40));
+    h.ios[0].h.onRecv!({ type: 'Done', stats: {} }, undefined);
+    h.ios[0].h.onClose!(null);
+    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.segment_end', 'audio', 'audio', 'tts.response_end']);
+    expect(h.out.filter((m) => m.type === 'audio').map((m) => [m.seg, (m.samples as Float32Array).length])).toEqual([[0, 100], [0, 40], [0, 40]]);
+  });
+
+  it('ends a reply that said nothing at once', () => {
+    const h = kyutai();
+    h.llm(0, 'start');
+    h.llm(10, 'end');
+    expect(h.types()).toEqual(['tts.response_end']);
     expect(h.ios[0].closed).toBe(true);
   });
 
-  it('speaks an opener at once, and the reply goes on the same socket after it', () => {
-    const h = harness();
-    h.llm(0, 'start');
-    h.send(100, 'text', { type: 'opener.say', rid: 'r0', text: 'Hmm, let me see ', line: 'Hmm, let me see' });
-    expect(h.ios[0].sent).toEqual([{ type: 'Speak', text: 'Hmm, let me see' }, { type: 'Flush' }]);
-    h.llm(900, 'delta', 'It is 391. ');
-    expect(h.ios).toHaveLength(1);
-    expect(h.ios[0].sent.slice(2)).toEqual([{ type: 'Speak', text: 'It is 391.' }, { type: 'Flush' }]);
+  it('lets a finished reply play out when the next one starts, and queues the new audio behind it', () => {
+    const h = kyutai();
+    h.send(0, 'text', { type: 'llm.start', rid: 'a' });
+    h.send(10, 'text', { type: 'llm.delta', rid: 'a', text: 'Sure, reggae.' });
+    h.send(20, 'text', { type: 'llm.end', rid: 'a' });
+    h.ios[0].h.onRecv!(null, h.pcm(10));
+    // The next reply starts while the first still renders: the first is not cut.
+    h.send(30, 'text', { type: 'llm.start', rid: 'b' });
+    expect(h.ios[0].closed).toBe(false);
+    expect(h.types()).not.toContain('tts.cancelled');
+    h.send(40, 'text', { type: 'llm.delta', rid: 'b', text: 'Bob Marley. ' });
+    expect(h.ios[1].sent[0]).toEqual({ type: 'Speak', text: 'Bob Marley. ' });
+    // The new reply's audio comes first, but plays after the old one's.
+    h.ios[1].h.onRecv!(null, h.pcm(7));
+    h.ios[0].h.onRecv!(null, h.pcm(20));
+    h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
+    h.ios[0].h.onRecv!(null, h.pcm(30));
+    expect(h.out.filter((m) => m.type === 'audio').map((m) => [m.rid, (m.samples as Float32Array).length])).toEqual([['a', 10], ['a', 20], ['a', 30]]);
+    h.ios[0].h.onClose!(null);
+    h.ios[1].h.onRecv!(null, h.pcm(8));
+    const seq = h.out.filter((m) => m.type !== 'tts.sent').map((m) => `${m.rid}:${m.type}${m.type === 'audio' ? (m.samples as Float32Array).length : ''}`);
+    expect(seq).toEqual(['a:tts.segment_start', 'a:audio10', 'a:audio20', 'a:tts.segment_end', 'a:audio30', 'a:tts.response_end', 'b:tts.segment_start', 'b:audio7', 'b:audio8']);
   });
 
-  it('synthesizes the opener\'s lines ahead and plays one without a request', () => {
-    const h = harness();
-    h.send(0, 'text', { type: 'opener.lines', lines: ['Hmm, let me think.', 'Let me see.'] });
+  it('cuts a reply still being written when the next one starts', () => {
+    const h = kyutai();
+    h.send(0, 'text', { type: 'llm.start', rid: 'a' });
+    h.send(10, 'text', { type: 'llm.delta', rid: 'a', text: 'Sure, reggae ' });
+    h.send(30, 'text', { type: 'llm.start', rid: 'b' });
+    expect(h.ios[0].closed).toBe(true);
+    expect(h.out.at(-1)).toEqual({ type: 'tts.cancelled', rid: 'a' });
+  });
+
+  it('a cancel cuts both the reply playing out and the new one, at once', () => {
+    const h = kyutai();
+    h.send(0, 'text', { type: 'llm.start', rid: 'a' });
+    h.send(10, 'text', { type: 'llm.delta', rid: 'a', text: 'Sure, reggae.' });
+    h.send(20, 'text', { type: 'llm.end', rid: 'a' });
+    h.ios[0].h.onRecv!(null, h.pcm(10));
+    h.send(30, 'text', { type: 'llm.start', rid: 'b' });
+    h.send(40, 'text', { type: 'llm.delta', rid: 'b', text: 'Bob Marley. ' });
+    h.ios[1].h.onRecv!(null, h.pcm(7));
+    h.send(50, 'control', { type: 'cancel' });
+    expect(h.ios[0].closed).toBe(true);
+    expect(h.ios[1].closed).toBe(true);
+    h.ios[0].h.onRecv!(null, h.pcm(10));
+    h.ios[1].h.onRecv!(null, h.pcm(10));
+    h.ios[0].h.onClose!(null);
+    // b's audio never played: it was waiting behind a's.
+    const seq = h.out.filter((m) => m.type !== 'tts.sent').map((m) => `${m.rid}:${m.type}`);
+    expect(seq).toEqual(['a:tts.segment_start', 'a:audio', 'a:tts.cancelled', 'b:tts.cancelled']);
+  });
+
+  it('flushes an opener at once without ending the text, and the reply follows on the same socket', () => {
+    const h = kyutai();
+    h.llm(0, 'start');
+    h.send(100, 'text', { type: 'opener.say', rid: 'r0', text: 'Hmm, let me see ', line: 'Hmm, let me see' });
+    expect(h.ios[0].sent).toEqual([{ type: 'Speak', text: 'Hmm, let me see ' }, { type: 'Flush' }]);
+    h.llm(900, 'delta', 'It is 391.');
+    h.llm(950, 'end');
+    expect(h.ios[0].sent.slice(2)).toEqual([{ type: 'Speak', text: 'It is ' }, { type: 'Speak', text: '391.' }, { type: 'Flush' }, { type: 'Close' }]);
+  });
+
+  it('places the server’s word times on the media track', () => {
+    const h = kyutai({ alignWords: true });
+    h.llm(0, 'start');
+    h.llm(10, 'delta', 'Hello there. ');
+    h.send(20, 'text', { type: 'bc.say', id: 'b', line: 'x', take: 'x' }); // not rendered: logs only
+    h.ios[0].h.onRecv!(null, h.pcm(24000));
+    h.ios[0].h.onRecv!({ type: 'Words', words: [{ word: 'Hello', start: 0.1, end: 0.5 }] }, undefined);
+    expect(h.out.find((m) => m.type === 'tts.words')).toEqual({ type: 'tts.words', rid: 'r0', words: [{ word: 'Hello', start: 2400, end: 12000 }] });
+  });
+
+  it("synthesizes the opener's lines ahead and plays one without a request", () => {
+    const h = kyutai();
+    h.send(0, 'text', { type: 'opener.lines', lines: ['Hmm, let me think.'] });
     const pre = h.ios[0];
-    expect(pre.sent).toEqual([{ type: 'Speak', text: 'Hmm, let me think.' }, { type: 'Flush' }, { type: 'Speak', text: 'Let me see.' }, { type: 'Flush' }]);
+    expect(pre.request).toEqual({ text: 'Hmm, let me think.', voice: '', sampleRate: 24000 });
+    pre.h.onRecv!({ type: 'Canned', cached: false }, undefined);
     pre.h.onRecv!(null, h.pcm(30));
-    pre.h.onRecv!({ type: 'Flushed', sequence_id: 0 }, undefined);
-    pre.h.onRecv!(null, h.pcm(20));
-    pre.h.onRecv!({ type: 'Flushed', sequence_id: 1 }, undefined);
-    expect(pre.closed).toBe(true);
+    pre.h.onRecv!(null, new Uint8Array(3)); // odd bytes carry over
+    pre.h.onRecv!(null, new Uint8Array(1));
+    pre.h.onClose!(null);
     expect(h.out).toEqual([]);
     h.llm(1000, 'start');
     h.send(1000, 'text', { type: 'opener.say', rid: 'r0', text: 'Hmm, let me think. ', line: 'Hmm, let me think.' });
     expect(h.ios[1].sent).toEqual([]);
-    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.segment_end']);
-    expect((h.out[1].samples as Float32Array).length).toBe(30);
+    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'audio', 'audio', 'tts.segment_end']);
+    expect(h.out.filter((m) => m.type === 'audio').map((m) => (m.samples as Float32Array).length)).toEqual([30, 1, 1]);
     h.llm(1500, 'delta', 'Because of scattering. ');
-    expect(h.ios[1].sent).toEqual([{ type: 'Speak', text: 'Because of scattering.' }, { type: 'Flush' }]);
-    expect(h.out.at(-1)).toMatchObject({ type: 'tts.segment_end', seg: 0 });
+    expect(h.ios[1].sent).toEqual([{ type: 'Speak', text: 'Because of scattering. ' }, { type: 'Flush' }]);
     h.ios[1].h.onRecv!(null, h.pcm(5));
     expect(h.out.at(-2)).toMatchObject({ type: 'tts.segment_start', seg: 1 });
   });
 
+  it('renders a canned line again once when it fails', () => {
+    const h = kyutai();
+    h.send(0, 'text', { type: 'bc.lines', lines: ['Mm-hmm.'] });
+    h.ios[0].h.onClose!({ error: 'tts closed before the line was rendered' });
+    expect(h.ios).toHaveLength(2);
+    expect(h.ios[1].request).toMatchObject({ text: 'Mm-hmm.' });
+    h.ios[1].h.onClose!({ error: 'websocket closed (1006)' });
+    expect(h.ios).toHaveLength(2);
+  });
+
   it('stops on cancel and drops audio still in flight', () => {
-    const h = harness();
+    const h = kyutai();
     h.llm(0, 'start');
     h.llm(100, 'delta', 'Hello there. ');
     h.ios[0].h.onRecv!(null, h.pcm(10));
@@ -113,50 +217,18 @@ describe('streaming TTS (Deepgram WebSocket)', () => {
     expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.cancelled']);
   });
 
-  it('holds sentences back past the flush limit and sends them with the next flush', () => {
-    const h = harness({ maxFlushesPerMin: 1 });
-    h.llm(0, 'start');
-    h.llm(100, 'delta', 'One. ');
-    h.llm(200, 'delta', 'Two. ');
-    h.llm(300, 'delta', 'Three.');
-    h.llm(400, 'end');
-    expect(h.ios[0].sent).toEqual([
-      { type: 'Speak', text: 'One.' },
-      { type: 'Flush' },
-      { type: 'Speak', text: 'Two. Three.' },
-      { type: 'Flush' },
-    ]);
-  });
-
-  it('transcribes the reply’s own audio for word timings, in samples of the media track', () => {
-    const h = harness({ alignWords: true });
-    h.send(0, 'text', { type: 'bc.say', id: 'b0', line: 'x', take: 'x' }); // not rendered: no audio
-    h.llm(0, 'start');
-    h.llm(10, 'delta', 'Hello there. ');
-    // Opened with the first audio, not before: Deepgram drops a socket that idles for 10 s.
-    expect(h.ios).toHaveLength(1);
-    const [tts] = h.ios;
-    tts.h.onRecv!(null, h.pcm(24000));
-    expect(h.ios.map((x) => (x.request as { path: string }).path)).toEqual(['/v1/speak', '/v1/listen']);
-    const asr = h.ios[1];
-    expect(asr.sent).toHaveLength(1);
-    tts.h.onRecv!({ type: 'Flushed' }, undefined);
-    expect(asr.sent.at(-1)).toEqual({ type: 'Finalize' });
-    asr.h.onRecv!({ type: 'Results', is_final: true, channel: { alternatives: [{ words: [{ word: 'hello', start: 0.1, end: 0.5 }] }] } } as never, undefined);
-    expect(h.out.find((m) => m.type === 'tts.words')).toEqual({ type: 'tts.words', rid: 'r0', words: [{ word: 'hello', start: 2400, end: 12000 }] });
-    h.llm(20, 'end');
-    expect(asr.sent.at(-1)).toEqual({ type: 'CloseStream' });
-  });
-});
-
-describe('word timings in the pipeline', () => {
-  it('are only asked for when the speaker resumes from a word', async () => {
-    const { buildGraph, defaultConfig } = await import('../src/pipeline');
-    const c = defaultConfig();
-    c.tts.variant = 'deepgram-stream';
-    const tts = (g: ReturnType<typeof buildGraph>) => g.nodes.find((n) => n.id === 'tts')!.params as Record<string, unknown>;
-    expect(tts(buildGraph(c)).alignWords).toBeUndefined();
-    c.speaker.params.speaker = { resumeFrom: 'cut' };
-    expect(tts(buildGraph(c)).alignWords).toBe(false);
+  it("renders canned lines one at a time, and doesn't hold them while a reply speaks (the box does)", () => {
+    const h = kyutai();
+    h.send(0, 'text', { type: 'opener.lines', lines: ['Hmm.', 'Right.', 'Okay.'] });
+    expect(h.ios.map((x) => x.request)).toEqual([{ text: 'Hmm.', voice: '', sampleRate: 24000 }]);
+    h.ios[0].h.onRecv!(null, h.pcm(10));
+    h.ios[0].h.onClose!(null);
+    expect(h.ios[1].request).toMatchObject({ text: 'Right.' });
+    // A reply starts while a line renders: the next line goes out anyway, as a background job.
+    h.llm(10, 'start');
+    h.ios[1].h.onRecv!(null, h.pcm(10));
+    h.ios[1].h.onClose!(null);
+    expect(h.ios[3].request).toMatchObject({ text: 'Okay.' });
+    expect(h.ios[2].request).toEqual({ path: '/v1/tts', query: {} });
   });
 });
