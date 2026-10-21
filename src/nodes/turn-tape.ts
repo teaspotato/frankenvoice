@@ -17,6 +17,7 @@ import {
   timed,
   tapePrompt,
   transcript,
+  trimIdle,
   type Cell,
   type SentWord,
   type TapeState,
@@ -40,6 +41,9 @@ interface TapeParams {
   slot: number;
   temperature: number;
   nProbs: number;
+  respondBias: number;
+  idleKeep: number;
+  answerAfterS: number;
   greeting: string;
 }
 
@@ -72,6 +76,8 @@ interface Call {
   res?: JsonObject;
   /** A cell written ahead, for this speculation. */
   spec: unknown;
+  /** The backstop: only respond was allowed. */
+  answer?: boolean;
 }
 
 /**
@@ -85,6 +91,11 @@ interface Call {
  * (control cancel); the speaker's playback.interrupted says what was heard, and the words written but
  * never heard leave the tape. Calls are skipped when the grammar would leave no choice (speaking with
  * a full TTS queue), while a call is still out, and in long silences (`idleCells`).
+ *
+ * Zero-shot, Gemma waits too long at turn ends and, once the tape fills with idle listen lines, copies
+ * them and stops answering (research: pilot/prompt-v2.md). So silent cells add `respondBias` to the
+ * logit of " respond", the prompt cuts each finished idle run to `idleKeep` lines, and a backstop
+ * allows only respond once the user has been silent `answerAfterS` after words left unanswered.
  *
  * Every cell is emitted as `tape.cell` (the line as written, the call's latency, timings, its xid and
  * Gemma's odds for each action), every cut as `tape.cut`, so the dashboard and the Tape inspector show
@@ -121,6 +132,27 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     { key: 'maxWords', label: 'Max words per cell', type: 'number', default: 6, description: 'Cap on the TTS headroom (two cells ahead at 0.3 s a word).' },
     { key: 'ttsLeadMs', label: 'TTS lead (ms)', type: 'number', default: 400, description: 'From writing a word to hearing it, for the headroom.' },
     { key: 'cutAfterMs', label: 'Cut after user voice (ms)', type: 'number', default: 200, description: 'User voice over the agent’s answer this long stops it (backchannel cues are never cut).' },
+    {
+      key: 'respondBias',
+      label: 'Respond bias',
+      type: 'number',
+      default: 2.2,
+      description: 'Added to the logit of “ respond” in silent cells (llama.cpp logit_bias): zero-shot, Gemma waits too long once the user is done. Pilot: +2.2 took the median answer from 2.8 to 2.0 s with no cut-ins; +3 cut into pauses. 0: off.',
+    },
+    {
+      key: 'idleKeep',
+      label: 'Idle lines kept',
+      type: 'number',
+      default: 2,
+      description: 'Each finished run of idle cells (nobody talking, the agent listening) is cut to this many lines in the prompt: a tape full of listen lines makes Gemma copy them and stop answering. 0: keep them all.',
+    },
+    {
+      key: 'answerAfterS',
+      label: 'Answer after silence (s)',
+      type: 'number',
+      default: 3,
+      description: 'Backstop: once the user has said something and then stayed silent this long with no answer, the next call may only respond. 0: off.',
+    },
     { key: 'idleCells', label: 'Stop calling after silent cells', type: 'number', default: 6, description: 'No calls (listen) once this many cells in a row had no user words or voice, unless the agent is speaking. 0: always call.' },
     {
       key: 'cutOverCells',
@@ -179,8 +211,10 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       queueEnd: number;
       /** Cells in a row without user words or voice. */
       idle: number;
+      /** The user said something the agent hasn't answered yet. */
+      owed: boolean;
     }
-    const live: Side = { state: 'silent', reply: null, queueEnd: 0, idle: 0 };
+    const live: Side = { state: 'silent', reply: null, queueEnd: 0, idle: 0, owed: false };
     const cells: Cell[] = [];
     let t0 = 0;
     let cellNo = 0;
@@ -277,6 +311,7 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
         if (!ws.length) return;
         if (s.reply && !s.reply.ended) endReply(s.reply, 'cancelled');
         s.reply = { rid: `${ctx.id}-r${ridNo++}`, sent: [], ended: false, playing: false };
+        s.owed = false;
         ctx.emit('text', { type: 'llm.start', rid: s.reply.rid, turnId: null, tape: action, ...(held ? { held: true } : {}) });
         s.queueEnd = Math.max(s.queueEnd, at);
         say(s, c, ws, at);
@@ -299,6 +334,8 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     };
 
     const defaultAction = (s: TapeState) => (s === 'speaking' ? 'continue' : 'listen');
+    /** The backstop: the user said something, then stayed silent `answerAfterS` without an answer. */
+    const mustAnswer = (s: Side) => s.state === 'silent' && s.owed && p.answerAfterS > 0 && s.idle >= Math.max(1, Math.round((p.answerAfterS * 1000) / cellMs));
 
     /**
      * Cell `n` of side `s`: its line up to the action, and whether a call decides it. The same rules
@@ -309,15 +346,18 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       if (s.state === 'cut' && p.cutOverCells > 0 && s.idle >= p.cutOverCells) s.state = 'silent';
       const c = newCell(n, tOf(n), s.state, user, voice);
       s.idle = user.length || voice ? 0 : s.idle + 1;
+      if (user.length) s.owed = true;
       const room = headroom(at / 1000, s.queueEnd / 1000, p.ttsLeadMs / 1000, cellMs / 1000, Math.max(1, p.maxWords));
-      const forced = s.state === 'speaking' && room === 0 ? 'TTS queue full' : s.state !== 'speaking' && p.idleCells > 0 && s.idle > p.idleCells ? 'idle' : null;
+      const forced = s.state === 'speaking' && room === 0 ? 'TTS queue full' : s.state !== 'speaking' && p.idleCells > 0 && s.idle > p.idleCells && !mustAnswer(s) ? 'idle' : null;
       return { c, forced, maxWords: Math.max(1, room) };
     };
 
     const ask = (c: Cell, tape: Cell[], maxWords: number, sp: Spec | null) => {
-      const allowed = ACTIONS[c.state];
+      const answer = mustAnswer(sp ? sp.side : live);
+      const allowed = answer ? ['respond'] : ACTIONS[c.state];
+      const bias: JsonObject = c.state === 'silent' && !answer && p.respondBias ? { logit_bias: [[' respond', p.respondBias]] } : {};
       const body: JsonObject = {
-        prompt: tapePrompt(head, tape),
+        prompt: tapePrompt(head, trimIdle(tape, p.idleKeep)),
         grammar: grammar(allowed, maxWords),
         n_predict: 32,
         temperature: p.temperature,
@@ -325,8 +365,9 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
         stop: ['\n'],
         ...(p.slot >= 0 ? { id_slot: p.slot } : {}),
         ...(p.nProbs > 0 ? { n_probs: p.nProbs } : {}),
+        ...bias,
       };
-      const k: Call = { cell: c, state: c.state, allowed, maxWords, t0: ctx.now(), io: undefined as unknown as Call['io'], spec: sp };
+      const k: Call = { cell: c, state: c.state, allowed, maxWords, t0: ctx.now(), io: undefined as unknown as Call['io'], spec: sp, ...(answer ? { answer } : {}) };
       call = k;
       ctx.setState('calling', sp ? 'ahead' : 'live');
       k.io = ctx.io.open(CHANNEL, { body }, {
@@ -354,6 +395,7 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
         allowed: k.allowed,
         xid: k.io.xid,
         ...(odds ? { odds } : {}),
+        ...(k.answer ? { backstop: 'answer after silence' } : {}),
         ...(timings ? { promptN: timings.prompt_n ?? null, promptMs: timings.prompt_ms ?? null, predictedN: timings.predicted_n ?? null, predictedMs: timings.predicted_ms ?? null } : {}),
       };
       ctx.setState('lastMs', stats.ms);

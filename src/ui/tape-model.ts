@@ -52,6 +52,8 @@ export interface TapeRow {
   dropped?: string;
   failed?: boolean;
   late?: boolean;
+  /** The backstop allowed only respond (the user had been silent too long after words). */
+  backstop?: string;
   /** Taken from the cells written ahead (adopted, adopted late). */
   spec?: string;
   /** What the call wrote, when it couldn't be used. */
@@ -164,7 +166,7 @@ export class TapeModel {
           cut: false,
           seq: e.seq,
         };
-        for (const k of ['allowed', 'odds', 'ms', 'promptN', 'promptMs', 'predictedN', 'predictedMs', 'forced', 'dropped', 'failed', 'late', 'spec', 'wrote', 'xid'] as const)
+        for (const k of ['allowed', 'odds', 'ms', 'promptN', 'promptMs', 'predictedN', 'predictedMs', 'forced', 'dropped', 'failed', 'late', 'spec', 'wrote', 'xid', 'backstop'] as const)
           if (d[k] !== undefined && d[k] !== null) (row as unknown as Record<string, unknown>)[k] = d[k];
         // Recorded before cells carried their call's xid: the last call that asked for this line.
         if (!row.xid && row.ms !== undefined) row.xid = this.callFor(row.line);
