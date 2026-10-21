@@ -413,6 +413,20 @@ async def tts_ws(ws: WebSocket):
             pass
 
 
+@app.post("/v1/align")
+async def align(request: Request):
+    """Word timings for known text on 16 kHz 16-bit mono PCM (the body); query: text, language.
+    The Qwen3-TTS worker times its own output with it, as that model gives no word timestamps."""
+    if aligner is None:
+        return JSONResponse({"error": "no aligner"}, status_code=503)
+    text = request.query_params.get("text", "")
+    pcm = np.frombuffer(await request.body(), dtype="<i2")
+    if not text.strip() or len(pcm) == 0:
+        return {"items": [], "align_ms": 0}
+    items, ms = await asyncio.to_thread(_align_sync, pcm, text, request.query_params.get("language", "English"))
+    return {"items": [{"text": w, "start": s, "end": e} for w, s, e in items], "align_ms": round(ms)}
+
+
 @app.get("/v1/tts/config")
 async def tts_config():
     try:

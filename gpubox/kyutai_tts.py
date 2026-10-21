@@ -26,6 +26,7 @@ import collections
 import json
 import logging
 import os
+from pathlib import Path
 import queue
 import threading
 import time
@@ -316,7 +317,9 @@ class Engine:
 
     # ---- conditioning per row --------------------------------------------------------------
     def _cond_attrs(self, voice: str, cfg: float):
-        return self.m.make_condition_attributes([self.m.get_voice_path(voice)], cfg_coef=cfg)
+        # voices arrive resolved to their local file; resolving one again would append the suffix twice
+        path = Path(voice) if os.path.isfile(voice) else self.m.get_voice_path(voice)
+        return self.m.make_condition_attributes([path], cfg_coef=cfg)
 
     def _set_row_cond(self, i: int, voice: str, cfg: float):
         key = (voice, cfg)

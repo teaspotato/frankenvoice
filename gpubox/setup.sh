@@ -19,6 +19,9 @@
 #                 when ASR starts, which is why ASR starts first.
 #   NO_LLM=1      skip the LLM;  LLM_CTX (8192 tokens, shared by the slots), LLM_SLOTS (2), LLM_SWA_FULL (1), LLM_MTP (1 = MTP
 #                 speculative decoding on)
+#   TTS_ENGINE   kyutai (default) or qwen (Qwen3-TTS, QWEN_TTS_MODEL, default the 0.6B CustomVoice; QWEN_TTS_VOICE).
+#                 Only one is loaded: both do not fit next to ASR and the LLM on an L4. `setup.sh tts qwen|kyutai` swaps
+#                 the running one (and remembers it in $ROOT/tts.engine)
 #   NO_TUNNEL=1   skip cloudflared;  NO_GW_TUNNEL=1 skips only the gateway's tunnel (the hosted UI doesn't need it)
 #   LLAMA_CUDA    12.8 or 13.4: which llama.cpp CUDA build to use (default: picked from the driver)
 #   UI_HOST       address the hosted UI listens on (default 127.0.0.1; the Docker image uses 0.0.0.0)
@@ -35,6 +38,8 @@ export HF_HUB_DISABLE_PROGRESS_BARS=1
 ASR_MODEL=${ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}
 ALIGN_MODEL=Qwen/Qwen3-ForcedAligner-0.6B
 TTS_REPO=kyutai/tts-1.6b-en_fr
+QWEN_TTS_MODEL=${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}
+QWEN_TTS_PKG=qwen-tts==0.1.1
 ASR_PORT=8101; TTS_PORT=8102; LLM_PORT=8103; GW_PORT=8000; UI_PORT=8787
 NODE_VERSION=v22.22.0
 FV_APP=${FV_APP:-$ROOT/frankenvoice.tar.gz}
@@ -194,6 +199,42 @@ mps_start() {
 }
 mps_stop() { mps_up && echo quit | nvidia-cuda-mps-control && log "CUDA MPS daemon stopped"; return 0; }
 
+tts_engine() { local e=${TTS_ENGINE:-}; [ -z "$e" ] && [ -f "$ROOT/tts.engine" ] && e=$(cat "$ROOT/tts.engine"); echo "${e:-kyutai}"; }
+tts_model() { [ "$(tts_engine)" = qwen ] && echo "$QWEN_TTS_MODEL" || echo "$TTS_REPO"; }
+
+install_qwen_tts() {  # its own venv: qwen-tts pins a transformers that moshi and qwen-asr do not share
+  [ -x "$ROOT/v-qtts/bin/python" ] && "$ROOT/v-qtts/bin/python" -c "import qwen_tts" 2>/dev/null && return 0
+  log "installing qwen-tts"
+  venv qtts "$QWEN_TTS_PKG" "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile httpx > "$DATA/logs/install-qtts.log" 2>&1 \
+    || { log "qwen-tts install failed"; tail -20 "$DATA/logs/install-qtts.log"; return 1; }
+}
+
+start_tts() {  # the TTS worker of $(tts_engine) on $TTS_PORT
+  alive tts && return 0
+  local TOKEN; TOKEN=$(cat "$DATA/gpubox.token")
+  if [ "$(tts_engine)" = qwen ]; then
+    install_qwen_tts || return 1
+    spawn tts env GPUBOX_TOKEN="$TOKEN" ALIGN_URL=http://127.0.0.1:$GW_PORT/v1/align QWEN_TTS_MODEL="$QWEN_TTS_MODEL" \
+      "$ROOT/v-qtts/bin/python" "$SRC/qwen3_tts_worker.py" --port $TTS_PORT
+  else
+    spawn tts "$ROOT/v-tts/bin/python" "$SRC/kyutai_tts.py" --port $TTS_PORT
+  fi
+  wait_http tts "http://127.0.0.1:$TTS_PORT/health" 900
+}
+
+swap_tts() {  # swap_tts kyutai|qwen : replace the running TTS worker; the gateway, LLM, ASR and tunnels stay up
+  case "$1" in kyutai|qwen) ;; *) echo "usage: $0 tts kyutai|qwen"; return 2 ;; esac
+  echo "$1" > "$ROOT/tts.engine"
+  TTS_ENGINE=$1
+  if alive tts; then
+    local p; p=$(cat "$ROOT/tts.pid"); kill -TERM -- "-$p" 2>/dev/null || kill "$p"; log "stopped tts ($p)"
+    for _ in $(seq 1 30); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+    rm -f "$ROOT/tts.pid"
+  fi
+  local t=$SECONDS
+  start_tts && log "tts is $1 ($((SECONDS - t)) s)"
+}
+
 stop_gpu() {  # the GPU services only; tunnels and the UI keep their URLs
   for n in gateway tts llm asr; do
     if alive $n; then
@@ -255,11 +296,10 @@ start() {
         --jinja --reasoning off "${mtp[@]}"
     wait_http llm "http://127.0.0.1:$LLM_PORT/health" 600 || return 1
   fi
-  alive tts || spawn tts "$ROOT/v-tts/bin/python" "$SRC/kyutai_tts.py" --port $TTS_PORT
-  wait_http tts "http://127.0.0.1:$TTS_PORT/health" 900 || return 1
+  start_tts || return 1
   local llm_name=$LLM_NAME; [ -n "${NO_LLM:-}" ] && llm_name=
   alive gateway || GPUBOX_TOKEN=$TOKEN ASR_URL=http://127.0.0.1:$ASR_PORT TTS_URL=ws://127.0.0.1:$TTS_PORT \
-      LLM_URL=http://127.0.0.1:$LLM_PORT LLM_MODEL=$llm_name ASR_MODEL=$ASR_MODEL ALIGN_MODEL=$ALIGN_MODEL TTS_MODEL=$TTS_REPO \
+      LLM_URL=http://127.0.0.1:$LLM_PORT LLM_MODEL=$llm_name ASR_MODEL=$ASR_MODEL ALIGN_MODEL=$ALIGN_MODEL TTS_MODEL=$(tts_model) \
       spawn gateway "$ROOT/v-gw/bin/python" "$SRC/server.py" --port $GW_PORT
   wait_http gateway "http://127.0.0.1:$GW_PORT/health?token=$TOKEN" 600 || return 1
   if [ -z "${NO_TUNNEL:-}${NO_GW_TUNNEL:-}" ] && ! alive tunnel; then
@@ -292,6 +332,7 @@ case "${1:-all}" in
   restart-gpu) stop_gpu; start ;;
   status) status ;;
   ui) install_ui && start_ui && status ;;
+  tts) mps_start && swap_tts "${2:-}" ;;
   all) install && start ;;
   *) echo "usage: $0 [all|install|fetch|start|stop|restart|restart-gpu|status|ui]"; exit 2 ;;
 esac
