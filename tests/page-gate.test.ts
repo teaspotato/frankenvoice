@@ -139,8 +139,8 @@ describe('page gate: speaker', () => {
   const speaker = () => {
     const h = harness(speakerNode, {});
     let pos = 0;
-    const play = (t: number, seg = 0) => {
-      const samples = new Float32Array(2400);
+    const play = (t: number, seg = 0, loud = 0) => {
+      const samples = new Float32Array(2400).map((_, i) => loud * Math.sin(i / 3));
       h.send(t, 'audio', { type: 'audio', track: 'tts.audio', start: pos, end: pos + samples.length, sampleRate: 24000, samples, rid: 'r0', seg } as never);
       pos += samples.length;
     };
@@ -162,6 +162,19 @@ describe('page gate: speaker', () => {
     s.recv(190, { type: 'gate', at: 150, pos: 2000, stop: 210, silent: 270 });
     expect(s.of('playback.paused')).toEqual([{ type: 'playback.paused', rid: 'r0', at: 270, from: 150, gate: true, cut: 210, pos: 2000 }]);
     expect(s.of('played.flush')).toEqual([{ type: 'played.flush', at: 270 }]);
+  });
+
+  it('gives the echo reference the tail the page played, not the reply past where it took over', () => {
+    const s = speaker();
+    for (let i = 0; i < 4; i++) s.play(0, 0, 0.5);
+    // The page heard the user at 150; the sound ended at 300, the tail took over 90 ms before.
+    s.recv(190, { type: 'gate', at: 150, pos: 3600, stop: 300, silent: 360 });
+    expect(s.of('played.flush')).toEqual([{ type: 'played.flush', at: 210 }]);
+    const tail = s.out.filter((o) => o.port === 'played' && o.msg.type === 'audio').at(-1)?.msg as unknown as { at: number; start: number; end: number; samples: Float32Array };
+    expect(tail).toMatchObject({ at: 210, start: 5040 });
+    expect(tail.end - tail.start).toBe(tail.samples.length);
+    // The 90 ms before the sound's end, sustained over the 60 ms tail.
+    expect(tail.samples.length).toBeGreaterThan(0.09 * 24000);
   });
 
   it("takes the page's stop as a pause where the page stopped, acks it, and reports what was heard up to there", () => {

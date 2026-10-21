@@ -66,6 +66,17 @@ export class TurnStream {
     return self;
   }
 
+  /** A new stream on the same compiled model, with its own state: one per session. */
+  fork(): TurnStream {
+    const s = new TurnStream();
+    s.ort = this.ort;
+    s.K = this.K;
+    s.enc = this.enc;
+    s.head = this.head;
+    s.reset();
+    return s;
+  }
+
   reset() {
     const T = this.ort.Tensor;
     this.back = win(this.K) + 1024; // samples kept per channel: the window plus the 1024 it skips

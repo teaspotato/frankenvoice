@@ -42,6 +42,8 @@ interface TapeParams {
 }
 
 const CHANNEL = 'llama-completion';
+/** After the VAD hears speech end, how long to wait for its ASR final before writing ahead anyway. */
+const FINAL_WAIT_MS = 1500;
 const words = (s: string) => s.split(/\s+/).filter(Boolean);
 /** A user word without its periods ("if." -> "if", "U.S." -> "US"); a decimal point between digits stays. */
 export const noPeriods = (w: string) => w.replace(/\.(?!\d)|(?<!\d)\./g, '');
@@ -185,6 +187,10 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     /** ASR: words of the current segment already on the tape, and the last partial's words. */
     let segN = 0;
     let prevPartial: string[] = [];
+    /** The end of the last ASR final; a speech end (at `dueAt`) whose final hasn't come yet: no writing ahead. */
+    let finalEnd = -Infinity;
+    let finalDue: TimerHandle | null = null;
+    let dueAt = 0;
 
     /**
      * A speculation: the cells after the live tape, written ahead on the assumption that the user stays
@@ -386,11 +392,18 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       emitSpec('drop', { why, ahead: sp.cells.length, ...(r && !sp.released ? { rid: r.rid } : {}) });
       spec = null;
       ctx.setState('ahead', 0);
+      if (sp.awaiting) {
+        // The real cell was waiting for the call just cancelled: it is decided without one.
+        const real = sp.awaiting;
+        sp.awaiting = undefined;
+        real.action = defaultAction(real.state);
+        emitCell(real, { forced: `speculation dropped (${why})` });
+      }
     };
 
     /** Start writing ahead, if the user is silent, ASR has their words and the agent has nothing in flight. */
     const maybeSpeculate = () => {
-      if (spec || call || p.specCells <= 0 || speaking || greet || greetFinish) return;
+      if (spec || call || p.specCells <= 0 || speaking || finalDue || greet || greetFinish) return;
       if (live.state === 'speaking' || live.reply) return;
       // An ASR partial with words not on the tape yet: they are still to come.
       if (prevPartial.length > segN) return;
@@ -481,24 +494,27 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       } else specStep();
     };
 
-    /** The real cell `c` differs from the speculation (the user spoke): what was released stays live. */
-    const breakSpec = (c: Cell, why: string) => {
+    /**
+     * Real cell `n` differs from the speculation (the user spoke): what was released stays live. Run
+     * before the cell is planned, so it sees the released reply's TTS queue; returns what the cell
+     * already did (the words sent ahead, and a finish) and the state after it.
+     */
+    const breakSpec = (n: number, why: string) => {
       const sp = spec!;
+      let sent: { action: string; say: string[]; after: TapeState } | null = null;
       if (sp.released && sp.side.reply) {
         // Words already sent for cells ahead belong to this cell now.
         const r = sp.side.reply;
-        const rest = sp.cells.filter((x) => x.n >= c.n);
+        const rest = sp.cells.filter((x) => x.n >= n);
         const ws = rest.flatMap((x) => x.say);
-        for (const w of r.sent) if (w.n >= c.n) w.n = c.n;
-        if (ws.length) {
-          c.say = ws;
-          c.action = rest.some((x) => x.action === 'finish') ? 'finish' : 'continue';
-        }
-        live.state = rest.length ? rest[rest.length - 1].after : live.state;
+        for (const w of r.sent) if (w.n >= n) w.n = n;
+        const finish = rest.some((x) => x.action === 'finish');
+        if (ws.length || finish) sent = { action: finish ? 'finish' : 'continue', say: ws, after: rest[rest.length - 1].after };
         live.reply = r;
-        sp.released = true;
+        live.queueEnd = Math.max(live.queueEnd, sp.side.queueEnd);
       }
       dropSpec(why);
+      return sent;
     };
 
     // ---- the live tape -------------------------------------------------------------------------
@@ -526,10 +542,13 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
           sp.awaiting = c;
           return;
         }
+        const sent = breakSpec(n, expect ? 'the user spoke' : 'nothing written for this cell');
         const planned = plan(live, n, user, voice, ctx.now());
         const c = planned.c;
-        breakSpec(c, expect ? 'the user spoke' : 'nothing written for this cell');
-        if (c.say.length) {
+        if (sent) {
+          c.action = sent.action;
+          c.say = sent.say;
+          live.state = sent.after;
           cells.push(c);
           trim();
           setFloor();
@@ -637,6 +656,15 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
             ctx.setState('userSpeaking', false);
             cutTimer?.clear();
             cutTimer = null;
+            // Its words may still be on their way: no writing ahead until the final that covers them.
+            if (typeof msg.at === 'number' && msg.at > finalEnd) {
+              finalDue?.clear();
+              dueAt = msg.at;
+              finalDue = ctx.setTimer(FINAL_WAIT_MS, () => {
+                finalDue = null;
+                maybeSpeculate();
+              }, 'final');
+            }
             maybeSpeculate();
           }
           return;
@@ -664,6 +692,13 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
           const line = p.greeting.trim();
           if (greeted || !line) return;
           greeted = true;
+          if (live.reply || spec?.released) {
+            // The agent already answers: no opening line over it.
+            ctx.log('info', 'opening line skipped: the agent is already speaking');
+            return;
+          }
+          // The opening line plays now: what was written ahead assumed it wouldn't.
+          if (spec) dropSpec('greeting');
           greet = words(line);
           ctx.emit('turn', { type: 'turn.greet', text: line });
           ctx.emit('text', { type: 'bc.say', id: `${ctx.id}-greet`, line, take: line, tailMs: 150, why: 'greeting' });
@@ -674,6 +709,11 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
           commitWords(ws.slice(segN));
           segN = 0;
           prevPartial = [];
+          if (typeof msg.end === 'number') finalEnd = Math.max(finalEnd, msg.end);
+          if (finalDue && !(typeof msg.end === 'number' && msg.end < dueAt)) {
+            finalDue.clear();
+            finalDue = null;
+          }
           maybeSpeculate();
         } else if (msg.type === 'asr.partial' && p.stableWords) {
           let same = 0;
@@ -688,6 +728,7 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       },
       stop() {
         cutTimer?.clear();
+        finalDue?.clear();
         if (call && !call.io.closed) call.io.close({ status: 'cancelled' });
         call = null;
       },

@@ -154,14 +154,47 @@ describe('streaming TTS (Kyutai on the GPU box)', () => {
     expect(seq).toEqual(['a:tts.segment_start', 'a:audio', 'a:tts.cancelled', 'b:tts.cancelled']);
   });
 
-  it('flushes an opener at once without ending the text, and the reply follows on the same socket', () => {
+  it('says an opener not rendered ahead on a socket of its own, closed at once, and the reply plays after it', () => {
     const h = kyutai();
     h.llm(0, 'start');
     h.send(100, 'text', { type: 'opener.say', rid: 'r0', text: 'Hmm, let me see ', line: 'Hmm, let me see' });
-    expect(h.ios[0].sent).toEqual([{ type: 'Speak', text: 'Hmm, let me see ' }, { type: 'Flush' }]);
+    // Closed, so the model says it without waiting for words after it.
+    expect(h.ios).toHaveLength(2);
+    expect(h.ios[0].sent).toEqual([]);
+    expect(h.ios[1].sent).toEqual([{ type: 'Speak', text: 'Hmm, let me see ' }, { type: 'Flush' }, { type: 'Close' }]);
     h.llm(900, 'delta', 'It is 391.');
     h.llm(950, 'end');
-    expect(h.ios[0].sent.slice(2)).toEqual([{ type: 'Speak', text: 'It is ' }, { type: 'Speak', text: '391.' }, { type: 'Flush' }, { type: 'Close' }]);
+    expect(h.ios[0].sent).toEqual([{ type: 'Speak', text: 'It is ' }, { type: 'Speak', text: '391.' }, { type: 'Flush' }, { type: 'Close' }]);
+    // The reply's audio comes first, but plays after the opener's.
+    h.ios[0].h.onRecv!(null, h.pcm(7));
+    h.ios[1].h.onRecv!(null, h.pcm(10));
+    h.ios[1].h.onRecv!({ type: 'Flushed' }, undefined);
+    h.ios[1].h.onRecv!(null, h.pcm(3));
+    h.ios[1].h.onClose!(null);
+    h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
+    h.ios[0].h.onClose!(null);
+    const seq = h.out.filter((m) => m.type !== 'tts.sent').map((m) => `${m.rid}:${m.type}${m.type === 'audio' ? (m.samples as Float32Array).length : ''}${'seg' in m ? `/${m.seg}` : ''}`);
+    expect(seq).toEqual([
+      'r0:tts.segment_start/0',
+      'r0:audio10/0',
+      'r0:tts.segment_end/0',
+      'r0:audio3/0',
+      'r0:tts.segment_start/1',
+      'r0:audio7/1',
+      'r0:tts.segment_end/1',
+      'r0:tts.response_end',
+    ]);
+  });
+
+  it('cuts an opener on its own socket with its reply', () => {
+    const h = kyutai();
+    h.llm(0, 'start');
+    h.send(100, 'text', { type: 'opener.say', rid: 'r0', text: 'Hmm, let me see ', line: 'Hmm, let me see' });
+    h.ios[1].h.onRecv!(null, h.pcm(10));
+    h.send(200, 'control', { type: 'cancel' });
+    expect(h.ios[0].closed).toBe(true);
+    expect(h.ios[1].closed).toBe(true);
+    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.cancelled']);
   });
 
   it('places the server’s word times on the media track', () => {
