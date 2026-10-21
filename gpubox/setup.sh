@@ -41,6 +41,7 @@ FV_APP=${FV_APP:-$ROOT/frankenvoice.tar.gz}
 APP=$ROOT/frankenvoice
 ASR_MEM=${ASR_MEM:-0.15}                           # of the whole GPU, counting what other processes hold: restarting asr alone
                                                    # after the others are up needs ~0.46 for the same 4.6 GB
+TORCH=2.9.1                                        # shared by the gw and tts venvs (moshi 0.2.13 resolves to it)
 LLAMA_CPP=b11753                                   # llama.cpp release (prebuilt CUDA binaries)
 LLM_REPO=google/gemma-4-12B-it-qat-q4_0-gguf       # official QAT Q4_0 GGUF, with the audio/vision projector
 LLM_FILE=gemma-4-12b-it-qat-q4_0.gguf
@@ -63,29 +64,40 @@ venv() {  # venv NAME pkgs...
 }
 
 install() {
+  local t0=$SECONDS
   command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH=$HOME/.local/bin:$PATH; }
   command -v ffmpeg >/dev/null || { (apt-get update -qq && apt-get install -y -qq ffmpeg) >/dev/null 2>&1 || true; }
+  # The venvs are the slow part (~19 GB), so the small downloads (cloudflared, llama.cpp, node + the UI) run alongside
+  # them. With 8 vCPUs, install is bound by the network (issue #32)
+  log "installing venvs (asr: sglang-omni, gw: gateway + forced aligner, tts: moshi) in parallel"
+  venv asr --prerelease=allow sglang-omni==0.1.8 > "$DATA/logs/install-asr.log" 2>&1 &
+  local a=$!
+  # gw and tts pin the same torch, so its ~3.7 GB of CUDA wheels download and unpack once (uv hardlinks them from
+  # its cache); unpinned, gw drifts to whatever torch is newest (2.14 + CUDA 13 wheels on 2026-10-21)
+  venv gw qwen-asr==0.0.6 torch==$TORCH "fastapi>=0.110" "uvicorn[standard]" websockets httpx numpy soundfile "huggingface_hub[cli]" > "$DATA/logs/install-gw.log" 2>&1 &
+  local g=$!
+  venv tts moshi==0.2.13 torch==$TORCH "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile > "$DATA/logs/install-tts.log" 2>&1 &
+  local t=$!
+  local ok=1
   if [ ! -x "$ROOT/cloudflared" ]; then
     curl -fsSL -o "$ROOT/cloudflared" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
     chmod +x "$ROOT/cloudflared"
   fi
-  install_llama
-  install_ui || return 1
-  log "installing venvs (asr: sglang-omni, gw: gateway + forced aligner, tts: moshi) in parallel"
-  venv asr --prerelease=allow sglang-omni==0.1.8 > "$DATA/logs/install-asr.log" 2>&1 &
-  local a=$!
-  venv gw qwen-asr==0.0.6 "fastapi>=0.110" "uvicorn[standard]" websockets httpx numpy soundfile "huggingface_hub[cli]" > "$DATA/logs/install-gw.log" 2>&1 &
-  local g=$!
-  venv tts moshi==0.2.13 "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile > "$DATA/logs/install-tts.log" 2>&1 &
-  local t=$!
-  wait $a || { log "asr install failed"; tail -20 "$DATA/logs/install-asr.log"; return 1; }
-  wait $g || { log "gw install failed"; tail -20 "$DATA/logs/install-gw.log"; return 1; }
-  wait $t || { log "tts install failed"; tail -20 "$DATA/logs/install-tts.log"; return 1; }
+  install_llama || ok=
+  install_ui || ok=
+  wait $a || { log "asr install failed"; tail -20 "$DATA/logs/install-asr.log"; ok=; }
+  wait $g || { log "gw install failed"; tail -20 "$DATA/logs/install-gw.log"; ok=; }
+  wait $t || { log "tts install failed"; tail -20 "$DATA/logs/install-tts.log"; ok=; }
+  [ -n "$ok" ] || return 1
+  log "venvs ready ($((SECONDS - t0)) s)"
   [ -n "${NO_FETCH:-}" ] || fetch || return 1
-  log "install done"
+  log "install done ($((SECONDS - t0)) s)"
 }
 
 fetch() {  # model weights: Hugging Face cache (HF_HOME) for ASR/aligner/TTS, $DATA/models for the LLM
+  # One file at a time already fills the link (~340 MB/s on an 8-vCPU Colab). Parallel files, HF_XET_HIGH_PERFORMANCE
+  # and fetching while the venvs install were no faster (issue #32)
+  local t0=$SECONDS
   log "fetching weights"
   "$ROOT/v-gw/bin/python" - <<EOF || { log "weight download failed"; return 1; }
 from huggingface_hub import snapshot_download, hf_hub_download
@@ -96,7 +108,7 @@ if not "${NO_LLM:-}":
     for r, f in [("$LLM_REPO", "$LLM_FILE"), ("$LLM_REPO", "$LLM_MMPROJ"), ("$LLM_MTP_REPO", "$LLM_MTP_FILE")]:
         print(f, hf_hub_download(r, f, local_dir="$DATA/models"))
 EOF
-  log "weights ready"
+  log "weights ready ($((SECONDS - t0)) s)"
 }
 
 llama_dir() {  # where the llama.cpp release for this driver lives
