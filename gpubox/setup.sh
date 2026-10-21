@@ -85,7 +85,7 @@ install() {
   local t=$!
   local q=
   if [ "$(tts_engine)" = qwen ]; then
-    venv qtts "$QWEN_TTS_PKG" torch==$TORCH "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile httpx > "$DATA/logs/install-qtts.log" 2>&1 &
+    venv qtts "$QWEN_TTS_PKG" torch==$TORCH torchaudio==$TORCH "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile httpx > "$DATA/logs/install-qtts.log" 2>&1 &
     q=$!
   fi
   local ok=1
@@ -213,7 +213,7 @@ tts_model() { [ "$(tts_engine)" = qwen ] && echo "$QWEN_TTS_MODEL" || echo "$TTS
 install_qwen_tts() {  # its own venv: qwen-tts pins a transformers that moshi and qwen-asr do not share
   [ -x "$ROOT/v-qtts/bin/python" ] && "$ROOT/v-qtts/bin/python" -c "import qwen_tts" 2>/dev/null && return 0
   log "installing qwen-tts"
-  venv qtts "$QWEN_TTS_PKG" torch==$TORCH "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile httpx > "$DATA/logs/install-qtts.log" 2>&1 \
+  venv qtts "$QWEN_TTS_PKG" torch==$TORCH torchaudio==$TORCH "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile httpx > "$DATA/logs/install-qtts.log" 2>&1 \
     || { log "qwen-tts install failed"; tail -20 "$DATA/logs/install-qtts.log"; return 1; }
 }
 
