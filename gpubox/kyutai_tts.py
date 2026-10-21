@@ -294,6 +294,8 @@ class Engine:
         self.missing = torch.full((B, m.lm.n_q - m.lm.dep_q, 1), self.zero, dtype=torch.long, device=device)
         self.no_depformer = torch.full((B, m.lm.dep_q, 1), self.zero, dtype=torch.long, device=device)
         self.conds: dict = {}
+        # voices are keyed by their local file (the WS handler resolves a name before submitting)
+        voice = str(m.get_voice_path(voice))
         ct = m.lm.condition_provider(m.lm.condition_provider.prepare([self._cond_attrs(voice, cfg)] * B))
         # support_out_of_sync: rows start at different times, so the per-row offsets decide which
         # outputs are not generated yet (-1), not the global step count
@@ -302,8 +304,9 @@ class Engine:
                             cfg_is_masked_until=None, cfg_is_no_text=True, support_out_of_sync=True)
         self.lm_gen.streaming_forever(B)
         m.mimi.streaming_forever(B)
-        self.row_cond = [(voice, cfg)] * B
+        self.row_cond: list[tuple[str, float] | None] = [(voice, cfg)] * B
         self.exec_mask: list[bool] | None = None
+        self.mimi_mask: list[bool] | None = None
         self.slots: list[Run | None] = [None] * B
         self.stepping: list[int] = []
         self.fg: collections.deque = collections.deque()
@@ -376,6 +379,12 @@ class Engine:
             reset = torch.zeros(B, dtype=torch.bool)
             reset[first] = True
             self.m.mimi.reset_streaming(reset)
+            self.mimi_mask = None  # reset sets the rows' exec mask
+        # only rows with a real frame advance the codec: one waiting for words must not decode junk
+        mmask = [i in out_rows for i in range(B)]
+        if mmask != self.mimi_mask:
+            self.m.mimi.set_exec_mask(torch.tensor(mmask, device=self.device))
+            self.mimi_mask = mmask
         pcm = self.m.mimi.decode(f[:, 1:, :].clamp(min=0)).float().cpu().numpy()
         return {i: np.clip(pcm[i, 0], -1, 1) for i in out_rows}
 
@@ -412,6 +421,18 @@ class Engine:
         r.state = self.m.machine.new_state([])
         r.offset = 0
         self.slots[i] = r
+
+    def _try_admit(self, i: int, r: Run) -> bool:
+        """Admit `r` to row `i`; on failure (a bad voice) fail its job instead of leaving it in no queue."""
+        try:
+            self._admit(i, r)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.exception("tts: could not admit a job (voice %s)", r.job.voice)
+            self.slots[i] = None
+            self.row_cond[i] = None  # its conditioning may be half written: set it again on the next admit
+            r.fail(f"bad voice: {e}")
+            return False
 
     def _preempt(self, i: int):
         """Give a background job's row back; it starts over later. The caller holds the lock."""
@@ -456,14 +477,19 @@ class Engine:
                     self._preempt(bgs[-1])
                     free.append(bgs[-1])
                 self.fg.remove(r)
-                self._admit(free.pop(0), r)
+                i = free.pop(0)
+                if not self._try_admit(i, r):
+                    free.insert(0, i)
             # a background job only takes a row no reply is waiting for
             spare = len(free) - len(self.fg)
             for r in [r for r in self.bg if r.pending]:
                 if spare <= 0:
                     break
                 self.bg.remove(r)
-                self._admit(free.pop(0), r)
+                i = free.pop(0)
+                if not self._try_admit(i, r):
+                    free.insert(0, i)
+                    continue
                 spare -= 1
 
     def _tick(self) -> bool:
@@ -551,6 +577,14 @@ def build_app(engine: Engine, default_voice: str, default_cfg: float) -> FastAPI
         valid = engine.m.valid_cfg_conditionings
         if valid and cfg not in valid:
             await ws.send_text(json.dumps({"type": "Error", "message": f"cfg must be one of {sorted(valid)}"}))
+            await ws.close()
+            return
+        # resolve (maybe download) the voice here, not on the step thread, where it would stall every stream
+        try:
+            voice = str(await asyncio.to_thread(engine.m.get_voice_path, voice))
+        except Exception as e:  # noqa: BLE001
+            log.warning("tts: bad voice %r: %s", voice, e)
+            await ws.send_text(json.dumps({"type": "Error", "message": f"bad voice: {voice}"}))
             await ws.close()
             return
         job = Job(voice=voice, cfg=cfg, loop=asyncio.get_running_loop(), out=asyncio.Queue(),
