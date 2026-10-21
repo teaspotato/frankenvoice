@@ -188,7 +188,15 @@ const sameToken = (got: string) => {
   const b = Buffer.from(HOST_TOKEN);
   return a.length === b.length && timingSafeEqual(a, b);
 };
-const cookieToken = (req: IncomingMessage) => /(?:^|;\s*)fv_token=([^;]*)/.exec(req.headers.cookie ?? '')?.[1] ?? '';
+/** The fv_token cookie, decoded; a malformed one reads as no token. */
+const cookieToken = (req: IncomingMessage) => {
+  const raw = /(?:^|;\s*)fv_token=([^;]*)/.exec(req.headers.cookie ?? '')?.[1] ?? '';
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return '';
+  }
+};
 
 const sameOrigin = (req: IncomingMessage) => {
   const origin = req.headers.origin;
@@ -203,7 +211,7 @@ const sameOrigin = (req: IncomingMessage) => {
 /** The host: in hosted mode, same-origin requests carrying the token cookie; otherwise only the local UI. */
 function isHost(req: IncomingMessage): boolean {
   if (!HOST_TOKEN) return localOnly(req);
-  return sameOrigin(req) && sameToken(decodeURIComponent(cookieToken(req)));
+  return sameOrigin(req) && sameToken(cookieToken(req));
 }
 
 /** Public demo (hosted mode only): anyone may load the page and talk; settings, recordings and the turn model stay the host's. */

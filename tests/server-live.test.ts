@@ -511,12 +511,28 @@ describe('the pipeline in the server', () => {
     await new Promise((r) => setTimeout(r, 300));
     expect(msgs.filter((m) => m.type === 'notice').map((m) => m.text)).toEqual(['replays on the GPU box are for the host only']);
     expect(msgs.filter((m) => m.type === 'session')).toHaveLength(1);
-    const saved = new Promise((r) => ws.on('message', (d: Buffer, bin) => !bin && JSON.parse(d.toString()).type === 'saved' && r(null)));
+    const saved = new Promise<Json>((r) => ws.on('message', (d: Buffer, bin) => !bin && JSON.parse(d.toString()).type === 'saved' && r(JSON.parse(d.toString()))));
     ws.send(JSON.stringify({ type: 'stop' }));
-    // A visitor's session is always kept.
-    await saved;
+    // A visitor's session is always kept, but where on the server is the host's business.
+    const m = (await saved) as { id: string; path?: string };
+    expect(typeof m.id).toBe('string');
+    expect(m.path).toBeUndefined();
     ws.close();
   }, 20_000);
+
+  it('gives no wait estimate behind a run without an end (a host replay with live channels)', () => {
+    const hub = new LiveHub({ upstreams: () => ({ headers: {} }), sessionsDir: () => sessions, modelsDir: join(sessions, 'models'), maxSessionMs: () => 60_000, log: () => {} });
+    const h = hub as unknown as { pages: Set<unknown>; queue: unknown[]; waits(): (number | null)[] };
+    const page = (run: unknown) => ({ run });
+    h.queue = [{ page: page(null) }, { page: page(null) }];
+    h.pages.add(page({ box: true, endsAt: Date.now() + 30_000 }));
+    const [w] = h.waits();
+    expect(w).toBeGreaterThan(29_000);
+    expect(w).toBeLessThanOrEqual(30_000);
+    h.pages.clear();
+    h.pages.add(page({ box: true }));
+    expect(h.waits()).toEqual([null, null]);
+  });
 
   it('renders a canned line once on the box, in the background, then serves it from the cache', async () => {
     const { serverDrivers } = await import('../server/drivers');
