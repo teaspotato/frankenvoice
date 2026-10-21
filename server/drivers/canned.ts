@@ -17,11 +17,14 @@ const errorJson = (e: unknown): Json => ({ error: e instanceof Error ? `${e.name
 type TtsConfig = { model: string; n_q: number; temp: number; voice: string; cfg: number; sample_rate: number };
 
 export function cannedDriver(up: Upstreams, cacheDir: string): LiveDriver {
-  // The box's TTS settings, asked once (again after a failure).
+  // The box's TTS settings, asked again after a failure and after 30 s (the box may have swapped Kyutai for Qwen3-TTS).
   let config: Promise<TtsConfig> | undefined;
+  let configAt = 0;
   const boxConfig = () => {
     const u = up('gpubox');
     if (u.missing) return Promise.reject(new Error(u.missing));
+    if (Date.now() - configAt > 30_000) config = undefined;
+    if (!config) configAt = Date.now();
     config ??= fetch(`${u.base!.replace(/^ws(s?):/, 'http$1:')}/v1/tts/config`, { headers: u.headers, signal: AbortSignal.timeout(5000) })
       .then((r) => (r.ok ? (r.json() as Promise<TtsConfig>) : Promise.reject(new Error(`tts config: HTTP ${r.status}`))))
       .catch((e) => {

@@ -10,7 +10,7 @@ import { SpanDetails } from './SpanDetails';
 import type { Json } from '../core/types';
 import { micMonitor, replaySpeaker, setOutputMuted, setOutputPaused, setOutputSuppressed } from '../client/audio';
 import { LiveClient, type LiveHandlers } from '../client/live';
-import type { TurnModelLoad } from '../live-protocol';
+import type { TtsEngineLoad, TurnModelLoad } from '../live-protocol';
 import { resolveParams } from '../core/node';
 import { turnModelRequest } from '../nodes/turn-model';
 import {
@@ -128,6 +128,30 @@ export function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [turnModelKey, host]);
+  // Kyutai and Qwen3-TTS don't fit on the box together: the TTS stage's engine swaps the box's worker, ahead of a session.
+  const wantEngine = host && stageType(config, 'tts') === 'tts.kyutai' ? String(resolveParams(registry['tts.kyutai'], stageParams(config, 'tts')).engine ?? '') : '';
+  const [ttsEngine, setTtsEngine] = useState<TtsEngineLoad | undefined>();
+  useEffect(() => {
+    setTtsEngine(undefined);
+    if (!wantEngine) return;
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = (method: 'POST' | 'GET') =>
+      fetch(`/api/tts-engine${method === 'POST' ? `?engine=${wantEngine}` : ''}`, { method })
+        .then((r) => (r.ok ? (r.json() as Promise<TtsEngineLoad>) : Promise.reject(new Error(`HTTP ${r.status}`))))
+        .then((l) => {
+          if (done) return;
+          setTtsEngine(l);
+          if (l.state === 'switching') timer = setTimeout(() => void poll('GET'), 1000);
+        })
+        .catch(() => {});
+    void poll('POST');
+    return () => {
+      done = true;
+      clearTimeout(timer);
+    };
+  }, [wantEngine]);
+  const switching = ttsEngine?.state === 'switching';
   const [running, setRunning] = useState<'live' | 'replay' | null>(null);
   /** Where the running run runs: the server (live sessions, replays with live channels) or the page (other replays). */
   const [runWhere, setRunWhere] = useState<'server' | 'page'>('page');
@@ -782,8 +806,8 @@ export function App() {
             ✕ Leave queue ({queuePos === 1 ? 'next' : `${queuePos - 1} ahead`})
           </button>
         ) : !running ? (
-          <button className="primary" onClick={runLive}>
-            ● Run live
+          <button className="primary" onClick={runLive} disabled={switching} title={switching ? `The GPU box is switching its TTS to ${ttsEngine!.engine}` : undefined}>
+            {switching ? `Switching TTS to ${ttsEngine!.engine}…` : '● Run live'}
           </button>
         ) : (
           <button className="danger" onClick={stop}>
@@ -846,7 +870,7 @@ export function App() {
 
       <section className="diagram">
         <Splitter layout={layout} onChange={setLayout} field="diagram" axis="y" sign={1} max={() => window.innerHeight - 260} />
-        <PipelineView config={config} turnModel={turnModel} states={nodeStates} stateTypes={stateTypes} activity={activity} running={!!running} selected={selected} onSelect={selectStage} />
+        <PipelineView config={config} turnModel={turnModel} ttsEngine={ttsEngine} states={nodeStates} stateTypes={stateTypes} activity={activity} running={!!running} selected={selected} onSelect={selectStage} />
       </section>
 
       <section className="dash">

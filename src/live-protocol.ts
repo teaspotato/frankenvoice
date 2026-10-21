@@ -48,6 +48,16 @@ export interface TurnModelLoad {
   error?: string;
 }
 
+/** The TTS engine the GPU box runs (GET/POST /api/tts-engine): Kyutai and Qwen3-TTS don't fit together, so a change swaps the worker. */
+export interface TtsEngineLoad {
+  engine: 'kyutai' | 'qwen';
+  state: 'ready' | 'switching' | 'failed';
+  error?: string | null;
+  elapsed_s?: number | null;
+  /** How long the last swap to this engine took. */
+  estimate_s?: number | null;
+}
+
 export type Header = { k: string; [key: string]: Json };
 
 export function frame(header: Header, payload: Uint8Array = new Uint8Array()): Uint8Array<ArrayBuffer> {

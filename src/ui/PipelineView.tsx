@@ -1,7 +1,7 @@
 import { registry } from '../nodes';
 import type { Json } from '../core/types';
 import type { Activity } from './activity';
-import type { TurnModelLoad } from '../live-protocol';
+import type { TtsEngineLoad, TurnModelLoad } from '../live-protocol';
 import { loadingState } from '../nodes/turn-model';
 import { STAGES, stageType, type PipelineConfig, type StageId } from '../pipeline';
 
@@ -51,6 +51,15 @@ function preloadState(l: TurnModelLoad): Record<string, Json> {
   return m ? loadingState(m) : { status: 'loading' };
 }
 
+/** The box's TTS engine while no session runs: a swap shows as a progress bar (seconds against the last swap's). */
+function engineState(l: TtsEngineLoad): Record<string, Json> {
+  if (l.state === 'failed') return { engine: l.engine, status: 'failed', error: l.error ?? null };
+  if (l.state === 'ready') return { engine: l.engine, status: 'ready' };
+  const done = Math.round(l.elapsed_s ?? 0);
+  const total = Math.round(l.estimate_s ?? 60);
+  return { download: { label: `switching to ${l.engine}`, done, total, fraction: Math.min(0.97, done / Math.max(1, total)), unit: 's' } };
+}
+
 interface Edge {
   /** The output port feeding this connection, `stage.port`. */
   src: string;
@@ -73,6 +82,7 @@ function link(src: string, a: [number, number], b: [number, number], label: stri
 export function PipelineView({
   config,
   turnModel,
+  ttsEngine,
   states,
   stateTypes,
   activity,
@@ -83,6 +93,8 @@ export function PipelineView({
   config: PipelineConfig;
   /** The preloaded turn model, shown on its stage while no session runs. */
   turnModel?: TurnModelLoad;
+  /** The GPU box's TTS engine, shown on the TTS stage while no session runs. */
+  ttsEngine?: TtsEngineLoad;
   /** Latest state per stage; only shown for stages that still run the same node type. */
   states: Record<string, Record<string, Json>>;
   stateTypes: Record<string, string>;
@@ -214,9 +226,16 @@ export function PipelineView({
         const [x, y] = POS[s.id];
         const variant = config[s.id].variant;
         const impl = Object.keys(s.variants).length > 1 ? variant : '';
-        const state = s.id === 'turnmodel' && !running && turnModel ? preloadState(turnModel) : stateTypes[s.id] === type ? states[s.id] : undefined;
+        const state =
+          s.id === 'turnmodel' && !running && turnModel
+            ? preloadState(turnModel)
+            : s.id === 'tts' && !running && ttsEngine
+              ? engineState(ttsEngine)
+              : stateTypes[s.id] === type
+                ? states[s.id]
+                : undefined;
         const on = activity.stages.get(s.id);
-        const dl = state?.download as { label: string; done: number; total: number; fraction: number | null } | null | undefined;
+        const dl = state?.download as { label: string; done: number; total: number; fraction: number | null; unit?: string } | null | undefined;
         const lines = Object.entries(state ?? {})
           .filter(([k, v]) => k !== 'download' && (typeof v !== 'object' || v === null))
           .slice(0, 2);
@@ -248,9 +267,10 @@ export function PipelineView({
             )}
             {dl && (
               <g className="pipeline-progress">
-                <title>{`downloading the ${dl.label}: ${dl.done} of ${dl.total} MB`}</title>
+                <title>{dl.unit === 's' ? `${dl.label}: ${dl.done} s, the last one took ${dl.total} s` : `downloading the ${dl.label}: ${dl.done} of ${dl.total} MB`}</title>
                 <text x={12} y={38} className="pipeline-state">
-                  <tspan className="k">{dl.label}</tspan> {dl.fraction !== null ? `${Math.round(dl.fraction * 100)}% of ${dl.total} MB` : `${dl.done} MB`}
+                  <tspan className="k">{dl.label}</tspan>{' '}
+                  {dl.unit === 's' ? `${dl.done} s of ~${dl.total} s` : dl.fraction !== null ? `${Math.round(dl.fraction * 100)}% of ${dl.total} MB` : `${dl.done} MB`}
                 </text>
                 <rect x={12} y={46} width={W - 24} height={5} rx={2} className="track" />
                 <rect x={12} y={46} width={(W - 24) * (dl.fraction ?? 0)} height={5} rx={2} className="bar" />

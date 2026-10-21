@@ -347,6 +347,18 @@ const server = createServer((req, res) => {
       if (typeof r.encoderUrl !== 'string' || typeof r.headUrl !== 'string' || typeof r.frames !== 'number') return json(res, 400, { error: 'bad turn model request' });
       return json(res, 200, preloadTurnModel(MODELS_DIR, r));
     }
+    if (p === '/api/tts-engine' && (req.method === 'POST' || req.method === 'GET')) {
+      // Which TTS engine the GPU box runs; POST ?engine=kyutai|qwen swaps it (the page polls GET while it switches).
+      const u = upstream('gpubox');
+      if (u.missing) return json(res, 503, { error: u.missing });
+      const engine = new URL(req.url ?? '', 'http://x').searchParams.get('engine') ?? '';
+      const r = await fetch(`${u.base!.replace(/^ws(s?):/, 'http$1:')}/v1/tts/engine${req.method === 'POST' ? `?engine=${encodeURIComponent(engine)}` : ''}`, {
+        method: req.method,
+        headers: u.headers,
+        signal: AbortSignal.timeout(10_000),
+      });
+      return json(res, r.status, await r.json());
+    }
     const m = /^\/api\/sessions(?:\/([^/]+))?$/.exec(p);
     if (m) return sessions(req, res, m[1] && decodeURIComponent(m[1]));
     if (STATIC_DIR && !p.startsWith('/api/') && (req.method === 'GET' || req.method === 'HEAD')) return serveStatic(p, res);

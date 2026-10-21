@@ -436,6 +436,64 @@ async def tts_config():
         return JSONResponse({"error": f"tts backend unavailable: {e}"}, status_code=502)
 
 
+# ---------------------------------------------------------------- TTS engine swap
+# Kyutai and Qwen3-TTS don't fit on the L4 together with ASR and the LLM: the page picks one, and the box swaps the
+# worker on port 8102 (setup.sh tts kyutai|qwen; the rest stays up). The page polls GET while it runs.
+GPUBOX_ROOT = os.environ.get("GPUBOX_ROOT") or ("/content" if os.path.isdir("/content") else os.path.expanduser("~/gpubox"))
+SETUP_SH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "setup.sh")
+ENGINES = ("kyutai", "qwen")
+swap = {"engine": None, "state": "ready", "t0": 0.0, "error": None, "proc": None}
+swap_s = {"kyutai": 40.0, "qwen": 90.0}   # how long a swap took last time: the page's estimate
+
+
+def _engine_now():
+    try:
+        with open(os.path.join(GPUBOX_ROOT, "tts.engine")) as f:
+            e = f.read().strip()
+        return e if e in ENGINES else "kyutai"
+    except OSError:
+        return "kyutai"
+
+
+def _swap_status():
+    p = swap["proc"]
+    if p is not None and p.returncode is not None:
+        swap["proc"] = None
+        if p.returncode == 0:
+            swap["state"] = "ready"
+            swap_s[swap["engine"]] = time.time() - swap["t0"]
+        else:
+            swap["state"], swap["error"] = "failed", f"setup.sh tts {swap['engine']} exited {p.returncode} (see /content/logs)"
+    switching = swap["state"] == "switching"
+    return {"engine": swap["engine"] if switching else _engine_now(), "state": swap["state"], "error": swap["error"],
+            "elapsed_s": round(time.time() - swap["t0"], 1) if switching else None,
+            "estimate_s": round(swap_s.get(swap["engine"] or "", 60.0)) if switching else None}
+
+
+@app.get("/v1/tts/engine")
+async def tts_engine():
+    return _swap_status()
+
+
+@app.post("/v1/tts/engine")
+async def tts_engine_set(request: Request):
+    want = request.query_params.get("engine", "")
+    if want not in ENGINES:
+        return JSONResponse({"error": f"engine must be one of {list(ENGINES)}"}, status_code=400)
+    st = _swap_status()
+    if st["state"] == "switching" or (want == st["engine"] and st["state"] == "ready"):
+        return st
+    swap.update(engine=want, state="switching", t0=time.time(), error=None)
+    log_path = os.path.join(GPUBOX_ROOT, "logs", "tts-swap.log")
+    out = open(log_path, "ab") if os.path.isdir(os.path.dirname(log_path)) else asyncio.subprocess.DEVNULL
+    # Its own session: the worker it starts outlives this request (and a gateway restart).
+    swap["proc"] = await asyncio.create_subprocess_exec("bash", SETUP_SH, "tts", want, cwd=os.path.dirname(SETUP_SH),
+                                                         stdout=out, stderr=out, start_new_session=True)
+    asyncio.get_running_loop().create_task(swap["proc"].wait())
+    log.info("tts engine -> %s", want)
+    return _swap_status()
+
+
 # ---------------------------------------------------------------- LLM pass-through
 LLM_TIMEOUT = httpx.Timeout(600, connect=5)
 _HOP = {"content-length", "transfer-encoding", "connection", "keep-alive", "content-encoding"}

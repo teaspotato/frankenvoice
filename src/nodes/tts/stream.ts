@@ -58,6 +58,14 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
   ],
   outputs: [{ name: 'audio', type: 'audio' }],
   params: [
+    {
+      key: 'engine',
+      label: 'Engine on the box',
+      type: 'select',
+      options: ['qwen', 'kyutai'],
+      default: 'qwen',
+      description: 'Qwen3-TTS (1.7B, takes voice directions) or Kyutai. They don’t fit on the GPU together: picking one swaps the box’s TTS worker (about 30 to 90 s, shown on this stage) before the next session.',
+    },
     { key: 'voice', label: 'Voice', type: 'string', default: '', description: 'Kyutai voice (a path in kyutai/tts-voices); empty uses the server’s default.' },
     { key: 'sampleRate', label: 'Sample rate', type: 'number', default: 24000, description: 'What the server sends (Kyutai: 24 kHz).' },
     {
