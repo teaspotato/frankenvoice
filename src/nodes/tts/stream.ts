@@ -117,6 +117,10 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       guard?: { clear(): void };
       /** Played out or cut; it leaves `line` once the replies before it have. */
       ended?: boolean;
+      /** An opener said on a socket of its own, ahead of this reply in `line`. */
+      opener?: Reply;
+      /** This is such an opener: part of a reply (its rid), which alone ends or cancels the reply. */
+      part?: boolean;
     };
     /** Held replies by rid, until released or dropped (they may finish rendering before). */
     const held = new Map<string, Reply>();
@@ -245,7 +249,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       if (!live(r)) return;
       // Close (end of text) went out when the LLM finished.
       if (!r.io.closed) r.io.close();
-      out(r, { type: 'tts.response_end', rid: r.rid });
+      if (!r.part) out(r, { type: 'tts.response_end', rid: r.rid });
       retire(r);
       if (!reply) ctx.setState('status', 'idle');
     };
@@ -379,7 +383,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       ctx.emit('audio', { type: 'tts.cue_dropped', rid: id, why });
     };
 
-    const start = (rid: string) => {
+    const start = (rid: string): Reply => {
       // Set right after the socket opens; its handlers only run later.
       let r!: Reply;
       const io = ctx.io.open(
@@ -442,6 +446,25 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       r = { rid, io, buf: '', spoken: 0, segs: [], segNo: 0, remainder: new Uint8Array(), llmDone: false, pieces: [], received: 0, spoke: false, queue: [] };
       reply = r;
       line.push(r);
+      return r;
+    };
+
+    /**
+     * An opener that isn't rendered ahead, said before the reply has any words: on a socket of its
+     * own with its text closed, so the model says it at once instead of holding it for the words
+     * after it. It plays as the reply's first segment, and the reply's audio queues behind it.
+     */
+    const sayOpener = (r: Reply, text: string) => {
+      const o = start(r.rid);
+      reply = r;
+      line.splice(line.indexOf(o), 1);
+      line.splice(line.indexOf(r), 0, o);
+      o.part = true;
+      o.segNo = r.segNo++;
+      o.llmDone = true;
+      o.buf = text;
+      r.opener = o;
+      send(o, true);
     };
 
     /** All text said: wait for the server's Done, but not forever. */
@@ -460,8 +483,10 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       r.io.close({ status: 'cancelled' });
       // What it was holding back behind an older reply is never heard.
       r.queue = [];
-      out(r, { type: 'tts.cancelled', rid: r.rid });
+      if (!r.part) out(r, { type: 'tts.cancelled', rid: r.rid });
       retire(r);
+      // Its opener goes with it.
+      if (r.opener) cancelReply(r.opener);
       if (!reply) ctx.setState('status', 'idle');
     };
     /** Cuts the current reply; with `all`, the ones still playing out too (a turn cut). */
@@ -560,6 +585,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
             if (!r || r.rid !== msg.rid) return;
             const opener = msg.type === 'opener.say';
             if (opener && !r.buf && playCanned(r, (msg.text as string).trim())) return;
+            if (opener && !r.buf && !r.spoke && !r.segs.length && !r.hold && !r.opener) return sayOpener(r, msg.text as string);
             r.buf += msg.text as string;
             // An opener is said as soon as it arrives, whatever its punctuation; the reply follows it.
             send(r, opener, false);
