@@ -123,7 +123,7 @@ describe('the tape format', () => {
 
 describe('the tape stage', () => {
   const run = (params: Record<string, unknown> = {}) => {
-    const h = harness(tapeTurnNode, { cellMs: 640, greeting: '', specCells: 0, ...params });
+    const h = harness(tapeTurnNode, { cellMs: 640, greeting: '', specCells: 0, draftGate: false, ...params });
     const answer = (content: string) => {
       const io = h.ios.at(-1)!;
       io.h.onRecv?.({ content, timings: { prompt_n: 20 } }, undefined);
@@ -261,6 +261,29 @@ describe('the tape stage', () => {
     // Its answer is done and nothing new was said: no respond again (it answered itself).
     h.advance(2560);
     expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " backchannel " bc');
+  });
+
+  it('drafts, then gates: listens before the earliest gate, Gemma chooses in between, responds by the latest', () => {
+    const h = run({ draftGate: true, specCells: 4 });
+    h.send(50, 'vad', { type: 'vad.speech_start', at: 0 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'how are you?', start: 0, end: 1 });
+    h.send(400, 'vad', { type: 'vad.speech_end', at: 0 });
+    // The cell with the words is too soon: no call for it; the first call is for the next one.
+    expect(h.ios).toHaveLength(1);
+    expect(h.prompt().endsWith('  0.64 | user: "how are you?" (talking) | agent (silent): listen\n  1.28 | user: (silent) | agent (silent):')).toBe(true);
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " respond " say | " backchannel " bc');
+    h.answer(' listen');
+    // 1.28 s of silence: only respond, drafted ahead and held.
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " respond " say');
+    h.answer(' respond "Fine, thanks."');
+    expect(h.of('llm.start')[0]).toMatchObject({ held: true });
+    h.advance(640);
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', forced: 'gate: too soon', spec: 'adopted' });
+    h.advance(1280);
+    expect(h.of('llm.release')).toHaveLength(0);
+    h.advance(1920);
+    expect(h.cells().at(-1)).toMatchObject({ action: 'respond', backstop: 'gate: answer now', spec: 'adopted' });
+    expect(h.of('llm.release')).toHaveLength(1);
   });
 
   it('skips the call while one is out, and while the TTS queue is full', () => {
