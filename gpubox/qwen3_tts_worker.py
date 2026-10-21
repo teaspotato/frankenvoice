@@ -61,6 +61,7 @@ class Job:
     voice: str
     loop: asyncio.AbstractEventLoop
     out: asyncio.Queue | None
+    instruct: str = ""
     events: "queue.Queue" = field(default_factory=queue.Queue)
     cancelled: bool = False
     background: bool = False
@@ -95,6 +96,7 @@ class Engine:
         self.voice = voice
         self.temp, self.sub_temp = temp, sub_temp
         self.speakers = sorted(self.tcfg.spk_id.keys())
+        self.use_instruct = getattr(self.m, "tts_model_size", "") not in ("0b6", "") if hasattr(self.m, "tts_model_size") else "0.6B" not in model
         V = self.tcfg.vocab_size
         self.suppress = torch.tensor([i for i in range(V - 1024, V) if i != self.tcfg.codec_eos_token_id], device=device)
         emb = self.talker.get_text_embeddings()
@@ -122,8 +124,9 @@ class Engine:
         t = torch.tensor([ids], device=self.device)
         return self.talker.text_projection(self.talker.get_text_embeddings()(t))
 
-    def prefill(self, voice: str, first_tok: int):
-        """The prompt generate() builds for a custom voice in streaming mode, up to the first text token."""
+    def prefill(self, voice: str, first_tok: int, instruct: str = ""):
+        """The prompt generate() builds for a custom voice in streaming mode, up to the first text token,
+        after the instruct (a voice direction; the 0.6B models ignore it, as qwen-tts does)."""
         c = self.tcfg
         E = self.talker.get_input_embeddings()
         lang = c.codec_language_id["english"]
@@ -134,6 +137,9 @@ class Engine:
         codec = torch.cat([c0, spk, c1], dim=1)
         x = torch.cat((self.tts_pad.expand(-1, codec.shape[1] - 2, -1), self.tts_bos), dim=1) + codec[:, :-1]
         x = torch.cat([self.role_embed, x, self.text_embed([first_tok]) + codec[:, -1:]], dim=1)
+        if instruct and self.use_instruct:
+            ids = self.tok(f"<|im_start|>user\n{instruct}<|im_end|>\n", add_special_tokens=False)["input_ids"]
+            x = torch.cat([self.text_embed(ids), x], dim=1)
         return x
 
     def sample(self, logits: torch.Tensor, prev: list[int], n: int) -> int:
@@ -250,6 +256,7 @@ class Run:
         self.word_tok_end: list[int] = []   # token count at the end of each word
         self.marks: list[int] = []
         self.closed = False
+        self.instruct = job.instruct
         self.last_ev = time.perf_counter()
 
     # ---- text in -------------------------------------------------------------------------------
@@ -290,6 +297,9 @@ class Run:
         elif kind == "flush":
             self.commit(True)
             self.marks.append(len(self.words))
+        elif kind == "instruct":
+            if not self.toks:   # only before the first word: it goes in the prompt
+                self.instruct = str(val or "").strip()[:300]
         elif kind == "close":
             self.commit(True)
             self.closed = True
@@ -334,7 +344,9 @@ class Run:
             t_gen = 0.0
             steps: list[float] = []
             t0 = time.perf_counter()
-            x = eng.prefill(job.voice, self.toks[0])
+            x = eng.prefill(job.voice, self.toks[0], self.instruct)
+            if self.instruct:
+                log.info("instruct %r (%s)", self.instruct, "used" if eng.use_instruct else "ignored by this model")
             self.fed = 1
             if eng.fast is not None:
                 logits0, _ = eng.fast.prefill(x)
@@ -511,7 +523,8 @@ def build_app(engine: Engine) -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"ok": True, "tts": engine.model_name, "engine": "qwen3-tts", "speakers": engine.speakers}
+        return {"ok": True, "tts": engine.model_name, "engine": "qwen3-tts", "speakers": engine.speakers,
+                "instruct": engine.use_instruct}
 
     @app.get("/config")
     def config():
@@ -525,7 +538,7 @@ def build_app(engine: Engine) -> FastAPI:
         if voice not in engine.speakers:
             # a Kyutai voice path from a graph made for Kyutai: use the default speaker
             voice = engine.voice
-        job = Job(voice=voice, loop=asyncio.get_running_loop(), out=asyncio.Queue(),
+        job = Job(voice=voice, loop=asyncio.get_running_loop(), out=asyncio.Queue(), instruct=ws.query_params.get("instruct") or "",
                   background=ws.query_params.get("priority") == "background")
         engine.submit(job)
         await ws.send_text(json.dumps({"type": "Ready", "sample_rate": SR}))
@@ -557,6 +570,8 @@ def build_app(engine: Engine) -> FastAPI:
                     job.events.put(("text", str(d.get("text", ""))))
                 elif t == "Flush":
                     job.events.put(("flush", None))
+                elif t == "Instruct":
+                    job.events.put(("instruct", str(d.get("text", ""))))
                 elif t == "Close":
                     job.events.put(("close", None))
                 else:

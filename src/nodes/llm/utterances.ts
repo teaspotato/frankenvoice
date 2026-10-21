@@ -9,6 +9,10 @@
  * The flags come before the words, so the pipeline knows how to treat the audio before any of it
  * is spoken. A tag is 6 tokens for Gemma; JSON objects cost twice that before the first word (see
  * the format bench in the commit). The history keeps the raw text, so the prompt prefix stays exact.
+ *
+ * Styled replies put a voice direction first, on a line of its own in parentheses, before any
+ * words: `(warm, unhurried, a little amused)`. It goes to TTS as the reply's instruct (Qwen3-TTS
+ * 1.7B), which has to have it before the first word is spoken.
  */
 
 export interface UtteranceFlags {
@@ -26,6 +30,23 @@ export const TAG_INSTRUCTIONS =
 
 /** Written for the model at the start of each reply: the first tag's opening, so it only writes the flags. */
 export const TAG_PREFILL = '[i';
+
+/** Told to the model once, in the system prompt, when replies are styled. */
+export const STYLE_INSTRUCTIONS =
+  'Start every reply with one line in parentheses: how to say it, as a short voice direction for the speech synthesizer ' +
+  '(tone, pace, emotion), for example (warm and relaxed, a little amused) or (quick and matter-of-fact) or (soft, sympathetic, slow). ' +
+  'Then the reply lines.';
+
+/** Written for the model at the start of a styled reply: the direction's opening. */
+export const STYLE_PREFILL = '(';
+
+/** The grammar for a styled reply after `prefix`: the rest of the direction line, then tagged lines. */
+export function styledGrammar(prefix: string): string {
+  if (prefix.includes('\n')) return tagGrammar(prefix);
+  const rest = 'line ("\\n" line)*';
+  if (prefix.endsWith(')')) return `root ::= "\\n" ${rest}\n${RULES}`;
+  return `root ::= [^)\\n]* ")\\n" ${rest}\n${RULES}`;
+}
 
 const TAG = ['"["', '"i"', '[01]', '"g"', '[01]', '"]"', '" "'];
 const RULES = 'line ::= "[i" [01] "g" [01] "] " t\nt ::= [^\\n\\[]+\n';
@@ -50,7 +71,10 @@ function matchesPart(c: string, part: string): boolean {
   return part === '[01]' ? c === '0' || c === '1' : part === `"${c}"`;
 }
 
-export type UtteranceEvent = { type: 'utterance'; flags: UtteranceFlags; tagged: boolean } | { type: 'text'; text: string };
+export type UtteranceEvent =
+  | { type: 'utterance'; flags: UtteranceFlags; tagged: boolean }
+  | { type: 'text'; text: string }
+  | { type: 'style'; text: string };
 
 const isTagPrefix = (s: string) => /^(?:\[(?:i(?:[01](?:g(?:[01](?:\](?: )?)?)?)?)?)?)?$/.test(s);
 const FULL = /^\[i([01])g([01])\]/;
@@ -58,11 +82,15 @@ const FULL = /^\[i([01])g([01])\]/;
 /**
  * Streams a tagged reply: each line's tag becomes an `utterance` event (before its words), its words
  * `text` events, and a line break a space. Text without a tag is an utterance with the default flags.
+ * A reply that opens with `(` opens with a voice direction: a `style` event once its `)` comes.
  */
 export class UtteranceParser {
   private head = '';
   private lineStart = true;
   private any = false;
+  /** The voice direction: may still come (start), being read (in), read and its line not ended (after), none or over (done). */
+  private style: 'start' | 'in' | 'after' | 'done' = 'start';
+  private styleText = '';
 
   feed(chunk: string): UtteranceEvent[] {
     const out: UtteranceEvent[] = [];
@@ -80,6 +108,19 @@ export class UtteranceParser {
       this.lineStart = false;
     };
     for (const c of chunk) {
+      if (this.style === 'start') this.style = c === '(' ? 'in' : 'done';
+      if (this.style === 'in') {
+        if (c === '(' && !this.styleText) continue;
+        if (c === ')' || c === '\n') {
+          out.push({ type: 'style', text: this.styleText.trim() });
+          this.style = c === '\n' ? 'done' : 'after';
+        } else this.styleText += c;
+        continue;
+      }
+      if (this.style === 'after') {
+        if (c === '\n') this.style = 'done';
+        continue;
+      }
       if (c === '\n') {
         if (this.lineStart && this.head) {
           startLine(DEFAULT_FLAGS, false);
@@ -141,7 +182,10 @@ export const visibleWordCount = (raw: string) => words(visibleText(raw)).length;
 export function rawPrefix(raw: string, k: number): string {
   const out: string[] = [];
   let left = k;
-  for (const line of raw.split('\n')) {
+  const lines = raw.split('\n');
+  // A voice direction is kept, uncounted
+  if (/^\(/.test(lines[0] ?? '')) out.push(lines.shift()!);
+  for (const line of lines) {
     if (left <= 0) break;
     const m = /^\[i[01]g[01]\] ?/.exec(line);
     const tag = m ? m[0].trimEnd() : '';

@@ -38,7 +38,10 @@ export HF_HUB_DISABLE_PROGRESS_BARS=1
 ASR_MODEL=${ASR_MODEL:-Qwen/Qwen3-ASR-1.7B}
 ALIGN_MODEL=Qwen/Qwen3-ForcedAligner-0.6B
 TTS_REPO=kyutai/tts-1.6b-en_fr
-QWEN_TTS_MODEL=${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}
+# 1.7B: 4.7 GB, 38 ms/frame alone, follows the instruct (voice direction); 0.6B: 2.8 GB, 30 ms/frame, ignores it.
+# A model given here is remembered in $ROOT/tts.qwen_model for later swaps
+[ -z "${QWEN_TTS_MODEL:-}" ] && [ -f "$ROOT/tts.qwen_model" ] && QWEN_TTS_MODEL=$(cat "$ROOT/tts.qwen_model")
+QWEN_TTS_MODEL=${QWEN_TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice}
 QWEN_TTS_PKG=qwen-tts==0.1.1
 ASR_PORT=8101; TTS_PORT=8102; LLM_PORT=8103; GW_PORT=8000; UI_PORT=8787
 NODE_VERSION=v22.22.0
@@ -222,6 +225,7 @@ start_tts() {  # the TTS worker of $(tts_engine) on $TTS_PORT
   local TOKEN; TOKEN=$(cat "$DATA/gpubox.token")
   if [ "$(tts_engine)" = qwen ]; then
     install_qwen_tts || return 1
+    echo "$QWEN_TTS_MODEL" > "$ROOT/tts.qwen_model"
     spawn tts env GPUBOX_TOKEN="$TOKEN" ALIGN_URL=http://127.0.0.1:$GW_PORT/v1/align QWEN_TTS_MODEL="$QWEN_TTS_MODEL" \
       "$ROOT/v-qtts/bin/python" "$SRC/qwen3_tts_worker.py" --port $TTS_PORT
   else

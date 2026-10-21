@@ -5,6 +5,9 @@ import type { ChatTurn, LlmStreamParser } from "./types";
 import {
   rawPrefix,
   TAG_INSTRUCTIONS,
+  STYLE_INSTRUCTIONS,
+  STYLE_PREFILL,
+  styledGrammar,
   TAG_PREFILL,
   tagGrammar,
   UtteranceParser,
@@ -181,6 +184,22 @@ export const llmNode: NodeDef = {
         "Added to the system prompt once (the same for every request, so the cache holds).",
     },
     {
+      key: "style",
+      label: "Voice direction first",
+      type: "boolean",
+      default: false,
+      when: { utterances: ["tagged"] },
+      description:
+        "Each reply opens with a voice direction in parentheses, (warm, unhurried), sent to TTS as its instruct (Qwen3-TTS 1.7B) before the first word.",
+    },
+    {
+      key: "stylePrompt",
+      label: "Voice direction format (system prompt)",
+      type: "text",
+      default: STYLE_INSTRUCTIONS,
+      when: { utterances: ["tagged"], style: [true] },
+    },
+    {
       key: "slot",
       label: "Reply slot",
       type: "number",
@@ -204,13 +223,14 @@ export const llmNode: NodeDef = {
     const p = ctx.params as JsonObject;
     /** Replies and drafts run on their slot; interjection checks on any. */
     const tagged = p.utterances === "tagged";
+    const styled = tagged && p.style === true;
     const reqParams: JsonObject = {
       ...p,
       idSlot: Number(p.slot ?? -1),
       ...(tagged
         ? {
             system:
-              `${String(p.system ?? "")}\n\n${String(p.tagPrompt ?? "")}`.trim(),
+              `${String(p.system ?? "")}\n\n${String(p.tagPrompt ?? "")}${styled ? `\n\n${String(p.stylePrompt ?? "")}` : ""}`.trim(),
           }
         : {}),
     };
@@ -302,7 +322,9 @@ export const llmNode: NodeDef = {
           active.tokens++;
           const a = active;
           for (const u of a.utt.feed(text)) {
-            if (u.type === "utterance")
+            if (u.type === "style")
+              ctx.emit("text", { type: "llm.style", rid: a.rid, text: u.text });
+            else if (u.type === "utterance")
               ctx.emit("text", {
                 type: "llm.utterance",
                 rid: a.rid,
@@ -377,7 +399,7 @@ export const llmNode: NodeDef = {
             ...(request as JsonObject),
             body: {
               ...((request as JsonObject).body as JsonObject),
-              grammar: tagGrammar(turns.at(-1)!.text),
+              grammar: (styled ? styledGrammar : tagGrammar)(turns.at(-1)!.text),
             },
           };
       } catch (e) {
@@ -505,7 +527,7 @@ export const llmNode: NodeDef = {
       });
     };
     const reply = (user: ChatTurn, extra: Partial<Reply>): Reply => {
-      const raw = tagged && !extra.checkId ? TAG_PREFILL : "";
+      const raw = tagged && !extra.checkId ? (styled ? STYLE_PREFILL : TAG_PREFILL) : "";
       const utt = new UtteranceParser();
       utt.feed(raw);
       return {

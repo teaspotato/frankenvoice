@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { rawPrefix, tagGrammar, UtteranceParser, visibleText } from '../src/nodes/llm/utterances';
+import { rawPrefix, styledGrammar, tagGrammar, UtteranceParser, visibleText } from '../src/nodes/llm/utterances';
 import { cutToHeard, llmNode } from '../src/nodes/llm';
 import { kyutaiTtsNode } from '../src/nodes/tts/stream';
 import { speakerNode } from '../src/nodes/speaker';
@@ -196,5 +196,32 @@ describe('tagged utterances: turn-taking', () => {
     h.advance(3000);
     expect(h.of('turn.decision').map((d) => d.decision)).toEqual(['protected']);
     expect(controls(h)).toEqual([]);
+  });
+});
+
+describe('styled replies', () => {
+  it('reads the voice direction first, apart from the words', () => {
+    const p = new UtteranceParser();
+    const evs = [...p.feed('(warm, a little'), ...p.feed(' amused)\n[i1g1] Sure.\n[i1g1] Go on.')];
+    expect(evs[0]).toEqual({ type: 'style', text: 'warm, a little amused' });
+    expect(evs.filter((e) => e.type === 'utterance')).toHaveLength(2);
+    expect(evs.flatMap((e) => (e.type === 'text' ? [e.text] : [])).join('')).toBe('Sure. Go on.');
+  });
+
+  it('keeps the direction out of the visible text and the word count, and in a cut prefix', () => {
+    const raw = '(quick and matter-of-fact)\n[i1g1] Turn left here.\n[i0g1] Then right.';
+    expect(visibleText(raw)).toBe('Turn left here. Then right.');
+    expect(rawPrefix(raw, 2)).toBe('(quick and matter-of-fact)\n[i1g1] Turn left');
+  });
+
+  it('a reply that does not open with ( has no direction', () => {
+    const p = new UtteranceParser();
+    expect(p.feed('[i1g1] Hi (there).').some((e) => e.type === 'style')).toBe(false);
+  });
+
+  it('grammar: the rest of the direction line, then tagged lines', () => {
+    expect(styledGrammar('(warm')).toContain('root ::= [^)\\n]* ")\\n" line');
+    expect(styledGrammar('(warm)')).toContain('root ::= "\\n" line');
+    expect(styledGrammar('(warm)\n[i')).toBe(tagGrammar('(warm)\n[i'));
   });
 });

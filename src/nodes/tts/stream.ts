@@ -547,6 +547,11 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
             if (r.buf.trim()) send(r, true, false);
             r.flags = { interruptible: msg.interruptible !== false, gate: msg.gate !== false };
             break;
+          case 'llm.style':
+            // The reply's voice direction, before its first word: the box's Qwen3-TTS takes it as instruct (Kyutai ignores it).
+            if (!r || r.rid !== msg.rid || !msg.text) return;
+            r.io.send({ type: 'Instruct', text: msg.text as string });
+            break;
           case 'opener.lines':
           case 'bc.lines':
             prerender(msg.lines as string[]);
