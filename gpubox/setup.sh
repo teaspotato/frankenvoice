@@ -183,14 +183,16 @@ stop_gpu() {  # the GPU services only; tunnels and the UI keep their URLs
   mps_stop
 }
 
+PORTS_FILTER="( sport = :$ASR_PORT or sport = :$TTS_PORT or sport = :$LLM_PORT or sport = :$GW_PORT )"
 ports_free() {  # wait for the services' ports, so restarted ones don't fall back to random ports
   for _ in $(seq 1 60); do
     # Any socket, not just listeners: sglang refuses a port with connections still in TIME_WAIT and
-    # silently serves on a random one instead
-    ss -tanH | grep -qE ":($ASR_PORT|$TTS_PORT|$LLM_PORT|$GW_PORT) " || return 0
+    # silently serves on a random one instead. Local ports only: a client socket whose peer is one
+    # of these ports holds nothing here.
+    [ -z "$(ss -tanH "$PORTS_FILTER")" ] && return 0
     sleep 1
   done
-  log "ports still busy: $(ss -ltn | grep -oE ":($ASR_PORT|$TTS_PORT|$LLM_PORT|$GW_PORT) " | tr -d '\n')"
+  log "ports still busy: $(ss -tanH "$PORTS_FILTER" | awk '{print $1, $4}' | sort -u | tr '\n' ' ')"
 }
 
 stop() {
