@@ -80,6 +80,12 @@ function titleToName(title: string): string {
     .trim();
 }
 
+/** Demo visitors get no System 2: its agents run with the server's credentials. */
+const noSystem2: LiveDriver = (_req, sink) => {
+  setTimeout(() => sink.close({ error: 'System 2 is only available to the host' }), 0);
+  return { send() {}, close() {} };
+};
+
 /** A connected page: its mic and speakers, and the run it started (at most one). */
 class Page {
   run: Run | null = null;
@@ -100,7 +106,7 @@ class Page {
     /** The host (token or local), not a demo visitor. */
     readonly host: boolean,
   ) {
-    this.drivers = { ...base, mic: this.mic, speaker: this.speaker };
+    this.drivers = { ...base, mic: this.mic, speaker: this.speaker, ...(host ? {} : { acp: noSystem2 }) };
   }
   send(m: Json) {
     if (this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify(m));

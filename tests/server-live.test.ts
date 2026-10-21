@@ -43,6 +43,7 @@ let gpuboxPort = 0;
 let llmPort = 0;
 /** The live session limit the hub uses (ms; 0: none), set per test. */
 let limitMs = 0;
+let hubRef: LiveHub | undefined;
 let livePort = 0;
 const seen = { asr: 0, tts: 0, llm: 0, completions: 0, auth: [] as string[], ttsQueries: [] as string[], llmBodies: [] as { messages?: { role: string; content: unknown }[] }[] };
 const sessions = mkdtempSync(join(tmpdir(), 'fv-sessions-'));
@@ -87,7 +88,7 @@ beforeAll(async () => {
   });
   gpuboxPort = await listen(gpubox);
   llmPort = await listen(llm);
-  const hub = new LiveHub({
+  const hub = (hubRef = new LiveHub({
     upstreams: (name): Upstream =>
       name === 'gpubox'
         ? { base: `ws://127.0.0.1:${gpuboxPort}`, headers: { authorization: `Bearer ${TOKEN}` } }
@@ -105,7 +106,7 @@ beforeAll(async () => {
     },
     heartbeatMs: 300,
     log: () => {},
-  });
+  }));
   const server = createServer();
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) =>
@@ -517,6 +518,10 @@ describe('the pipeline in the server', () => {
     await new Promise((r) => setTimeout(r, 300));
     expect(msgs.filter((m) => m.type === 'notice').map((m) => m.text)).toEqual(['replays on the GPU box are for the host only']);
     expect(msgs.filter((m) => m.type === 'session')).toHaveLength(1);
+    // A visitor's System 2 is refused: its agents would run with the server's credentials.
+    const page = [...(hubRef as unknown as { pages: Set<{ host: boolean; drivers: Record<string, LiveDriver> }> }).pages].find((pg) => !pg.host)!;
+    const refused = await new Promise<Json>((resolve) => page.drivers.acp({}, { recv() {}, close: (e) => resolve(e ?? null) }, { now: () => 0 }));
+    expect(refused).toEqual({ error: 'System 2 is only available to the host' });
     const saved = new Promise((r) => ws.on('message', (d: Buffer, bin) => !bin && JSON.parse(d.toString()).type === 'saved' && r(null)));
     ws.send(JSON.stringify({ type: 'stop' }));
     // A visitor's session is always kept.
