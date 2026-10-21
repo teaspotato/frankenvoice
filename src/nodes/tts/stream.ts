@@ -107,12 +107,47 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       flags?: Flags;
       /** Held (a speculative reply): what it would emit, kept until it is released or dropped. */
       hold?: Msg[];
+      /** Text went out on the socket (so the server sends Done and closes it when it has said it all). */
+      spoke: boolean;
+      /** The last segment whose Flushed came: the audio after it (the model's last frames) is still its. */
+      tail?: Seg;
+      /** Output waiting for the replies before it to finish playing out, so it queues after theirs. */
+      queue: Msg[];
+      /** In case the server never closes the socket after the text's end. */
+      guard?: { clear(): void };
+      /** Played out or cut; it leaves `line` once the replies before it have. */
+      ended?: boolean;
     };
     /** Held replies by rid, until released or dropped (they may finish rendering before). */
     const held = new Map<string, Reply>();
-    /** A reply's output: emitted, or kept while the reply is held. */
-    const out = (r: Reply, m: Msg) => (r.hold ? void r.hold.push(m) : void ctx.emit('audio', m));
+    /** The reply taking text now. */
     let reply: Reply | undefined;
+    /**
+     * Replies in the order they play: ones whose text is complete and whose audio is still coming
+     * (the model speaks on for a while after its last Flushed; a new reply doesn't cut them off),
+     * then the current one. Only the first emits as it goes; the others' output waits behind it.
+     */
+    const line: Reply[] = [];
+    const live = (r: Reply) => !r.ended && line.includes(r);
+    /** Emits now if no older reply is still playing out, else after it. */
+    const emitNow = (r: Reply, m: Msg) => (line.length && line[0] !== r && line.includes(r) ? void r.queue.push(m) : void ctx.emit('audio', m));
+    /** A reply's output: emitted, or kept while the reply is held. */
+    const out = (r: Reply, m: Msg) => (r.hold ? void r.hold.push(m) : emitNow(r, m));
+    /** A reply played out or was cut: once it heads the line it leaves, and the next one's waiting output follows. */
+    const retire = (r: Reply) => {
+      r.ended = true;
+      r.guard?.clear();
+      r.guard = undefined;
+      if (reply === r) reply = undefined;
+      while (line[0]?.ended) {
+        line.shift();
+        const n = line[0];
+        if (!n) break;
+        const q = n.queue;
+        n.queue = [];
+        for (const m of q) ctx.emit('audio', m);
+      }
+    };
     /** Opener lines (fillers), synthesized ahead so they play at once. */
     const canned = new Map<string, Float32Array[]>();
 
@@ -205,14 +240,17 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
       return piece ? piece.m + Math.min(x - piece.a, piece.n) : x;
     };
 
+    /** The reply has played out: the server said all of it and closed (Done), or it said nothing. */
     const finish = (r: Reply) => {
-      if (reply !== r) return;
-      reply = undefined;
+      if (!live(r)) return;
       // Close (end of text) went out when the LLM finished.
       if (!r.io.closed) r.io.close();
       out(r, { type: 'tts.response_end', rid: r.rid });
-      ctx.setState('status', 'idle');
+      retire(r);
+      if (!reply) ctx.setState('status', 'idle');
     };
+    /** How long to wait for the server's Done after the last Flushed before closing anyway. */
+    const DONE_GRACE_MS = 3000;
 
     /**
      * Whole words go out as soon as they are written (all of the text when `all`), and a Flush
@@ -228,6 +266,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
         }
         if (r.open) r.open.text = r.buf.slice(0, ready).trim();
         r.io.send({ type: 'Speak', text });
+        r.spoke = true;
         // For the scheduler: how many words TTS has been given.
         const words = text.split(/\s+/).filter(Boolean).length;
         if (words) out(r, { type: 'tts.sent', rid: r.rid, words });
@@ -348,9 +387,10 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
         request(),
         {
           onRecv(data: Json, bin) {
-            if (reply !== r) return;
+            if (!live(r)) return;
             if (bin) {
-              const s = r.segs[0];
+              // After the last Flushed the model still speaks for a few frames: that audio ends its segment.
+              const s = r.segs[0] ?? r.tail;
               if (!s) return;
               const all = new Uint8Array(r.remainder.length + bin.length);
               all.set(r.remainder);
@@ -384,12 +424,14 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
               if (s) {
                 if (!s.started) emitAudio(r, s, new Float32Array());
                 out(r, { type: 'tts.segment_end', rid: r.rid, seg: s.seg });
+                r.tail = s;
               }
-              if (r.llmDone && !r.segs.length && !r.buf) finish(r);
+              // The reply ends on Done (the socket's close), once its last frames have arrived.
+              if (r.llmDone && !r.segs.length && !r.buf) awaitDone(r);
             } else if (m.type === 'Warning' || m.type === 'Error') ctx.log('warn', `TTS ${String(m.type)}`, m);
           },
           onClose(data) {
-            if (reply !== r) return;
+            if (!live(r)) return;
             if (data && (data as { error?: unknown }).error) ctx.log('error', 'TTS connection failed', data);
             for (const s of r.segs) out(r, { type: 'tts.segment_end', rid: r.rid, seg: s.seg });
             r.segs = [];
@@ -397,29 +439,59 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
           },
         },
       );
-      r = { rid, io, buf: '', spoken: 0, segs: [], segNo: 0, remainder: new Uint8Array(), llmDone: false, pieces: [], received: 0 };
+      r = { rid, io, buf: '', spoken: 0, segs: [], segNo: 0, remainder: new Uint8Array(), llmDone: false, pieces: [], received: 0, spoke: false, queue: [] };
       reply = r;
+      line.push(r);
     };
 
-    const cancel = () => {
+    /** All text said: wait for the server's Done, but not forever. */
+    const awaitDone = (r: Reply) => {
+      if (r.guard) return;
+      r.guard = ctx.setTimer(DONE_GRACE_MS, () => {
+        r.guard = undefined;
+        if (!live(r)) return;
+        ctx.log('warn', 'TTS sent no Done after the reply; closing it');
+        finish(r);
+      }, 'tts-done');
+    };
+
+    const cancelReply = (r: Reply) => {
+      if (!live(r)) return;
+      r.io.close({ status: 'cancelled' });
+      // What it was holding back behind an older reply is never heard.
+      r.queue = [];
+      out(r, { type: 'tts.cancelled', rid: r.rid });
+      retire(r);
+      if (!reply) ctx.setState('status', 'idle');
+    };
+    /** Cuts the current reply; with `all`, the ones still playing out too (a turn cut). */
+    const cancel = (all = false) => {
+      if (reply) cancelReply(reply);
+      // Newest first, so none of their waiting audio is let out on the way.
+      if (all) for (const r of [...line].reverse()) cancelReply(r);
+    };
+    /**
+     * A new reply: the current one plays out if its text is complete (and it isn't held), else it
+     * is cut. One playing out queues the new reply's audio behind its own.
+     */
+    const supersede = () => {
       const r = reply;
       if (!r) return;
-      reply = undefined;
-      r.io.close({ status: 'cancelled' });
-      out(r, { type: 'tts.cancelled', rid: r.rid });
-      ctx.setState('status', 'idle');
+      // It stays in `line` until it has played out.
+      if (r.llmDone && !r.hold) reply = undefined;
+      else cancelReply(r);
     };
 
     return {
       onInput(port, msg: Msg) {
         if (port === 'control') {
-          if (msg.type === 'cancel') cancel();
+          if (msg.type === 'cancel') cancel(true);
           return;
         }
         const r = reply;
         switch (msg.type) {
           case 'llm.start':
-            cancel();
+            supersede();
             start(msg.rid as string);
             if (msg.held) {
               // Rendered now, heard only once released.
@@ -433,14 +505,14 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
             held.delete(h.rid);
             const msgs = h.hold ?? [];
             h.hold = undefined;
-            for (const m of msgs) ctx.emit('audio', m);
+            for (const m of msgs) emitNow(h, m);
             break;
           }
           case 'llm.drop': {
             const h = held.get(msg.rid as string);
             if (!h) break;
             held.delete(h.rid);
-            if (reply === h) cancel();
+            if (live(h)) cancelReply(h);
             h.hold = undefined;
             break;
           }
@@ -497,12 +569,14 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
             if (!r || r.rid !== msg.rid) return;
             r.llmDone = true;
             send(r, true);
-            if (!r.segs.length) finish(r);
+            // Nothing said: nothing to wait for. Else it ends on Done.
+            if (!r.spoke) finish(r);
+            else if (!r.segs.length) awaitDone(r);
             break;
         }
       },
       stop() {
-        cancel();
+        cancel(true);
         for (const id of [...genCues.keys()]) dropCue(id, false, 'stopped');
       },
     };

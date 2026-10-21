@@ -64,13 +64,94 @@ describe('streaming TTS (Kyutai on the GPU box)', () => {
     h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
     h.ios[0].h.onRecv!(null, h.pcm(30));
     h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
+    expect(h.ios[0].closed).toBe(false);
+    h.ios[0].h.onRecv!({ type: 'Done' }, undefined);
+    h.ios[0].h.onClose!(null);
     // The first audio plays at once, before its sentence is all written; the rest of its text follows.
     expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.segment_text', 'audio', 'tts.segment_end', 'tts.segment_start', 'audio', 'tts.segment_end', 'tts.response_end']);
     expect(h.out.filter((m) => m.type === 'tts.segment_start').map((m) => m.text)).toEqual(['Sure, I can', 'Then bye.']);
     expect(h.out.find((m) => m.type === 'tts.segment_text')).toMatchObject({ seg: 0, text: 'Sure, I can help.' });
     // Close went out with the end of the text; it is not sent again.
     expect(h.ios[0].sent.filter((m) => (m as { type: string }).type === 'Close')).toHaveLength(1);
+  });
+
+  it('plays the audio after the last Flushed (the model speaks on), and ends the reply on Done', () => {
+    const h = kyutai();
+    h.llm(0, 'start');
+    h.llm(100, 'delta', 'Reggae it is.');
+    h.llm(110, 'end');
+    h.ios[0].h.onRecv!(null, h.pcm(100));
+    // Flushed comes a little early, and the model's last frames follow it.
+    h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
+    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.segment_end']);
+    expect(h.ios[0].closed).toBe(false);
+    h.ios[0].h.onRecv!(null, h.pcm(40));
+    h.ios[0].h.onRecv!(null, h.pcm(40));
+    h.ios[0].h.onRecv!({ type: 'Done', stats: {} }, undefined);
+    h.ios[0].h.onClose!(null);
+    expect(h.types()).toEqual(['tts.segment_start', 'audio', 'tts.segment_end', 'audio', 'audio', 'tts.response_end']);
+    expect(h.out.filter((m) => m.type === 'audio').map((m) => [m.seg, (m.samples as Float32Array).length])).toEqual([[0, 100], [0, 40], [0, 40]]);
+  });
+
+  it('ends a reply that said nothing at once', () => {
+    const h = kyutai();
+    h.llm(0, 'start');
+    h.llm(10, 'end');
+    expect(h.types()).toEqual(['tts.response_end']);
     expect(h.ios[0].closed).toBe(true);
+  });
+
+  it('lets a finished reply play out when the next one starts, and queues the new audio behind it', () => {
+    const h = kyutai();
+    h.send(0, 'text', { type: 'llm.start', rid: 'a' });
+    h.send(10, 'text', { type: 'llm.delta', rid: 'a', text: 'Sure, reggae.' });
+    h.send(20, 'text', { type: 'llm.end', rid: 'a' });
+    h.ios[0].h.onRecv!(null, h.pcm(10));
+    // The next reply starts while the first still renders: the first is not cut.
+    h.send(30, 'text', { type: 'llm.start', rid: 'b' });
+    expect(h.ios[0].closed).toBe(false);
+    expect(h.types()).not.toContain('tts.cancelled');
+    h.send(40, 'text', { type: 'llm.delta', rid: 'b', text: 'Bob Marley. ' });
+    expect(h.ios[1].sent[0]).toEqual({ type: 'Speak', text: 'Bob Marley. ' });
+    // The new reply's audio comes first, but plays after the old one's.
+    h.ios[1].h.onRecv!(null, h.pcm(7));
+    h.ios[0].h.onRecv!(null, h.pcm(20));
+    h.ios[0].h.onRecv!({ type: 'Flushed' }, undefined);
+    h.ios[0].h.onRecv!(null, h.pcm(30));
+    expect(h.out.filter((m) => m.type === 'audio').map((m) => [m.rid, (m.samples as Float32Array).length])).toEqual([['a', 10], ['a', 20], ['a', 30]]);
+    h.ios[0].h.onClose!(null);
+    h.ios[1].h.onRecv!(null, h.pcm(8));
+    const seq = h.out.filter((m) => m.type !== 'tts.sent').map((m) => `${m.rid}:${m.type}${m.type === 'audio' ? (m.samples as Float32Array).length : ''}`);
+    expect(seq).toEqual(['a:tts.segment_start', 'a:audio10', 'a:audio20', 'a:tts.segment_end', 'a:audio30', 'a:tts.response_end', 'b:tts.segment_start', 'b:audio7', 'b:audio8']);
+  });
+
+  it('cuts a reply still being written when the next one starts', () => {
+    const h = kyutai();
+    h.send(0, 'text', { type: 'llm.start', rid: 'a' });
+    h.send(10, 'text', { type: 'llm.delta', rid: 'a', text: 'Sure, reggae ' });
+    h.send(30, 'text', { type: 'llm.start', rid: 'b' });
+    expect(h.ios[0].closed).toBe(true);
+    expect(h.out.at(-1)).toEqual({ type: 'tts.cancelled', rid: 'a' });
+  });
+
+  it('a cancel cuts both the reply playing out and the new one, at once', () => {
+    const h = kyutai();
+    h.send(0, 'text', { type: 'llm.start', rid: 'a' });
+    h.send(10, 'text', { type: 'llm.delta', rid: 'a', text: 'Sure, reggae.' });
+    h.send(20, 'text', { type: 'llm.end', rid: 'a' });
+    h.ios[0].h.onRecv!(null, h.pcm(10));
+    h.send(30, 'text', { type: 'llm.start', rid: 'b' });
+    h.send(40, 'text', { type: 'llm.delta', rid: 'b', text: 'Bob Marley. ' });
+    h.ios[1].h.onRecv!(null, h.pcm(7));
+    h.send(50, 'control', { type: 'cancel' });
+    expect(h.ios[0].closed).toBe(true);
+    expect(h.ios[1].closed).toBe(true);
+    h.ios[0].h.onRecv!(null, h.pcm(10));
+    h.ios[1].h.onRecv!(null, h.pcm(10));
+    h.ios[0].h.onClose!(null);
+    // b's audio never played: it was waiting behind a's.
+    const seq = h.out.filter((m) => m.type !== 'tts.sent').map((m) => `${m.rid}:${m.type}`);
+    expect(seq).toEqual(['a:tts.segment_start', 'a:audio', 'a:tts.cancelled', 'b:tts.cancelled']);
   });
 
   it('flushes an opener at once without ending the text, and the reply follows on the same socket', () => {
