@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EXAMPLE_TAPE, PROMPTS, cutTape, grammar, headroom, line, newCell, parseAction, promptHead, tapePrompt, timed, type Cell, type TapeState } from '../src/nodes/tape';
+import { EXAMPLE_TAPE, PROMPTS, actionOdds, cutTape, grammar, headroom, line, newCell, parseAction, promptHead, tapePrompt, timed, type Cell, type TapeState } from '../src/nodes/tape';
 import { noPeriods, tapeTurnNode } from '../src/nodes/turn-tape';
 import { harness } from './node-harness';
 import type { Json, Msg } from '../src/core/types';
@@ -48,6 +48,15 @@ describe('the tape format', () => {
     );
     expect(grammar(['continue', 'finish'], 1).split('\n').slice(0, 2)).toEqual(['root ::= " continue " say | " finish" (" " say)?', 'say ::= "\\"" word (" " word){0,0} "\\""']);
     expect(grammar(['listen', 'respond', 'backchannel'], 2).split('\n')[0]).toBe('root ::= " listen" | " respond " say | " backchannel " bc');
+  });
+
+  it("reads Gemma's odds for each action from the first token's alternatives", () => {
+    const top = (pairs: [string, number][]) => ({ completion_probabilities: [{ token: pairs[0][0], logprob: Math.log(pairs[0][1]), top_logprobs: pairs.map(([token, p]) => ({ token, logprob: Math.log(p) })) }] });
+    // " backchannel" starts with the token " back"; "\n" belongs to no action.
+    expect(actionOdds(top([[' listen', 0.7], [' respond', 0.2], [' back', 0.05], ['\n', 0.05]]), ['listen', 'respond', 'backchannel'])).toEqual({ listen: 0.7, respond: 0.2, backchannel: 0.05 });
+    // An action outside the top alternatives gets 0.
+    expect(actionOdds(top([[' continue', 0.99]]), ['continue', 'finish'])).toEqual({ continue: 0.99, finish: 0 });
+    expect(actionOdds({ content: ' listen' } as never, ['listen'])).toBeNull();
   });
 
   it('reads what Gemma wrote', () => {
@@ -166,6 +175,24 @@ describe('the tape stage', () => {
     }
     expect(h.prompt().endsWith('  6.40 | user: (silent) | agent (silent):')).toBe(true);
     expect(h.prompt()).toContain('  5.76 | user: (silent) | agent (cut off): listen');
+  });
+
+  it("asks for the token odds and reports each action's on the cell", () => {
+    const h = run();
+    h.send(100, 'transcript', { type: 'asr.final', text: 'is it open?', start: 0, end: 1 });
+    h.advance(640);
+    expect((h.ios.at(-1)!.request as { body: { n_probs: number } }).body.n_probs).toBe(8);
+    const io = h.ios.at(-1)!;
+    const tok = (token: string, p: number) => ({ token, logprob: Math.log(p) });
+    io.h.onRecv?.({ content: ' listen', completion_probabilities: [{ ...tok(' listen', 0.6), top_logprobs: [tok(' listen', 0.6), tok(' respond', 0.4)] }] }, undefined);
+    io.h.onClose?.(null);
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', xid: '1', odds: { listen: 0.6, respond: 0.4, backchannel: 0 } });
+    // Off: no n_probs, no odds.
+    const off = run({ nProbs: 0 });
+    off.advance(640);
+    expect((off.ios.at(-1)!.request as { body: Record<string, unknown> }).body).not.toHaveProperty('n_probs');
+    off.answer(' listen');
+    expect(off.cells().at(-1)).not.toHaveProperty('odds');
   });
 
   it('skips the call while one is out, and while the TTS queue is full', () => {

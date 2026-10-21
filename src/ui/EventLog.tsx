@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { Trajectory } from '../core/trajectory';
 import type { TrajEvent } from '../core/types';
 
@@ -30,6 +30,7 @@ export function EventLog({
   open,
   onToggle,
   focus,
+  tabs,
 }: {
   trajectory?: Trajectory;
   live: boolean;
@@ -38,6 +39,8 @@ export function EventLog({
   /** Collapsed, only the header bar shows and live updates are skipped. */
   open: boolean;
   onToggle(): void;
+  /** Switches between the bottom panel's views, shown in place of the title. */
+  tabs?: ReactNode;
 }) {
   const [, setTick] = useState(0);
   const [hideNoisy, setHideNoisy] = useState(true);
@@ -101,8 +104,9 @@ export function EventLog({
     <div className="event-log">
       <div className="event-log-bar">
         <button className="link event-log-toggle" onClick={onToggle} title={open ? 'Collapse' : 'Expand'}>
-          {open ? '▾' : '▸'} <strong>Events</strong>
+          {open ? '▾' : '▸'} {!tabs && <strong>Events</strong>}
         </button>
+        {tabs}
         <span className="muted">{open ? `${shown.length} shown / ${events.length} total` : `${events.length} events`}</span>
         {open && (
           <>

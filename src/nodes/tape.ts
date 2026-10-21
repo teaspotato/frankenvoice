@@ -89,6 +89,32 @@ export function grammar(allowed: string[], n: number): string {
   ].join('\n');
 }
 
+/** One token's alternatives as llama.cpp's `/completion` returns them with `n_probs` (before sampling). */
+interface TopToken {
+  token: string;
+  logprob: number;
+}
+
+/**
+ * Gemma's odds for each allowed action: the probability of the token it starts with, among the first
+ * written token's top alternatives (`n_probs`, taken before logit bias and grammar). An action whose
+ * first token isn't among them gets 0. Null when the answer carries no probabilities.
+ */
+export function actionOdds(res: { completion_probabilities?: unknown } | undefined, allowed: string[]): Record<string, number> | null {
+  const first = Array.isArray(res?.completion_probabilities) ? (res.completion_probabilities[0] as { top_logprobs?: TopToken[] }) : null;
+  const top = first?.top_logprobs;
+  if (!Array.isArray(top)) return null;
+  const odds: Record<string, number> = {};
+  for (const a of allowed) {
+    const word = ` ${a}`;
+    // The longest top token the action's word starts with (" respond", or " back" for " backchannel").
+    let best: TopToken | null = null;
+    for (const t of top) if (t.token.trim() && word.startsWith(t.token) && (!best || t.token.length > best.token.length)) best = t;
+    odds[a] = best ? Math.round(Math.exp(best.logprob) * 1e4) / 1e4 : 0;
+  }
+  return odds;
+}
+
 export function parseAction(text: string): { action: string; words: string[] } | null {
   const m = /^\s*(\w+)(?:\s+"([^"]*)")?/.exec(text);
   if (!m) return null;
