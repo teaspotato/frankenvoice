@@ -23,12 +23,12 @@ const POS: Record<StageId, [number, number]> = {
   interject: [610, 206],
   backchannel: [810, 206],
   llm: [810, 88],
-  opener: [1010, 88],
-  tts: [1210, 88],
-  speaker: [1410, 88],
-  sched: [1210, 206],
+  tts: [1010, 88],
+  speaker: [1210, 88],
+  sched: [1010, 206],
+  workers: [1010, 330],
 };
-const VIEW_W = 1570;
+const VIEW_W = 1370;
 const VIEW_H = 410;
 const FEEDBACK_Y = 60;
 /** The echo reference runs under everything, below ASR. */
@@ -103,9 +103,7 @@ export function PipelineView({
     ...(registry[stageType(config, 'turn')].inputs.some((p) => p.name === 'scores') ? [link('turnmodel.scores', right('turnmodel'), left('turn'), 'scores')] : []),
     link('asr.transcript', right('asr'), left('turn'), 'transcript'),
     link('turn.turn', right('turn'), left('llm'), 'turn'),
-    // The opener watches the LLM's stream and adds its own lines to what TTS says.
-    link('llm.text', right('llm'), left('opener'), 'text'),
-    link('opener.text', right('opener'), left('tts'), 'text'),
+    link('llm.text', right('llm'), left('tts'), 'text'),
     // Backchannels hear the user (speech, words, turn model) through turn-taking's view of the floor.
     link('turn.turn', right('turn'), left('backchannel'), 'floor'),
     link('backchannel.text', right('backchannel'), left('tts'), 'lines'),
@@ -129,7 +127,7 @@ export function PipelineView({
     const [sx, sy] = POS.sched;
     edges.push({ src: 'tts.audio', d: `M${sx + 40},${POS.tts[1] + H} L${sx + 40},${sy - 2}`, label: 'queue', lx: sx + 20, ly: sy - 26 });
     if (registry[stageType(config, 'llm')].inputs.some((p) => p.name === 'sched')) {
-      const [gx, ky, lx] = [POS.opener[0] - 25, CONTROL_Y - 14, POS.llm[0] + W - 20];
+      const [gx, ky, lx] = [POS.tts[0] - 25, CONTROL_Y - 14, POS.llm[0] + W - 20];
       edges.push({
         src: 'sched.control',
         d: `M${sx},${sy + H / 2} L${gx + r},${sy + H / 2} Q${gx},${sy + H / 2} ${gx},${sy + H / 2 - r} L${gx},${ky + r} Q${gx},${ky} ${gx - r},${ky} L${lx + r},${ky} Q${lx},${ky} ${lx},${ky - r} L${lx},${POS.llm[1] + H + 2}`,
@@ -138,6 +136,13 @@ export function PipelineView({
         ly: sy + H / 2 - 6,
       });
     }
+  }
+  // System 2: tasks out of the LLM's right side, down the gap before TTS to the workers, and their news back.
+  if (registry[stageType(config, 'llm')].outputs.some((p) => p.name === 'workers')) {
+    const [rx, ry] = [POS.llm[0] + W, POS.llm[1] + H / 2];
+    const [wx, wy] = POS.workers;
+    edges.push({ src: 'llm.workers', d: `M${rx},${ry - 8} L${rx + 10},${ry - 8} L${rx + 10},${wy + H * 0.35} L${wx - 2},${wy + H * 0.35}`, label: 'tasks', lx: wx - 70, ly: wy + H * 0.35 - 4 });
+    edges.push({ src: 'workers.updates', d: `M${wx},${wy + H * 0.7} L${rx + 40},${wy + H * 0.7} L${rx + 40},${ry + 8} L${rx + 2},${ry + 8}`, label: 'news', lx: wx - 70, ly: wy + H * 0.7 + 12 });
   }
   // Playback feedback: up from the speaker, back over the row, down into turn-taking.
   const [ox, oy] = [POS.speaker[0] + W / 2, POS.speaker[1]];

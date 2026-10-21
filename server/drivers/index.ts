@@ -13,6 +13,7 @@ import { fireredDriver, sileroDriver } from './vad';
 import { turnModelDriver } from './turn-model';
 import { rnnoiseDriver } from './rnnoise';
 import { cannedDriver } from './canned';
+import { acpDriver, type AcpConfig } from './acp';
 
 export type UpstreamName = 'gpubox' | 'llm' | 'typesafe';
 /** Where an upstream is and how to authenticate; `missing` says what isn't configured. */
@@ -260,9 +261,9 @@ const embed: LiveDriver = (req, sink) => {
 
 /**
  * Everything but the mic and the speaker. `modelsDir` caches downloaded models (the turn model),
- * `cannedDir` the canned lines' audio.
+ * `cannedDir` the canned lines' audio, `acp` where System 2's agents are (read at each worker's start).
  */
-export function serverDrivers(up: Upstreams, o: { modelsDir: string; cannedDir: string }): DriverRegistry {
+export function serverDrivers(up: Upstreams, o: { modelsDir: string; cannedDir: string; acp?: () => AcpConfig }): DriverRegistry {
   const gpubox = socket(up, 'gpubox');
   return {
     silero: sileroDriver(ort, (model) => loadModel(MODELS[model] ?? MODELS.v5)),
@@ -276,5 +277,6 @@ export function serverDrivers(up: Upstreams, o: { modelsDir: string; cannedDir: 
     rnnoise: rnnoiseDriver,
     'turn-model': turnModelDriver(o.modelsDir),
     embed,
+    acp: acpDriver(o.acp ?? (() => ({ cwd: '.', env: {} }))),
   };
 }

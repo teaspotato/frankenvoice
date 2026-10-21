@@ -23,6 +23,7 @@ export const halfDuplexTurnNode: NodeDef<TurnParams> = {
     { name: 'transcript', type: 'transcript' },
     { name: 'vad', type: 'vad' },
     { name: 'playback', type: 'playback' },
+    { name: 'agent', type: 'agent', description: 'agent.pass: the voice agent (agent.loop) says nothing for now' },
   ],
   outputs: [{ name: 'turn', type: 'turn' }],
   params: [{ key: 'commitOn', label: 'Commit on', type: 'select', options: ['speech_final', 'utterance_end'], default: 'speech_final' }],
@@ -52,6 +53,10 @@ export const halfDuplexTurnNode: NodeDef<TurnParams> = {
 
     return {
       onInput(port, msg) {
+        if (port === 'agent') {
+          if (msg.type === 'agent.pass' && floor === 'thinking') setFloor('listening', 'the agent said nothing');
+          return;
+        }
         if (port === 'playback') {
           if (msg.type === 'playback.start') setFloor('speaking', 'playback started');
           else if (msg.type === 'playback.end' && floor === 'speaking') setFloor('listening', 'playback ended');
@@ -128,7 +133,7 @@ export const DEFAULT_EOT_INSTRUCTIONS =
 
 /** Who holds the floor, and whether the user is talking over the agent while it does. */
 export type FloorState = 'listening' | 'thinking' | 'speaking' | 'thinking+user' | 'speaking+user';
-export type FloorEvent = 'commit' | 'playback_start' | 'playback_end' | 'user_start' | 'backchannel' | 'take_floor' | 'aside';
+export type FloorEvent = 'commit' | 'playback_start' | 'playback_end' | 'user_start' | 'backchannel' | 'take_floor' | 'aside' | 'pass';
 
 /**
  * The floor as an explicit state machine. These are the only transitions; an
@@ -138,10 +143,11 @@ export type FloorEvent = 'commit' | 'playback_start' | 'playback_end' | 'user_st
 export const FLOOR: Record<FloorState, Partial<Record<FloorEvent, FloorState>>> = {
   // playback_start: the agent speaks unprompted (a background task's result).
   listening: { commit: 'thinking', playback_start: 'speaking' },
-  thinking: { playback_start: 'speaking', user_start: 'thinking+user' },
+  // pass: the agent (agent.loop) decided to say nothing for now.
+  thinking: { playback_start: 'speaking', user_start: 'thinking+user', pass: 'listening' },
   // aside: the agent stopped to answer what the user said over it.
   speaking: { playback_end: 'listening', user_start: 'speaking+user', aside: 'listening' },
-  'thinking+user': { playback_start: 'speaking+user', backchannel: 'thinking', take_floor: 'listening' },
+  'thinking+user': { playback_start: 'speaking+user', backchannel: 'thinking', take_floor: 'listening', pass: 'listening' },
   'speaking+user': { playback_end: 'listening', backchannel: 'speaking', take_floor: 'listening' },
 };
 
@@ -250,6 +256,7 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     { name: 'playback', type: 'playback' },
     { name: 'scores', type: 'turnscores' },
     { name: 'interject', type: 'interject', description: 'interject.take: commit the words so far now, for an early interjection' },
+    { name: 'agent', type: 'agent', description: 'agent.pass: the voice agent (agent.loop) says nothing for now, so the floor is free' },
   ],
   outputs: [
     { name: 'turn', type: 'turn' },
@@ -1143,6 +1150,23 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     };
 
     const handle = (port: string, msg: Msg) => {
+      if (port === 'agent') {
+        if (msg.type !== 'agent.pass' || (state !== 'thinking' && state !== 'thinking+user')) return;
+        // The agent chose silence: the floor is the user's again, and speech over its thinking is just their talking.
+        const c = candidate;
+        if (!go('pass', 'the agent said nothing')) return;
+        if (c) {
+          c.timer?.clear();
+          c.wait?.clear();
+          c.holdTimer?.clear();
+          c.gate?.clear();
+          candidate = null;
+          for (const f of c.finals) collect(f.text, f.start, f.end);
+        }
+        armSilence();
+        listenAfterOverlap();
+        return;
+      }
       if (port === 'interject') {
         if (msg.type !== 'interject.take') return;
         const why =
@@ -1236,7 +1260,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             if (String(msg.heard ?? '').trim() && ++interrupts >= p.backoffAfter) enterBackoff();
           }
           // What the user heard before we stopped, for the LLM's history.
-          if (last) ctx.emit('turn', { type: 'turn.heard', turnId: last.id, ...(msg.rid ? { rid: msg.rid as string } : {}), text: (msg.heard as string) ?? '' });
+          // (The agent may have spoken first, before any user turn: then the reply says which.)
+          if (last || msg.rid) ctx.emit('turn', { type: 'turn.heard', turnId: last?.id ?? null, ...(msg.rid ? { rid: msg.rid as string } : {}), text: (msg.heard as string) ?? '' });
           if (aside?.cutting) finishAside('aside');
         }
         return;

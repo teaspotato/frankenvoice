@@ -1,6 +1,6 @@
 // TypeSafe Choice (POST /v1/systemone): a hosted classifier that reads a text
 // state and picks one of a few named options, with a probability for each.
-// The opener and the backchannel stages use it to pick a line from the user's
+// The backchannel and turn-taking stages use it to pick a line from the user's
 // ASR words.
 
 import type { NodeContext } from '../core/node';

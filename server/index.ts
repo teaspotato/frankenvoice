@@ -13,6 +13,7 @@ import type { UpstreamName, Upstreams } from './drivers';
 import { checkGraph, type GraphSpec } from '../src/core/graph';
 import { buildGraph, defaultConfig } from '../src/pipeline';
 import { preloadTurnModel, type TurnModelRequest } from './drivers/turn-model';
+import type { AcpConfig } from './drivers/acp';
 
 try {
   process.loadEnvFile('.env');
@@ -59,8 +60,25 @@ const SETTINGS: SettingDef[] = [
     hint: 'e.g. http://127.0.0.1:8103/v1 (llama.cpp on the GPU box), or any local server: vLLM, Ollama, LM Studio',
   },
   { name: 'OPENAI_COMPAT_API_KEY', group: 'LLM (OpenAI-compatible)', label: 'API key (optional)', secret: true },
-  { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'API key', secret: true },
-  { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
+  { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (backchannels, end of turn, interjection gate)', label: 'API key', secret: true },
+  { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (backchannels, end of turn, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
+  {
+    name: 'FV_ACP_URL',
+    group: 'System 2 (ACP agent)',
+    label: 'Agent endpoint (optional)',
+    hint: 'ws(s) URL of an agent that speaks the Agent Client Protocol, one JSON-RPC message per frame. Set: workers connect here instead of starting the command below',
+  },
+  { name: 'FV_ACP_TOKEN', group: 'System 2 (ACP agent)', label: 'Endpoint token', secret: true, hint: 'Sent as a bearer token to the endpoint' },
+  {
+    name: 'FV_ACP_COMMAND',
+    group: 'System 2 (ACP agent)',
+    label: 'Agent command',
+    default: 'npx -y @agentclientprotocol/claude-agent-acp@0.85.1',
+    hint: 'Started once per worker when no endpoint is set; speaks the Agent Client Protocol on stdin/stdout. Gets the API key and base URL below',
+  },
+  { name: 'ANTHROPIC_API_KEY', group: 'System 2 (ACP agent)', label: 'API key', secret: true, hint: 'Passed to the agent command as ANTHROPIC_API_KEY' },
+  { name: 'ANTHROPIC_BASE_URL', group: 'System 2 (ACP agent)', label: 'API base URL', hint: "Passed as ANTHROPIC_BASE_URL; empty uses the agent's default" },
+  { name: 'FV_ACP_CWD', group: 'System 2 (ACP agent)', label: 'Working folder', default: '.frankenvoice/workers', hint: 'Where started agents run; relative to where the server runs' },
   { name: 'FV_SESSIONS_DIR', group: 'Storage', label: 'Sessions folder', default: 'sessions', hint: 'Relative to where the proxy runs' },
   {
     name: 'FV_MAX_SESSIONS',
@@ -331,7 +349,7 @@ const server = createServer((req, res) => {
       return json(res, 200, { host, public: isPublic(), ...(host ? {} : { graph: demoGraph ?? buildGraph(defaultConfig()) }) });
     }
     if (p === '/api/health') {
-      return json(res, 200, Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])));
+      return json(res, 200, { ...Object.fromEntries(Object.entries(upstreams).map(([k, u]) => [k, configured(u)])), acp: !!(setting('FV_ACP_URL') || setting('FV_ACP_COMMAND')) });
     }
     if (p === '/api/turn-model' && req.method === 'POST') {
       // Load the turn model ahead of a session; the page polls this while it loads.
@@ -350,8 +368,18 @@ const server = createServer((req, res) => {
   });
 });
 
+/** System 2, as Settings has it now: a remote endpoint, or a command started per worker with its key. */
+const acpConfig = (): AcpConfig => {
+  const env: Record<string, string> = {};
+  for (const k of ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL']) {
+    const v = setting(k);
+    if (v) env[k] = v;
+  }
+  return { url: setting('FV_ACP_URL'), token: setting('FV_ACP_TOKEN'), command: setting('FV_ACP_COMMAND'), cwd: resolve(setting('FV_ACP_CWD')!), env };
+};
+
 // The page's socket: mic in, agent audio and the run's trajectory out.
-const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR, maxSessions: () => Number(setting('FV_MAX_SESSIONS')) || 1,
+const live = new LiveHub({ upstreams: upstream, sessionsDir, acp: acpConfig, modelsDir: MODELS_DIR, cannedDir: CANNED_DIR, maxSessions: () => Number(setting('FV_MAX_SESSIONS')) || 1,
   maxSessionMs: () => Math.max(0, Number(setting('FV_MAX_SESSION_S') ?? 180) || 0) * 1000,
   demoGraph: () => demoGraph ?? buildGraph(defaultConfig()),
   hostGraph: (g) => {
@@ -372,6 +400,8 @@ server.on('upgrade', (req, socket, head) => {
 
 // Last resort: one bad request must not stop the proxy, which would drop every connection of a live session.
 process.on('uncaughtException', (e) => console.error('[server] uncaught error, still running:', e));
+// Exit on these signals, so the exit hook takes System 2's agent processes down too.
+for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]] as const) process.on(sig, () => process.exit(code));
 
 server.listen(PORT, HOST, () => {
   const keys = Object.entries(upstreams)

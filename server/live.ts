@@ -18,6 +18,7 @@ import type { Trajectory } from '../src/core/trajectory';
 import type { Json, TrajEvent } from '../src/core/types';
 import { frame, unframe, type Header } from '../src/live-protocol';
 import { serverDrivers, sessionTitle, type Upstreams } from './drivers';
+import type { AcpConfig } from './drivers/acp';
 
 /** The largest message a visitor (no host token) may send; bigger ones are dropped. */
 export const VISITOR_MAX_MESSAGE = 64 * 1024;
@@ -38,6 +39,8 @@ export interface LiveOptions {
   modelsDir: string;
   /** Canned lines' audio, rendered once per box (default: tts-cache in modelsDir's folder). */
   cannedDir?: string;
+  /** System 2: where the workers' ACP agents run (Settings), read at each worker's start. */
+  acp?: () => AcpConfig;
   /** How many sessions may use the GPU box at once; more wait in a queue. Default 1. */
   maxSessions?: () => number;
   /** A live session is stopped after this long (ms; 0 = never), so a stuck page can't hold the box. */
@@ -77,6 +80,12 @@ function titleToName(title: string): string {
     .trim();
 }
 
+/** Demo visitors get no System 2: its agents run with the server's credentials. */
+const noSystem2: LiveDriver = (_req, sink) => {
+  setTimeout(() => sink.close({ error: 'System 2 is only available to the host' }), 0);
+  return { send() {}, close() {} };
+};
+
 /** A connected page: its mic and speakers, and the run it started (at most one). */
 class Page {
   run: Run | null = null;
@@ -97,7 +106,7 @@ class Page {
     /** The host (token or local), not a demo visitor. */
     readonly host: boolean,
   ) {
-    this.drivers = { ...base, mic: this.mic, speaker: this.speaker };
+    this.drivers = { ...base, mic: this.mic, speaker: this.speaker, ...(host ? {} : { acp: noSystem2 }) };
   }
   send(m: Json) {
     if (this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify(m));
@@ -189,7 +198,7 @@ export class LiveHub {
   private queueTick?: ReturnType<typeof setInterval>;
 
   constructor(private o: LiveOptions) {
-    this.drivers = serverDrivers(o.upstreams, { modelsDir: o.modelsDir, cannedDir: o.cannedDir ?? join(o.modelsDir, '..', 'fv-tts-cache') });
+    this.drivers = serverDrivers(o.upstreams, { modelsDir: o.modelsDir, cannedDir: o.cannedDir ?? join(o.modelsDir, '..', 'fv-tts-cache'), acp: o.acp });
   }
 
   private log(m: string) {

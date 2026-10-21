@@ -43,6 +43,7 @@ let gpuboxPort = 0;
 let llmPort = 0;
 /** The live session limit the hub uses (ms; 0: none), set per test. */
 let limitMs = 0;
+let hubRef: LiveHub | undefined;
 let livePort = 0;
 const seen = { asr: 0, tts: 0, llm: 0, completions: 0, auth: [] as string[], ttsQueries: [] as string[], llmBodies: [] as { messages?: { role: string; content: unknown }[] }[] };
 const sessions = mkdtempSync(join(tmpdir(), 'fv-sessions-'));
@@ -87,7 +88,7 @@ beforeAll(async () => {
   });
   gpuboxPort = await listen(gpubox);
   llmPort = await listen(llm);
-  const hub = new LiveHub({
+  const hub = (hubRef = new LiveHub({
     upstreams: (name): Upstream =>
       name === 'gpubox'
         ? { base: `ws://127.0.0.1:${gpuboxPort}`, headers: { authorization: `Bearer ${TOKEN}` } }
@@ -105,7 +106,7 @@ beforeAll(async () => {
     },
     heartbeatMs: 300,
     log: () => {},
-  });
+  }));
   const server = createServer();
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) =>
@@ -164,6 +165,8 @@ describe('the pipeline in the server', () => {
     const c = defaultConfig();
     c.vad.variant = 'energy';
     c.backchannel.variant = 'off';
+    // System 2 without an agent process.
+    c.workers.variant = 'mock';
     page.send(JSON.stringify({ type: 'start', graph: buildGraph(c) as unknown as Json, env: { userAgent: 'test' }, autosave: true, title: '' }));
     await new Promise((r) => setTimeout(r, 2500));
     page.send(JSON.stringify({ type: 'stop' }));
@@ -184,14 +187,18 @@ describe('the pipeline in the server', () => {
     const traj = decodeBundle(bundle!);
     const types = new Set(traj.events.filter((e) => e.kind === 'msg').map((e) => (e.data as { type: string }).type));
     for (const t of ['asr.final', 'turn.user', 'llm.delta', 'tts.words', 'playback.start']) expect(types).toContain(t);
-    // The agent opens once the ASR is connected.
-    const msgs = traj.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; why?: string });
+    // The voice agent opens once the ASR is connected: the session's start is the first line of its log, and it speaks before the user has said anything.
+    const msgs = traj.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; kind?: string });
     const open = msgs.findIndex((m) => m.type === 'asr.open');
     expect(open).toBeGreaterThanOrEqual(0);
-    expect(msgs.findIndex((m) => m.type === 'bc.say' && m.why === 'greeting')).toBeGreaterThan(open);
-    // And its line opens the LLM transcript.
-    const reply = seen.llmBodies.find((b) => b.messages?.some((m) => m.role === 'user'))!;
-    expect(reply.messages!.filter((m) => m.role !== 'system')[0]).toMatchObject({ role: 'assistant', content: expect.stringContaining("What's on your mind?") });
+    expect(msgs.findIndex((m) => m.type === 'agent.event' && m.kind === 'start')).toBeGreaterThan(open);
+    expect(msgs.findIndex((m) => m.type === 'llm.start')).toBeLessThan(msgs.findIndex((m) => m.type === 'turn.user'));
+    const first = seen.llmBodies.find((b) => b.messages?.some((m) => m.role === 'user'))!;
+    expect(first.messages!.filter((m) => m.role !== 'system')[0]).toMatchObject({ role: 'user', content: expect.stringContaining('session start') });
+    // Its opening decision stays on the log, before the user's first words.
+    const later = seen.llmBodies.filter((b) => b.messages?.some((m) => /\ds user: /.test(String(m.content))));
+    expect(later.length).toBeGreaterThan(0);
+    expect(later[0].messages!.filter((m) => m.role !== 'system')[1]).toMatchObject({ role: 'assistant', content: expect.stringContaining('[i1g0] Reply number') });
     expect(traj.events.some((e) => e.kind === 'io.recv' && (e.data as { payload?: { type?: string } }).payload?.type === 'late')).toBe(got.lateSent > 0);
     expect(traj.events.filter((e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toEqual([]);
     // The server's recording replays exactly, like one made in the page.
@@ -511,6 +518,10 @@ describe('the pipeline in the server', () => {
     await new Promise((r) => setTimeout(r, 300));
     expect(msgs.filter((m) => m.type === 'notice').map((m) => m.text)).toEqual(['replays on the GPU box are for the host only']);
     expect(msgs.filter((m) => m.type === 'session')).toHaveLength(1);
+    // A visitor's System 2 is refused: its agents would run with the server's credentials.
+    const page = [...(hubRef as unknown as { pages: Set<{ host: boolean; drivers: Record<string, LiveDriver> }> }).pages].find((pg) => !pg.host)!;
+    const refused = await new Promise<Json>((resolve) => page.drivers.acp({}, { recv() {}, close: (e) => resolve(e ?? null) }, { now: () => 0 }));
+    expect(refused).toEqual({ error: 'System 2 is only available to the host' });
     const saved = new Promise((r) => ws.on('message', (d: Buffer, bin) => !bin && JSON.parse(d.toString()).type === 'saved' && r(null)));
     ws.send(JSON.stringify({ type: 'stop' }));
     // A visitor's session is always kept.
@@ -544,6 +555,60 @@ describe('the pipeline in the server', () => {
     expect(seen.tts).toBe(before + 1);
     expect(b.pcm).toEqual(a.pcm);
     expect(readdirSync(cannedDir)).toHaveLength(1);
+  });
+
+  it('runs System 2 over ACP: a local agent process per worker, or a remote endpoint with its token', async () => {
+    const { serverDrivers } = await import('../server/drivers');
+    const cwd = mkdtempSync(join(tmpdir(), 'fv-acp-'));
+    const fixture = join(__dirname, 'fixtures', 'fake-acp-agent.mjs');
+    /** initialize, session/new and one prompt through the acp driver; what came back. */
+    const talk = (acp: () => import('../server/drivers/acp').AcpConfig) =>
+      new Promise<Json[]>((resolve, reject) => {
+        const d = serverDrivers(() => ({ headers: {}, missing: 'off' }), { modelsDir: sessions, cannedDir: sessions, acp });
+        const got: Json[] = [];
+        const conn = d.acp({ worker: 'w1' }, {
+          recv: (m) => {
+            got.push(m);
+            const r = m as { id?: number; result?: { stopReason?: string } };
+            if (r.id === 1) conn.send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: '', mcpServers: [] } });
+            if (r.id === 2) conn.send({ jsonrpc: '2.0', id: 3, method: 'session/prompt', params: { sessionId: 's1', prompt: [{ type: 'text', text: 'hi' }] } });
+            if (r.result?.stopReason) (conn.close(), resolve(got));
+          },
+          close: (e) => (e ? reject(new Error(JSON.stringify(e))) : resolve(got)),
+        }, { now: () => 0 });
+        conn.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } });
+      });
+    const local = await talk(() => ({ command: `node ${JSON.stringify(fixture)}`, cwd, env: { ANTHROPIC_API_KEY: 'k-123' } }));
+    expect(local[0]).toMatchObject({ $open: { cwd } });
+    expect(local).toContainEqual({ $stderr: expect.stringContaining('key=k-123') });
+    expect(JSON.stringify(local)).toContain('echo: hi');
+
+    // The same agent behind a WebSocket endpoint: one JSON-RPC message per frame.
+    const { spawn } = await import('node:child_process');
+    const http = createServer();
+    const wss = new WebSocketServer({ server: http });
+    const auth: string[] = [];
+    wss.on('connection', (ws, req) => {
+      auth.push(req.headers.authorization ?? '');
+      const child = spawn(process.execPath, [fixture], { stdio: ['pipe', 'pipe', 'ignore'] });
+      let buf = '';
+      child.stdout.on('data', (b: Buffer) => {
+        buf += b.toString();
+        for (let i; (i = buf.indexOf('\n')) >= 0; buf = buf.slice(i + 1)) ws.send(buf.slice(0, i));
+      });
+      ws.on('message', (d: Buffer) => child.stdin.write(`${d.toString()}\n`));
+      ws.on('close', () => child.kill());
+    });
+    const port = await listen(http);
+    try {
+      const remote = await talk(() => ({ url: `ws://127.0.0.1:${port}/acp`, token: 'tok', cwd, env: {} }));
+      expect(remote[0]).toEqual({ $open: { url: `ws://127.0.0.1:${port}/acp` } });
+      expect(JSON.stringify(remote)).toContain('echo: hi');
+      expect(auth).toEqual(['Bearer tok']);
+    } finally {
+      http.closeAllConnections?.();
+      http.close();
+    }
   });
 
   it('runs onnxruntime-node VADs: Silero and FireRedVAD', async () => {

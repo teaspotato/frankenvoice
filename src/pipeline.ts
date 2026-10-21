@@ -9,7 +9,7 @@ import type { Json } from './core/types';
 import { registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'interject' | 'backchannel' | 'llm' | 'opener' | 'tts' | 'speaker' | 'sched';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'interject' | 'backchannel' | 'llm' | 'workers' | 'tts' | 'speaker' | 'sched';
 
 export interface StageDef {
   id: StageId;
@@ -38,8 +38,8 @@ export const STAGES: StageDef[] = [
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex', tape: 'turn.tape' } },
   { id: 'interject', label: 'Interjection', variants: { off: 'interject.off', typesafe: 'interject' } },
   { id: 'backchannel', label: 'Backchannels', variants: { on: 'backchannel', off: 'backchannel.off' } },
-  { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
-  { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', typesafe: 'opener.choice', off: 'opener.off' } },
+  { id: 'llm', label: 'LLM', variants: { agent: 'agent.loop', api: 'llm', echo: 'llm.echo' } },
+  { id: 'workers', label: 'System 2', variants: { acp: 'workers', mock: 'workers.mock', off: 'workers.off' } },
   { id: 'tts', label: 'TTS', variants: { 'kyutai-gpubox': 'tts.kyutai', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
   { id: 'sched', label: 'Scheduler', variants: { tick: 'sched' } },
@@ -92,7 +92,7 @@ const COLUMN: Record<StageId, [number, number]> = {
   interject: [630, 200],
   backchannel: [840, 20],
   llm: [840, 110],
-  opener: [840, 200],
+  workers: [1050, 290],
   tts: [1050, 110],
   speaker: [1260, 110],
   sched: [1050, 200],
@@ -102,11 +102,16 @@ const e = (from: string, fp: string, to: string, tp: string): EdgeSpec => ({ fro
 
 /**
  * The fixed topology: mic → noise/echo cleanup → VAD + turn model + ASR → turn-taking → LLM → TTS → speaker,
- * the opener watching the LLM and speaking through TTS too, with playback fed back to turn-taking and what was played to the turn model (the agent's channel),
+ * with playback fed back to turn-taking and what was played to the turn model (the agent's channel),
  * and the tick scheduler pacing the LLM by the TTS queue and playback.
  */
 export function buildGraph(c: PipelineConfig): GraphSpec {
   const cleanupType = stageType(c, 'cleanup');
+  const llm = registry[stageType(c, 'llm')];
+  /** The voice agent on its own clock (agent.loop): it hears the session start, silences and its own playback. */
+  const agent = llm.outputs.some((p) => p.name === 'agent');
+  /** The tape (turn.tape) speaks for the agent itself: the LLM stage gets no turns. */
+  const tape = stageType(c, 'turn') === 'turn.tape';
   const nodes: NodeSpec[] = STAGES.map((s) => ({
     id: s.id,
     type: stageType(c, s.id),
@@ -114,12 +119,13 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
       s.id === 'mic'
         ? // The cleanup stage decides what the browser does at capture.
           { ...stageParams(c, 'mic'), ...micProcessing(cleanupType, resolveParams(registry[cleanupType], stageParams(c, 'cleanup'))) }
-        : stageParams(c, s.id),
+        : s.id === 'turn' && agent && !tape && 'greeting' in resolveParams(registry[stageType(c, 'turn')], {})
+          ? // The voice agent opens the call itself.
+            { ...stageParams(c, 'turn'), greeting: '' }
+          : stageParams(c, s.id),
     ui: { x: COLUMN[s.id][0], y: COLUMN[s.id][1] },
   }));
   const wantsReference = registry[cleanupType].inputs.some((p) => p.name === 'ref');
-  /** The tape (turn.tape) speaks for the agent itself: the LLM stage gets no turns. */
-  const tape = stageType(c, 'turn') === 'turn.tape';
   const edges = [
     e('mic', 'audio', 'cleanup', 'audio'),
     e('cleanup', 'audio', 'vad', 'audio'),
@@ -149,11 +155,23 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
       ? [e('backchannel', 'ask', 'llm', 'bc'), e('llm', 'text', 'backchannel', 'llm')]
       : []),
     e('llm', 'text', 'tts', 'text'),
-    e('llm', 'text', 'opener', 'text'),
-    // The opener may pick its line from the user's words.
-    e('turn', 'turn', 'opener', 'turn'),
-    e('opener', 'text', 'tts', 'text'),
     ...(registry[stageType(c, 'turn')].outputs.some((p) => p.name === 'text') ? [e('turn', 'text', 'tts', 'text')] : []),
+    // The voice agent: the session's start, the user's voice and its own playback (for silences), unless the tape speaks;
+    // its passes free the floor, and it can stop its own speech the user's words overtook.
+    ...(agent && !tape
+      ? [
+          e('asr', 'transcript', 'llm', 'transcript'),
+          e('vad', 'vad', 'llm', 'vad'),
+          e('speaker', 'playback', 'llm', 'playback'),
+          ...(registry[stageType(c, 'turn')].inputs.some((p) => p.name === 'agent') ? [e('llm', 'agent', 'turn', 'agent')] : []),
+          e('llm', 'control', 'tts', 'control'),
+          e('llm', 'control', 'speaker', 'control'),
+        ]
+      : []),
+    // System 2: the voice agent hands tasks to workers and hears back from them.
+    ...(registry[stageType(c, 'llm')].outputs.some((p) => p.name === 'workers')
+      ? [e('llm', 'workers', 'workers', 'workers'), e('workers', 'updates', 'llm', 'updates')]
+      : []),
     e('tts', 'audio', 'speaker', 'audio'),
     e('speaker', 'playback', 'turn', 'playback'),
     // The tick scheduler watches the reply (LLM, TTS queue, playback, ASR) and paces the LLM.
@@ -186,7 +204,10 @@ export function configFromGraph(graph: GraphSpec): PipelineConfig {
 /** Proxy upstreams (API keys) the configured pipeline needs. */
 export function requiredUpstreams(c: PipelineConfig): string[] {
   const out = new Set<string>();
+  const delegates = registry[stageType(c, 'llm')].outputs.some((p) => p.name === 'workers');
   for (const s of STAGES) {
+    // System 2 is only asked for when the LLM stage hands it work.
+    if (s.id === 'workers' && !delegates) continue;
     const def = registry[stageType(c, s.id)];
     for (const u of def.requires?.(resolveParams(def, stageParams(c, s.id))) ?? []) out.add(u);
   }

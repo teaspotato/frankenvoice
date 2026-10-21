@@ -1,4 +1,4 @@
-// Canned lines (backchannels, openers, "you go first") rendered once per box: a disk cache keyed by
+// Canned lines (backchannels, greetings, "you go first") rendered once per box: a disk cache keyed by
 // everything that decides the audio (text, voice, cfg, model settings, sample rate). A miss renders
 // on the GPU box as a background job, which any reply preempts. The node sees one exchange either
 // way, its audio recorded like any other IO, so a replay serves it from the recording and never

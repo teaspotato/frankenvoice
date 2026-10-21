@@ -6,7 +6,6 @@ import { asrNode } from './asr';
 import { duplexTurnNode, halfDuplexTurnNode } from './turn';
 import { noTurnModelNode, turnModelNode } from './turn-model';
 import { llmNode } from './llm';
-import { choiceOpenerNode, fillerOpenerNode, noOpenerNode } from './opener';
 import { kyutaiTtsNode } from './tts/stream';
 import { speakerNode } from './speaker';
 import { echoLlmNode, toneTtsNode } from './mocks';
@@ -14,9 +13,11 @@ import { backchannelNode, noBackchannelNode } from './backchannel';
 import { interjectNode, noInterjectNode } from './interject';
 import { schedNode } from './sched';
 import { tapeTurnNode } from './turn-tape';
+import { agentLoopNode } from './agent';
+import { mockWorkersNode, noWorkersNode, workersNode } from './workers';
 
 export const registry: NodeRegistry = Object.fromEntries(
-  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, fireredVadNode, energyVadNode, asrNode, turnModelNode, noTurnModelNode, duplexTurnNode, halfDuplexTurnNode, tapeTurnNode, llmNode, fillerOpenerNode, choiceOpenerNode, noOpenerNode, kyutaiTtsNode, speakerNode, echoLlmNode, toneTtsNode, backchannelNode, noBackchannelNode, interjectNode, noInterjectNode, schedNode].map(
+  [micNode, browserCleanupNode, aecNode, rnnoiseNode, noCleanupNode, sileroVadNode, fireredVadNode, energyVadNode, asrNode, turnModelNode, noTurnModelNode, duplexTurnNode, halfDuplexTurnNode, tapeTurnNode, llmNode, kyutaiTtsNode, speakerNode, echoLlmNode, toneTtsNode, backchannelNode, noBackchannelNode, interjectNode, noInterjectNode, schedNode, agentLoopNode, workersNode, mockWorkersNode, noWorkersNode].map(
     (d) => [d.type, d],
   ),
 );
