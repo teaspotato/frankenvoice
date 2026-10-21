@@ -217,6 +217,8 @@ describe('the tape stage', () => {
     h.answer(' finish');
     for (let n = 3; n <= 6; n++) {
       h.advance(n * 640);
+      // Silent, but its answer is done and nothing new was said: no bias (it made Gemma answer itself).
+      expect(body()).not.toHaveProperty('logit_bias');
       h.answer(' listen');
     }
     h.send(6 * 640 + 100, 'transcript', { type: 'asr.final', text: 'tell me more', start: 0, end: 1 });

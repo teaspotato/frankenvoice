@@ -137,7 +137,7 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       label: 'Respond bias',
       type: 'number',
       default: 2.2,
-      description: 'Added to the logit of “ respond” in silent cells (llama.cpp logit_bias): zero-shot, Gemma waits too long once the user is done. Pilot: +2.2 took the median answer from 2.8 to 2.0 s with no cut-ins; +3 cut into pauses. 0: off.',
+      description: 'Added to the logit of “ respond” in silent cells while the user’s words are unanswered (llama.cpp logit_bias): zero-shot, Gemma waits too long once the user is done. Pilot: +2.2 took the median answer from 2.8 to 2.0 s with no cut-ins; +3 cut into pauses. 0: off.',
     },
     {
       key: 'idleKeep',
@@ -353,9 +353,12 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     };
 
     const ask = (c: Cell, tape: Cell[], maxWords: number, sp: Spec | null) => {
-      const answer = mustAnswer(sp ? sp.side : live);
+      const side = sp ? sp.side : live;
+      const answer = mustAnswer(side);
       const allowed = answer ? ['respond'] : ACTIONS[c.state];
-      const bias: JsonObject = c.state === 'silent' && !answer && p.respondBias ? { logit_bias: [[' respond', p.respondBias]] } : {};
+      // Only while the user's words wait for an answer: right after its own answer, the bias made Gemma answer
+      // itself, playing the user's next line (Rin, 2026-10-21)
+      const bias: JsonObject = c.state === 'silent' && side.owed && !answer && p.respondBias ? { logit_bias: [[' respond', p.respondBias]] } : {};
       const body: JsonObject = {
         prompt: tapePrompt(head, trimIdle(tape, p.idleKeep)),
         grammar: grammar(allowed, maxWords),
