@@ -50,6 +50,8 @@ mic ─> noise/echo ─────┼─> turn model ────┼─> turn �
 
 The *Scheduler* stage (below, not drawn in the sketch) watches the reply in flight and paces the LLM.
 
+The LLM stage is the voice agent by default (`agent.loop`, below): it also reads the ASR, VAD and playback, runs on its own clock, and hands work to *System 2* (the `workers` stage, not drawn). The `api` implementation is the turn-based reply LLM (one reply per user turn, with an optional greeting).
+
 The wiring lives in `src/pipeline.ts` (`STAGES` and `buildGraph`). Each stage lists the node types that can fill it; the UI only chooses among those and sets their params. To change the topology, edit that file.
 
 ## Noise / echo cancellation
@@ -97,6 +99,42 @@ The *Scheduler* stage (`sched` in `src/nodes/sched.ts`) gives the pipeline a vie
 | `asr` | `partials`, `finals` arrived during the tick |
 
 The backends are separate processes, so what the scheduler governs is when the LLM may write. With *Pace the LLM* on, the LLM writes a reply in chunks: its first request (a draft's too) asks for *first burst* tokens (16); a request that stops at its limit leaves the reply open (`llm.chunk`), and each `sched.grant` continues it with *chunk* tokens (8): the same messages plus the text so far as the assistant's turn, which llama.cpp continues, prefilling a token or two thanks to its prompt cache. A grant goes out on a tick when TTS has fewer than *lookahead* words (3) to read, or playback is about to run dry; before the first audio, otherwise nothing more until that audio is out (*hold until first audio*); after it, while TTS has fewer than *max words queued* (6) and its audio runs at least *min audio ahead* (300 ms) ahead of playback. Drafts are capped at the first burst and paced once kept. Off, the LLM runs free and the ticks are only logged. Grants and ticks are ordinary messages driven by recorded IO and timers, so they replay exactly; a future engine running the models in one process would take the grants over its own channel and report what it ran per tick, without changing the pipeline or replay.
+
+### The agent (System 1 and System 2)
+
+The default LLM implementation, `agent.loop` (`src/nodes/agent.ts`, format in `src/nodes/agent-format.ts`), doesn't map one user turn to one reply. It keeps one append-only log and wakes on events; the user's input is the highest-priority event, not the only trigger. Gemma is *System 1*: it talks, and anything that needs looking up, working out or doing goes to a *System 2* worker over ACP (`workers`), whose news comes back into the log.
+
+Events are one compact timestamped line each, sent as user turns (the decisions are the assistant's turns, so llama.cpp reuses the cached prefix):
+
+```
+0.0s session start: the user is on the line and can hear you
+4.2s user: what's the weather in Kyoto tomorrow
+9.8s w1 progress: searching the forecast
+14.1s w1 result (Kyoto weather tomorrow): Sunny, 24 °C, light wind.
+20.3s silence for 6 s; the user said so far: ...
+26.0s user cut in; they heard you up to "It will be sunny"
+```
+
+Others: `user (went on): ...`, `w1 asks the user (task): ...` (a result starting with `QUESTION:`), `w1 failed ...`, `wake-up (you asked for it at 30.0s)`. Each step's decision is written under a GBNF grammar: any number of action lines, then one ending line.
+
+| line | does |
+| --- | --- |
+| `[i1g1] text` | say this (the tagged-utterance flags, as above) |
+| `[think] task` | start a System 2 worker on the task (w1, w2, ... in order) |
+| `[tell w1] text` | message a worker (a change, an answer to its question, a follow-up) |
+| `[stop w1]` | stop a worker |
+| `[wait 20]` | end the step; wake in 20 s unless something happens first |
+| `[silent]` | end the step |
+| `[quiet]` | end the step and stay quiet: only the user's own words wake it (speaking ends quiet mode) |
+
+- **Session start** is an event, so the agent speaks first (this replaces the greeting and the canned opener).
+- **Preemption**: the user's turn overtakes a step in flight; its request is closed, and speech the user never heard is cancelled and dropped from the log. Barge-in and the heard cut-off are turn.duplex's as before (the decision keeps only the words heard). Other events wait while the user is talking.
+- **Dead air** (*silence event after*, 6 s) wakes it with what the user has said so far, backing off (6, 12, 24, 48 s) while nothing happens; never in quiet mode.
+- **System 2 progress** is throttled (*progress at most every*, 10 s, per worker) and either wakes the agent, is only logged, or is off (*System 2 progress*). Results are cut to *longest result on the log* (600 chars).
+- *Most steps without the user* (12) bounds how many steps it takes in a row without the user.
+- A step that says nothing tells turn-taking (`agent.pass`), which gives the floor back.
+
+The *Agent log* lane on the dashboard shows the events (ringed when they woke it), each think step, and its decision. System 2's endpoint is set in Settings (*System 2 (ACP agent)*): a remote ACP endpoint over a WebSocket, or a command the server starts per worker, with its API key.
 
 ### Turn model
 
@@ -174,5 +212,5 @@ tests/        replay determinism tests with randomized fake drivers
 
 1. ~~Runtime with trajectory logging and a basic voice loop~~; fixed pipeline with a live per-stage dashboard, scrubbing and run comparison
 2. ~~Full-duplex floor control: barge-in, with history cut back to what was heard; backchannels; every decision marked on the dashboard with its reason~~ (first version; tune on real sessions)
-3. Tool calls mid-conversation, with filler speech and interruptible calls
+3. ~~Tool calls mid-conversation, with filler speech and interruptible calls~~ (the agent on its own clock, with System 2 workers; tune on the box)
 4. Local models on a GPU box (VAD, ASR, LLM, TTS), with their internals visualized
