@@ -83,6 +83,11 @@ install() {
   local g=$!
   venv tts moshi==0.2.13 torch==$TORCH "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile > "$DATA/logs/install-tts.log" 2>&1 &
   local t=$!
+  local q=
+  if [ "$(tts_engine)" = qwen ]; then
+    venv qtts "$QWEN_TTS_PKG" torch==$TORCH "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile httpx > "$DATA/logs/install-qtts.log" 2>&1 &
+    q=$!
+  fi
   local ok=1
   if [ ! -x "$ROOT/cloudflared" ]; then
     curl -fsSL -o "$ROOT/cloudflared" https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -93,6 +98,7 @@ install() {
   wait $a || { log "asr install failed"; tail -20 "$DATA/logs/install-asr.log"; ok=; }
   wait $g || { log "gw install failed"; tail -20 "$DATA/logs/install-gw.log"; ok=; }
   wait $t || { log "tts install failed"; tail -20 "$DATA/logs/install-tts.log"; ok=; }
+  [ -z "$q" ] || wait $q || { log "qwen-tts install failed"; tail -20 "$DATA/logs/install-qtts.log"; ok=; }
   [ -n "$ok" ] || return 1
   log "venvs ready ($((SECONDS - t0)) s)"
   [ -n "${NO_FETCH:-}" ] || fetch || return 1
@@ -109,6 +115,8 @@ from huggingface_hub import snapshot_download, hf_hub_download
 for r in ["$ASR_MODEL", "$ALIGN_MODEL", "$TTS_REPO"]:
     print(r, snapshot_download(r))
 snapshot_download("kyutai/tts-voices", allow_patterns=["expresso/ex03-ex01_happy_001_channel1_334s*"])
+if "$(tts_engine)" == "qwen":
+    print("$QWEN_TTS_MODEL", snapshot_download("$QWEN_TTS_MODEL"))
 if not "${NO_LLM:-}":
     for r, f in [("$LLM_REPO", "$LLM_FILE"), ("$LLM_REPO", "$LLM_MMPROJ"), ("$LLM_MTP_REPO", "$LLM_MTP_FILE")]:
         print(f, hf_hub_download(r, f, local_dir="$DATA/models"))
@@ -205,7 +213,7 @@ tts_model() { [ "$(tts_engine)" = qwen ] && echo "$QWEN_TTS_MODEL" || echo "$TTS
 install_qwen_tts() {  # its own venv: qwen-tts pins a transformers that moshi and qwen-asr do not share
   [ -x "$ROOT/v-qtts/bin/python" ] && "$ROOT/v-qtts/bin/python" -c "import qwen_tts" 2>/dev/null && return 0
   log "installing qwen-tts"
-  venv qtts "$QWEN_TTS_PKG" "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile httpx > "$DATA/logs/install-qtts.log" 2>&1 \
+  venv qtts "$QWEN_TTS_PKG" torch==$TORCH "fastapi>=0.110" "uvicorn[standard]" websockets numpy soundfile httpx > "$DATA/logs/install-qtts.log" 2>&1 \
     || { log "qwen-tts install failed"; tail -20 "$DATA/logs/install-qtts.log"; return 1; }
 }
 
