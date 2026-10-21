@@ -46,7 +46,7 @@ describe('the tape format', () => {
         'bc ::= "\\"mhm\\"" | "\\"yeah\\"" | "\\"right\\"" | "\\"okay\\"" | "\\"uh-huh\\"" | "\\"I see\\""',
       ].join('\n'),
     );
-    expect(grammar(['continue', 'finish'], 1).split('\n').slice(0, 2)).toEqual(['root ::= " continue " say | " finish" (" " say)?', 'say ::= "\\"" word (" " word){0,0} "\\""']);
+    expect(grammar(['continue', 'finish'], 1).split('\n').slice(0, 2)).toEqual(['root ::= " continue " say | " finish" (" " end)?', 'say ::= "\\"" word (" " word){0,0} "\\""']);
     expect(grammar(['listen', 'respond', 'backchannel'], 2).split('\n')[0]).toBe('root ::= " listen" | " respond " say | " backchannel " bc');
   });
 
@@ -160,7 +160,7 @@ describe('the tape stage', () => {
     expect(h.of('llm.delta').map((m) => m.text)).toEqual(['You soak it ']);
     h.advance(2560);
     expect(h.prompt()).toContain('  1.92 | user: (silent) | agent (silent): respond "You soak it"\n  2.56 | user: (silent) | agent (speaking):');
-    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " continue " say | " finish" (" " say)?');
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " continue " say | " finish" (" " end)?');
     h.answer(' continue "in warm water"');
     const rid = h.of('llm.start')[0].rid as string;
     h.send(2700, 'playback', { type: 'playback.start', rid, at: 2700 });
@@ -240,9 +240,27 @@ describe('the tape stage', () => {
     h.answer(' respond "Sure, what about"');
     expect(h.cells().at(-1)).toMatchObject({ action: 'respond', backstop: 'answer after silence' });
     // Off.
-    const off = run({ respondBias: 0, idleKeep: 0, answerAfterS: 0 });
+    const off = run({ respondBias: 0, idleKeep: 0, answerAfterS: 0, respondToWords: false });
     off.advance(640);
     expect((off.ios.at(-1)!.request as { body: Record<string, unknown> }).body).not.toHaveProperty('logit_bias');
+  });
+
+  it('responds only to new words, and finishes on a sentence end', () => {
+    const h = run();
+    h.advance(640);
+    // Nothing said yet: no respond.
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " backchannel " bc');
+    h.answer(' listen');
+    h.send(700, 'transcript', { type: 'asr.final', text: 'hello', start: 0, end: 1 });
+    h.advance(1280);
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " respond " say | " backchannel " bc');
+
+    h.answer(' respond "Hi there."');
+    h.advance(1920);
+    h.answer(' finish');
+    // Its answer is done and nothing new was said: no respond again (it answered itself).
+    h.advance(2560);
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " backchannel " bc');
   });
 
   it('skips the call while one is out, and while the TTS queue is full', () => {

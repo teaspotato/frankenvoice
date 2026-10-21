@@ -78,13 +78,17 @@ export const line = (c: Cell) => `${prefix(c)} ${agentText(c)}`;
 /** GBNF for one cell's action: the state's actions, at most `n` (>= 1) words. */
 export function grammar(allowed: string[], n: number): string {
   const alts = allowed.map((a) =>
-    a === 'listen' ? '" listen"' : a === 'backchannel' ? '" backchannel " bc' : a === 'finish' ? '" finish" (" " say)?' : `" ${a} " say`,
+    a === 'listen' ? '" listen"' : a === 'backchannel' ? '" backchannel " bc' : a === 'finish' ? '" finish" (" " end)?' : `" ${a} " say`,
   );
   const rep = n > 1 ? `{0,${n - 1}}` : '{0,0}';
+  const fin = allowed.includes('finish');
   return [
     `root ::= ${alts.join(' | ')}`,
     `say ::= "\\"" word (" " word)${rep} "\\""`,
+    // The last words of an answer end a sentence: without this Gemma finished mid-phrase ("you in the")
+    ...(fin ? [`end ::= "\\"" (word " ")${rep} last "\\""`] : []),
     "word ::= [A-Za-z0-9$%&'] [A-Za-z0-9$%&'-]{0,18} [,.?!;:]?",
+    ...(fin ? ["last ::= [A-Za-z0-9$%&'] [A-Za-z0-9$%&'-]{0,18} [.?!]"] : []),
     `bc ::= ${AGENT_BACKCHANNELS.map((b) => `"\\"${b}\\""`).join(' | ')}`,
   ].join('\n');
 }

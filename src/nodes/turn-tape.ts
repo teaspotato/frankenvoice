@@ -44,6 +44,7 @@ interface TapeParams {
   respondBias: number;
   idleKeep: number;
   answerAfterS: number;
+  respondToWords: boolean;
   greeting: string;
 }
 
@@ -152,6 +153,13 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
       type: 'number',
       default: 3,
       description: 'Backstop: once the user has said something and then stayed silent this long with no answer, the next call may only respond. 0: off.',
+    },
+    {
+      key: 'respondToWords',
+      label: 'Respond only to new words',
+      type: 'boolean',
+      default: true,
+      description: 'In silent cells, respond is allowed only once the user has said something since the last answer. Off, Gemma often answers itself right after finishing, playing the user’s next line.',
     },
     { key: 'idleCells', label: 'Stop calling after silent cells', type: 'number', default: 6, description: 'No calls (listen) once this many cells in a row had no user words or voice, unless the agent is speaking. 0: always call.' },
     {
@@ -355,7 +363,9 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     const ask = (c: Cell, tape: Cell[], maxWords: number, sp: Spec | null) => {
       const side = sp ? sp.side : live;
       const answer = mustAnswer(side);
-      const allowed = answer ? ['respond'] : ACTIONS[c.state];
+      const allowed = answer
+        ? ['respond']
+        : ACTIONS[c.state].filter((a) => !(a === 'respond' && c.state === 'silent' && p.respondToWords && !side.owed));
       // Only while the user's words wait for an answer: right after its own answer, the bias made Gemma answer
       // itself, playing the user's next line (Rin, 2026-10-21)
       const bias: JsonObject = c.state === 'silent' && side.owed && !answer && p.respondBias ? { logit_bias: [[' respond', p.respondBias]] } : {};
