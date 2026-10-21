@@ -234,7 +234,7 @@ describe('the pipeline in the server', () => {
     const c = defaultConfig();
     c.vad.variant = 'energy';
     c.turn.variant = 'tape';
-    c.turn.params.tape = { cellMs: 120 };
+    c.turn.params.tape = { cellMs: 120, draftGate: false };
     page.send(JSON.stringify({ type: 'start', graph: buildGraph(c) as unknown as Json, env: {}, autosave: true, title: '' }));
     await new Promise((r) => setTimeout(r, 2500));
     page.send(JSON.stringify({ type: 'stop' }));

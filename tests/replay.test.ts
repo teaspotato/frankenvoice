@@ -163,7 +163,7 @@ describe('record and replay', () => {
   it('lets the tape decide each cell (llama.cpp /completion), speaks its words, and replays it exactly', async () => {
     const c = testConfig();
     c.turn.variant = 'tape';
-    c.turn.params.tape = { cellMs: 100 };
+    c.turn.params.tape = { cellMs: 100, draftGate: false };
     const run = await recordLive(2500, performance, buildGraph(c));
     const msgs = run.events.filter((e) => e.kind === 'msg').map((e) => ({ node: e.node, ...(e.data as { type: string; action?: string; forced?: string }) }));
     const cells = msgs.filter((m) => m.type === 'tape.cell');
