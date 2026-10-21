@@ -300,10 +300,20 @@ export const speakerNode: NodeDef<SpeakerParams> = {
       const stop = typeof d.stop === 'number' ? Math.max(at, d.stop) : at;
       const silent = typeof d.silent === 'number' ? Math.max(stop, d.silent) : at + Math.max(0, p.releaseMs);
       const from = Math.min(cutPoint(at).from, stop);
+      // The tail the page played, rebuilt as it built it (its cut()), before the hold drops that audio.
+      const t0 = Math.max(at + 5, stop - TAIL_SEG_MS);
+      const a = p.cutoff === 'syllable' && p.tailMs > 0 && stop - t0 >= MIN_SEG_MS ? spanOf(queued, t0, stop) : null;
+      const tail = a && { at: a.at, src: posAt(a.at), sampleRate: a.sampleRate, samples: sustain(a.samples, a.sampleRate, p.tailMs) };
       silentAt = Math.max(silentAt, silent);
       holdFrom(from);
       gateStop = stop;
-      flushPlayed(silent);
+      if (tail) {
+        // The echo reference: the reply up to where the tail took over, then the tail.
+        flushPlayed(tail.at);
+        const track = tail.src?.track ?? queued[0]?.track ?? 'audio';
+        const start = tail.src?.pos ?? 0;
+        ctx.emit('played', { type: 'audio', track, start, end: start + tail.samples.length, sampleRate: tail.sampleRate, samples: tail.samples, at: tail.at });
+      } else flushPlayed(silent);
       ctx.emit('playback', { type: 'playback.paused', rid, at: silent, from, gate: true, cut: stop, ...(typeof d.pos === 'number' ? { pos: d.pos } : {}) });
     };
     const resume = () => {
