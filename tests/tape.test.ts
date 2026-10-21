@@ -124,9 +124,9 @@ describe('the tape format', () => {
 describe('the tape stage', () => {
   const run = (params: Record<string, unknown> = {}) => {
     const h = harness(tapeTurnNode, { cellMs: 640, greeting: '', specCells: 0, draftGate: false, ...params });
-    const answer = (content: string) => {
+    const answer = (content: string, extra: Record<string, number> = {}) => {
       const io = h.ios.at(-1)!;
-      io.h.onRecv?.({ content, timings: { prompt_n: 20 } }, undefined);
+      io.h.onRecv?.({ content, timings: { prompt_n: 20 }, ...extra }, undefined);
       io.h.onClose?.(null);
     };
     const prompt = () => ((h.ios.at(-1)!.request as { body: { prompt: string } }).body.prompt);
@@ -284,6 +284,59 @@ describe('the tape stage', () => {
     h.advance(1920);
     expect(h.cells().at(-1)).toMatchObject({ action: 'respond', backstop: 'gate: answer now', spec: 'adopted' });
     expect(h.of('llm.release')).toHaveLength(1);
+  });
+
+  it('lets the probe decide when to answer: a draft in each owed silent cell, played once the score reaches probeAt', () => {
+    const h = run({ draftGate: true, probeAt: 0.5 });
+    const body = () => (h.ios.at(-1)!.request as { body: Record<string, unknown> }).body;
+    h.send(50, 'vad', { type: 'vad.speech_start', at: 0 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'so I was', start: 0, end: 1 });
+    h.send(400, 'vad', { type: 'vad.speech_end', at: 0 });
+    h.advance(640);
+    // The earliest gate still holds the words' own cell.
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', forced: 'gate: too soon' });
+    h.advance(1280);
+    expect(body()).toMatchObject({ probe: true });
+    expect(body().logit_bias).toBeUndefined();
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " respond " say');
+    h.answer(' respond "Go on."', { probe: 0.1 });
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', probe: 0.1, probeHeld: 'Go on.' });
+    // Past the latest gate, the probe still decides.
+    h.advance(1920);
+    expect(body()).toMatchObject({ probe: true });
+    h.answer(' respond "Go on."', { probe: 0.3 });
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', probe: 0.3 });
+    expect(h.of('llm.start')).toHaveLength(0);
+    h.advance(2560);
+    h.answer(' respond "Sorry, go on."', { probe: 0.8 });
+    expect(h.cells().at(-1)).toMatchObject({ action: 'respond', probe: 0.8 });
+    expect(h.cells().at(-1)?.probeHeld).toBeUndefined();
+    expect(h.of('llm.delta').map((m) => m.text)).toEqual(['Sorry, go on. ']);
+  });
+
+  it('without a probe score, the latest gate decides; the backstop answers whatever the probe says', () => {
+    const h = run({ draftGate: true, probeAt: 0.5 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'hi there', start: 0, end: 1 });
+    h.advance(1280);
+    h.answer(' respond "Hi!"');
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', probe: null, probeHeld: 'Hi!' });
+    h.advance(1920);
+    h.answer(' respond "Hi!"');
+    expect(h.cells().at(-1)).toMatchObject({ action: 'respond', probe: null });
+
+    const g = run({ probeAt: 0.5, answerAfterS: 3 });
+    const body = () => (g.ios.at(-1)!.request as { body: Record<string, unknown> }).body;
+    g.send(300, 'transcript', { type: 'asr.final', text: 'and um', start: 0, end: 1 });
+    for (let t = 640; t <= 3200; t += 640) {
+      g.advance(t);
+      g.answer(' respond "Yes?"', { probe: 0.1 });
+      expect(g.cells().at(-1)).toMatchObject({ action: 'listen' });
+    }
+    // 3 s of silence after the words (5 cells): only respond, no probe asked.
+    g.advance(3840);
+    expect(body().probe).toBeUndefined();
+    g.answer(' respond "Yes?"');
+    expect(g.cells().at(-1)).toMatchObject({ action: 'respond', backstop: 'answer after silence' });
   });
 
   it('skips the call while one is out, and while the TTS queue is full', () => {

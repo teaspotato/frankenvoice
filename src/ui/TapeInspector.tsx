@@ -82,6 +82,13 @@ function Notes({ r }: { r: TapeRow }) {
   if (r.forced) out.push(r.forced === 'idle' ? 'idle, no call' : `no call: ${r.forced}`);
   if (r.spec) out.push(r.spec === 'adopted' ? 'written ahead' : `written ahead, ${r.spec}`);
   if (r.backstop) out.push(<span key="backstop" title="The user had been silent too long after words: the grammar allowed only respond">{r.backstop}</span>);
+  if (r.probe !== undefined)
+    out.push(
+      <span key="probe" title={r.probeHeld ? `The probe said the user wasn’t done: the drafted reply “${r.probeHeld}” was dropped` : 'The probe on Gemma’s layer 28 said the user was done: the drafted reply plays'}>
+        {r.probe === null ? 'probe: no score' : `probe ${r.probe.toFixed(2)}`}
+        {r.probeHeld ? ', held' : ''}
+      </span>,
+    );
   if (r.late)
     out.push(
       <span key="late" className="warn" title="answered after its cell had ended">

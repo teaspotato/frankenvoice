@@ -48,6 +48,7 @@ interface TapeParams {
   draftGate: boolean;
   gateMinS: number;
   gateMaxS: number;
+  probeAt: number;
   greeting: string;
 }
 
@@ -80,6 +81,10 @@ interface Call {
   spec: unknown;
   /** The backstop: only respond was allowed. */
   answer?: boolean;
+  /** The probe decides: a reply was drafted (only respond), kept only if the probe's score reaches probeAt. */
+  probed?: boolean;
+  /** For a probed call: the latest gate was due (the fallback when the server returns no score). */
+  gateDue?: boolean;
 }
 
 /**
@@ -98,6 +103,8 @@ interface Call {
  * them and stops answering (research: pilot/prompt-v2.md). So silent cells add `respondBias` to the
  * logit of " respond", the prompt cuts each finished idle run to `idleKeep` lines, and a backstop
  * allows only respond once the user has been silent `answerAfterS` after words left unanswered.
+ * With `probeAt`, a linear probe on Gemma's layer 28, scored by llama-server, decides instead when to
+ * answer: Gemma's activations know when the user is done even when its output listens.
  *
  * Every cell is emitted as `tape.cell` (the line as written, the call's latency, timings, its xid and
  * Gemma's odds for each action), every cut as `tape.cut`, so the dashboard and the Tape inspector show
@@ -172,6 +179,14 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     },
     { key: 'gateMinS', label: 'Gate: earliest (s)', type: 'number', default: 0.6, when: { draftGate: [true] }, description: 'No answer before this much silence after the user’s last words (rounded to cells).' },
     { key: 'gateMaxS', label: 'Gate: latest (s)', type: 'number', default: 1.3, when: { draftGate: [true] }, description: 'Answer by this much silence at the latest (rounded to cells).' },
+    {
+      key: 'probeAt',
+      label: 'Probe: answer at',
+      type: 'number',
+      default: 0,
+      description:
+        'A linear probe on Gemma’s layer 28 decides when to answer, instead of Gemma’s own choice and the latest gate: with the user’s words unanswered, each silent cell drafts a reply and plays it once the probe’s score reaches this (0 to 1). Needs llama-server with LLAMA_PROBE_FILE (research: duplex-text-llm/steering); without a score, the latest gate decides. The earliest gate and the backstop still apply. 0: off.',
+    },
     { key: 'idleCells', label: 'Stop calling after silent cells', type: 'number', default: 6, description: 'No calls (listen) once this many cells in a row had no user words or voice, unless the agent is speaking. 0: always call.' },
     {
       key: 'cutOverCells',
@@ -242,6 +257,7 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     /** The VAD hears the user. */
     let speaking = false;
     let call: Call | null = null;
+    let warnedProbe = false;
     let ridNo = 0;
     let cutTimer: TimerHandle | null = null;
     let greet: string[] | null = null;
@@ -350,7 +366,15 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
 
     const defaultAction = (s: TapeState) => (s === 'speaking' ? 'continue' : 'listen');
     /** The backstop: the user said something, then stayed silent `answerAfterS` without an answer. */
-    const mustAnswer = (s: Side) => s.state === 'silent' && s.owed && (gate(s) === 'respond' || (p.answerAfterS > 0 && s.idle >= Math.max(1, Math.round((p.answerAfterS * 1000) / cellMs))));
+    const backstop = (s: Side) => s.state === 'silent' && s.owed && p.answerAfterS > 0 && s.idle >= Math.max(1, Math.round((p.answerAfterS * 1000) / cellMs));
+    const mustAnswer = (s: Side) => s.state === 'silent' && s.owed && (gate(s) === 'respond' || backstop(s));
+    /**
+     * The probe (research: duplex-text-llm/steering): Gemma's layer 28 knows when the user is done far
+     * better than its own odds of responding (AUC 0.97 vs 0.73 on the pilot's scenarios). So with words
+     * unanswered, every silent cell drafts a reply and the server's probe score at the decision spot says
+     * whether it plays; the backstop still answers regardless.
+     */
+    const probing = (s: Side, c: Cell) => p.probeAt > 0 && c.state === 'silent' && s.owed && !backstop(s);
     /**
      * Draft, then gate (Rin, 2026-10-21): Gemma answers well but can't tell when to. With words unanswered,
      * a silent cell only listens before `gateMinS` of silence and may only respond from `gateMaxS` on;
@@ -387,13 +411,13 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
 
     const ask = (c: Cell, tape: Cell[], maxWords: number, sp: Spec | null) => {
       const side = sp ? sp.side : live;
-      const answer = mustAnswer(side);
-      const allowed = answer
-        ? ['respond']
-        : ACTIONS[c.state].filter((a) => !(a === 'respond' && c.state === 'silent' && p.respondToWords && !side.owed));
+      const probed = probing(side, c);
+      const answer = mustAnswer(side) && !probed;
+      const allowed =
+        answer || probed ? ['respond'] : ACTIONS[c.state].filter((a) => !(a === 'respond' && c.state === 'silent' && p.respondToWords && !side.owed));
       // Only while the user's words wait for an answer: right after its own answer, the bias made Gemma answer
       // itself, playing the user's next line (Rin, 2026-10-21)
-      const bias: JsonObject = c.state === 'silent' && side.owed && !answer && p.respondBias ? { logit_bias: [[' respond', p.respondBias]] } : {};
+      const bias: JsonObject = c.state === 'silent' && side.owed && !answer && !probed && p.respondBias ? { logit_bias: [[' respond', p.respondBias]] } : {};
       const body: JsonObject = {
         prompt: tapePrompt(head, trimIdle(tape, p.idleKeep)),
         grammar: grammar(allowed, maxWords),
@@ -403,9 +427,20 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
         stop: ['\n'],
         ...(p.slot >= 0 ? { id_slot: p.slot } : {}),
         ...(p.nProbs > 0 ? { n_probs: p.nProbs } : {}),
+        ...(probed ? { probe: true } : {}),
         ...bias,
       };
-      const k: Call = { cell: c, state: c.state, allowed, maxWords, t0: ctx.now(), io: undefined as unknown as Call['io'], spec: sp, ...(answer ? { answer } : {}) };
+      const k: Call = {
+        cell: c,
+        state: c.state,
+        allowed,
+        maxWords,
+        t0: ctx.now(),
+        io: undefined as unknown as Call['io'],
+        spec: sp,
+        ...(answer ? { answer } : {}),
+        ...(probed ? { probed, gateDue: gate(side) === 'respond' } : {}),
+      };
       call = k;
       ctx.setState('calling', sp ? 'ahead' : 'live');
       k.io = ctx.io.open(CHANNEL, { body }, {
@@ -443,6 +478,19 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
         if (error || text === null) ctx.log('warn', 'tape call failed', { error, cell: k.cell.n });
         else ctx.log('warn', 'tape call wrote no action', { text, cell: k.cell.n });
         return { d: null, text, stats };
+      }
+      if (k.probed) {
+        const score = typeof k.res?.probe === 'number' ? k.res.probe : null;
+        stats.probe = score;
+        if (score === null && !warnedProbe) {
+          warnedProbe = true;
+          ctx.log('warn', 'tape: the server returned no probe score (llama-server needs LLAMA_PROBE_FILE); the latest gate decides', { cell: k.cell.n });
+        }
+        if (!(score === null ? k.gateDue : score >= p.probeAt)) {
+          // Not done yet, says the probe: the drafted reply is dropped and the cell listens.
+          stats.probeHeld = d.words.join(' ');
+          return { d: { action: 'listen', words: [] }, text, stats };
+        }
       }
       return { d, text, stats };
     };

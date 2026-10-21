@@ -54,6 +54,10 @@ export interface TapeRow {
   late?: boolean;
   /** The backstop allowed only respond (the user had been silent too long after words). */
   backstop?: string;
+  /** The probe decided (turn.tape probeAt): its score for this cell, null if the server gave none. */
+  probe?: number | null;
+  /** The probe said the user wasn't done: the reply drafted for this cell, dropped. */
+  probeHeld?: string;
   /** Taken from the cells written ahead (adopted, adopted late). */
   spec?: string;
   /** What the call wrote, when it couldn't be used. */
@@ -166,8 +170,9 @@ export class TapeModel {
           cut: false,
           seq: e.seq,
         };
-        for (const k of ['allowed', 'odds', 'ms', 'promptN', 'promptMs', 'predictedN', 'predictedMs', 'forced', 'dropped', 'failed', 'late', 'spec', 'wrote', 'xid', 'backstop'] as const)
+        for (const k of ['allowed', 'odds', 'ms', 'promptN', 'promptMs', 'predictedN', 'predictedMs', 'forced', 'dropped', 'failed', 'late', 'spec', 'wrote', 'xid', 'backstop', 'probeHeld'] as const)
           if (d[k] !== undefined && d[k] !== null) (row as unknown as Record<string, unknown>)[k] = d[k];
+        if (d.probe !== undefined) row.probe = typeof d.probe === 'number' ? d.probe : null;
         // Recorded before cells carried their call's xid: the last call that asked for this line.
         if (!row.xid && row.ms !== undefined) row.xid = this.callFor(row.line);
         // In tape order: a late answer lands after cells that were decided without it.

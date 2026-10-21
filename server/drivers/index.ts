@@ -187,9 +187,10 @@ const completion =
       const text = await res.text();
       if (!res.ok) return sink.close({ error: { status: res.status, body: text.slice(0, 2000) } });
       // The answer without the echoed prompt and settings: they would double the recording. The token
-      // odds (n_probs) stay: the Tape inspector reads Gemma's odds for each action from them.
+      // odds (n_probs) stay: the Tape inspector reads Gemma's odds for each action from them. So does the
+      // probe's score (turn.tape probeAt), from a llama-server patched for it.
       const j = JSON.parse(text) as Record<string, Json>;
-      const keep = ['content', 'completion_probabilities', 'stop_type', 'stopping_word', 'tokens_cached', 'tokens_evaluated', 'truncated', 'timings', 'id_slot'];
+      const keep = ['content', 'completion_probabilities', 'probe', 'stop_type', 'stopping_word', 'tokens_cached', 'tokens_evaluated', 'truncated', 'timings', 'id_slot'];
       sink.recv(Object.fromEntries(keep.filter((k) => k in j).map((k) => [k, j[k]])));
       sink.close(null);
     })().catch((e) => !ac.signal.aborted && sink.close(errorJson(e)));
