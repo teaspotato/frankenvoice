@@ -327,14 +327,24 @@ const speaker: LiveDriver = (_req, sink) => {
   return { send() {}, close() {} };
 };
 
-export const fakeDrivers: DriverRegistry = { mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, 'tts-canned': ttsCanned, openai, 'llama-completion': llamaCompletion, rnnoise, speaker, 'turn-model': turnModel, typesafe };
+/** A fixed wall clock: Wednesday 21 October 2026, 13:12 in Berlin. */
+const clock: LiveDriver = (_req, sink) => {
+  later(0, () => {
+    sink.recv({ epochMs: Date.UTC(2026, 9, 21, 11, 12), timeZone: 'Europe/Berlin', locale: 'en-GB' });
+    sink.close();
+  });
+  return { send() {}, close() {} };
+};
+
+export const fakeDrivers: DriverRegistry = { clock, mic, silero, firered, 'gpubox-asr': gpuboxAsr, 'gpubox-tts': gpuboxTts, 'tts-canned': ttsCanned, openai, 'llama-completion': llamaCompletion, rnnoise, speaker, 'turn-model': turnModel, typesafe };
 
 /** The default pipeline with the turn model on (it is off by default, a big download). */
 export function testConfig(): PipelineConfig {
   const c = defaultConfig();
   c.turnmodel.variant = 'ssl_turn';
   // The fake user talks soon after replies start; these tests are about the rest of the floor rules.
-  c.turn.params['full-duplex'] = { yieldWithinMs: 0 };
+  // The agent doesn't open the call: the fake user starts at once (the opening has its own test).
+  c.turn.params['full-duplex'] = { yieldWithinMs: 0, opening: 'off' };
   // Small chunks, so replies are paced by the scheduler.
   c.sched.params.tick = { firstTokens: 3, chunkTokens: 2 };
   return c;

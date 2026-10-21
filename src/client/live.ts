@@ -243,3 +243,12 @@ export class LiveClient {
     });
   }
 }
+
+/** The page's time zone and language, sent with a start: the LLM's live context (the server's `clock` channel). */
+export function pageClock(): { timeZone?: string; locale?: string } {
+  try {
+    return { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language };
+  } catch {
+    return {};
+  }
+}

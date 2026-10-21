@@ -9,7 +9,7 @@ import type { Trajectory } from '../core/trajectory';
 import { SpanDetails } from './SpanDetails';
 import type { Json } from '../core/types';
 import { micMonitor, replaySpeaker, setOutputMuted, setOutputPaused, setOutputSuppressed } from '../client/audio';
-import { LiveClient, type LiveHandlers } from '../client/live';
+import { LiveClient, pageClock, type LiveHandlers } from '../client/live';
 import type { TurnModelLoad } from '../live-protocol';
 import { resolveParams } from '../core/node';
 import { turnModelRequest } from '../nodes/turn-model';
@@ -454,7 +454,7 @@ export function App() {
 
   const runLive = () =>
     runOnServer({ keep: true }, (c) =>
-      c.start(buildGraph(config), { env: { userAgent: navigator.userAgent }, autosave: autosaveRef.current, title: titleOn ? autoTitle : '' }),
+      c.start(buildGraph(config), { env: { userAgent: navigator.userAgent, ...pageClock() }, autosave: autosaveRef.current, title: titleOn ? autoTitle : '' }),
     );
 
   const stop = () => {
