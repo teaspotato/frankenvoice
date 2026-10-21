@@ -233,6 +233,105 @@ describe('the tape stage', () => {
     expect(h.of('llm.release')).toHaveLength(0);
   });
 
+  it('drops what it wrote ahead when the opening line starts, so no held reply plays over it', () => {
+    const h = run({ specCells: 6, greeting: 'Hi there.' });
+    h.advance(640);
+    h.answer(' listen');
+    // Live cell 1 is silent: writing ahead starts.
+    expect(h.of('tape.spec')[0]).toMatchObject({ event: 'start' });
+    h.answer(' listen');
+    h.send(900, 'transcript', { type: 'asr.open' } as Msg);
+    expect(h.of('tape.spec').at(-1)).toMatchObject({ event: 'drop', why: 'greeting' });
+    expect(h.ios.at(-1)!.closed).toBe(true);
+    h.advance(2000);
+    expect(h.of('llm.start')).toHaveLength(0);
+    expect(h.cells().map((c) => c.line).slice(0, 3)).toEqual([
+      '  0.64 | user: (silent) | agent (silent): listen',
+      '  1.28 | user: (silent) | agent (silent): respond "Hi there."',
+      '  1.92 | user: (silent) | agent (speaking): finish',
+    ]);
+  });
+
+  it('does not write ahead between the speech end and its ASR final', () => {
+    const h = run({ specCells: 4 });
+    h.send(50, 'vad', { type: 'vad.speech_start', at: 0 });
+    h.send(500, 'vad', { type: 'vad.speech_end', at: 400 });
+    // Its words are still to come: nothing written ahead, so no reply held for silence that isn't.
+    expect(h.ios).toHaveLength(0);
+    h.advance(640);
+    expect(h.ios).toHaveLength(1);
+    h.send(700, 'transcript', { type: 'asr.final', text: 'no wait', start: 0, end: 450 });
+    h.answer(' listen');
+    expect(h.of('tape.spec')[0]).toMatchObject({ event: 'start' });
+    expect(h.prompt().endsWith('  1.28 | user: "no wait" (silent) | agent (silent):')).toBe(true);
+    expect(h.of('llm.release')).toHaveLength(0);
+  });
+
+  it('writes ahead anyway when the ASR final doesn’t come', () => {
+    const h = run({ specCells: 4 });
+    h.send(50, 'vad', { type: 'vad.speech_start', at: 0 });
+    h.send(500, 'vad', { type: 'vad.speech_end', at: 400 });
+    h.advance(640);
+    h.answer(' listen');
+    expect(h.of('tape.spec')).toHaveLength(0);
+    for (const t of [1280, 1920]) {
+      h.advance(t);
+      h.answer(' listen');
+    }
+    h.advance(1999);
+    expect(h.of('tape.spec')).toHaveLength(0);
+    h.advance(2000);
+    expect(h.of('tape.spec')[0]).toMatchObject({ event: 'start' });
+  });
+
+  it('decides a real cell that waited for a speculative call when the speculation is dropped', () => {
+    const h = run({ specCells: 4 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'tell me a joke', start: 0, end: 1 });
+    // The call for cell 1 is still out at its boundary: the real cell waits for it.
+    h.advance(640);
+    expect(h.cells()).toHaveLength(0);
+    h.send(700, 'vad', { type: 'vad.speech_start', at: 0 });
+    expect(h.cells().map((c) => c.line)).toEqual(['  0.64 | user: "tell me a joke" (silent) | agent (silent): listen']);
+    expect(h.cells()[0].forced).toBe('speculation dropped (user voice)');
+    h.advance(1280);
+    expect(h.prompt()).toContain('  0.64 | user: "tell me a joke" (silent) | agent (silent): listen\n  1.28 | user: (talking) | agent (silent):');
+  });
+
+  it('keeps a finish written ahead when the user speaks after the reply was released', () => {
+    const h = run({ specCells: 4 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'hi', start: 0, end: 1 });
+    h.answer(' listen');
+    h.answer(' respond "Hello there friend"');
+    h.answer(' finish');
+    h.advance(640);
+    h.advance(1280);
+    expect(h.of('llm.release')).toHaveLength(1);
+    expect(h.ios).toHaveLength(3);
+    // Words in the cell the finish was written for: the speculation breaks, its finish stays.
+    h.send(1500, 'transcript', { type: 'asr.final', text: 'wait', start: 1, end: 2 });
+    h.advance(1920);
+    expect(h.cells().at(-1)).toMatchObject({ line: '  1.92 | user: "wait" (silent) | agent (speaking): finish', forced: 'sent ahead' });
+    expect(h.ios).toHaveLength(3);
+    h.advance(2560);
+    expect(h.prompt().endsWith('  2.56 | user: (silent) | agent (silent):')).toBe(true);
+  });
+
+  it('counts the words sent ahead in the TTS headroom when a released speculation breaks', () => {
+    const h = run({ specCells: 4 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'hi', start: 0, end: 1 });
+    h.answer(' respond "One two three"');
+    h.advance(640);
+    expect(h.of('llm.release')).toHaveLength(1);
+    h.answer(' continue "four five six"');
+    h.send(1000, 'transcript', { type: 'asr.final', text: 'um', start: 1, end: 2 });
+    h.advance(1280);
+    expect(h.cells().at(-1)).toMatchObject({ line: '  1.28 | user: "um" (silent) | agent (speaking): continue "four five six"', forced: 'sent ahead' });
+    h.advance(1920);
+    // Six words queued by 2.84 s: room for three more, not four.
+    expect(h.prompt().endsWith('  1.92 | user: (silent) | agent (speaking):')).toBe(true);
+    expect(h.grammarOf().split('\n')[1]).toBe('say ::= "\\"" word (" " word){0,2} "\\""');
+  });
+
   it('says the opening line and writes it on the tape', () => {
     const h = harness(tapeTurnNode, { cellMs: 640, specCells: 0 });
     expect(h.of('bc.lines')[0].lines).toContain("Hi! What's on your mind?");

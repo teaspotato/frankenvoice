@@ -196,6 +196,11 @@ export class LiveHub {
     (this.o.log ?? console.log)(`[live] ${m}`);
   }
 
+  /** A notice: the host sees `detail` (error text, maybe with server paths); a visitor only `text`. */
+  private notice(page: Page, text: string, detail?: unknown) {
+    page.send({ type: 'notice', text: page.host && detail !== undefined ? `${text}: ${String(detail)}` : text });
+  }
+
   private get maxSessions() {
     return Math.max(1, Math.floor(this.o.maxSessions?.() ?? 1));
   }
@@ -321,20 +326,21 @@ export class LiveHub {
 
   /**
    * The longest each waiting page may wait (ms, in line order), from the session limit: the box's runs end by their
-   * limit, and each page ahead may use a whole one. Null without a limit.
+   * limit, and each page ahead may use a whole one. Null without a limit, and where it depends on a run with no end
+   * (a host's replay with live channels).
    */
   private waits(): (number | null)[] {
     const limit = this.maxSessionMs;
     if (!limit) return this.queue.map(() => null);
     const now = Date.now();
     const slots: number[] = [];
-    for (const p of this.pages) if (p.run?.box) slots.push(Math.max(0, (p.run.endsAt ?? now + limit) - now));
+    for (const p of this.pages) if (p.run?.box) slots.push(p.run.endsAt === undefined ? Infinity : Math.max(0, p.run.endsAt - now));
     while (slots.length < this.maxSessions) slots.push(0);
     return this.queue.map(() => {
       slots.sort((a, b) => a - b);
       const wait = slots[0];
       slots[0] += limit;
-      return wait;
+      return Number.isFinite(wait) ? wait : null;
     });
   }
 
@@ -365,7 +371,7 @@ export class LiveHub {
         q.go();
       } catch (e) {
         this.log(`a queued start failed: ${String(e)}`);
-        q.page.send({ type: 'notice', text: `could not start: ${String(e)}` });
+        this.notice(q.page, 'could not start', e);
       }
     }
     this.tellQueue();
@@ -437,7 +443,7 @@ export class LiveHub {
     try {
       graph = checkGraph(m.graph);
     } catch (e) {
-      return page.send({ type: 'notice', text: `bad graph: ${String(e)}` });
+      return this.notice(page, 'bad graph', e);
     }
     const limit = this.maxSessionMs;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -489,7 +495,7 @@ export class LiveHub {
     } catch (e) {
       // The start failed: free the box, tell the page, and let the next in line start.
       clearTimeout(timer);
-      this.abort(page, rt, run, `could not start the session: ${String(e)}`);
+      this.abort(page, rt, run, 'could not start the session', e);
       return;
     }
     // Only a graph that started becomes the demo graph.
@@ -498,8 +504,8 @@ export class LiveHub {
   }
 
   /** A run that failed to start: stop what started, end it on the page (unsaved), free its slot and start the next. */
-  private abort(page: Page, rt: Runtime | undefined, run: Run | undefined, text: string) {
-    this.log(text);
+  private abort(page: Page, rt: Runtime | undefined, run: Run | undefined, text: string, detail?: unknown) {
+    this.log(detail === undefined ? text : `${text}: ${String(detail)}`);
     try {
       if (rt?.isRunning) rt.stop();
     } catch (e) {
@@ -520,7 +526,7 @@ export class LiveHub {
         }
       }
     }
-    page.send({ type: 'notice', text });
+    this.notice(page, text, detail);
     this.broadcastUsers();
     this.next();
   }
@@ -548,7 +554,7 @@ export class LiveHub {
         monitorChannels: h.audible ? outputChannels : [],
       }));
     } catch (e) {
-      return this.abort(page, undefined, undefined, `replay: ${String(e)}`);
+      return this.abort(page, undefined, undefined, 'replay', e);
     }
     const s = this.stream(page, rt, () => sim.now(), () => sim.isPaused);
     let stoppedAt: number | undefined;
@@ -569,7 +575,7 @@ export class LiveHub {
     // A start that throws on the first tick rejects the run: end it like any other, so the slot frees.
     const done = sim
       .runRealtime(1)
-      .catch((e) => page.send({ type: 'notice', text: `replay: ${String(e)}` }))
+      .catch((e) => this.notice(page, 'replay', e))
       .then(async () => {
         stoppedAt = rt.isRunning ? sim.now() : undefined;
         try {
@@ -601,9 +607,11 @@ export class LiveHub {
     try {
       await mkdir(dir, { recursive: true });
       await writeFile(join(dir, `${id}.fvs`), bytes);
-      page.send({ type: 'saved', id, path: join(dir, `${id}.fvs`) });
+      // Only the host learns where on the server it went.
+      page.send({ type: 'saved', id, ...(page.host ? { path: join(dir, `${id}.fvs`) } : {}) });
     } catch (e) {
-      return page.send({ type: 'notice', text: `Session not saved (${String(e)}).` });
+      this.log(`session ${id} not saved: ${String(e)}`);
+      return page.send({ type: 'notice', text: page.host ? `Session not saved (${String(e)}).` : 'Session not saved.' });
     }
     const transcript = run.title ? transcriptOf(traj) : '';
     if (!transcript) return;
@@ -611,7 +619,7 @@ export class LiveHub {
     try {
       name = titleToName(await sessionTitle(this.o.upstreams, run.title, transcript));
     } catch (e) {
-      return page.send({ type: 'notice', text: `Could not title the session with ${run.title}: ${String(e).slice(0, 200)}` });
+      return this.notice(page, `Could not title the session with ${run.title}`, String(e).slice(0, 200));
     }
     if (!name) return;
     for (let n = 1; n <= 9; n++) {
@@ -619,7 +627,7 @@ export class LiveHub {
       const dest = join(dir, `${to}.fvs`);
       if (await stat(dest).catch(() => null)) continue;
       await rename(join(dir, `${id}.fvs`), dest);
-      page.send({ type: 'renamed', from: id, to, path: dest });
+      page.send({ type: 'renamed', from: id, to, ...(page.host ? { path: dest } : {}) });
       id = to;
       return;
     }
