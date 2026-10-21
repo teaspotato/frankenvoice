@@ -13,7 +13,7 @@ const chunk = (content: string, finish: string | null = null) => ({ choices: [{ 
 const body = (io: { request: Json }) => (io.request as { body: JsonObject }).body;
 
 describe('generated backchannels: the LLM request', () => {
-  const llm = () => harness(llmNode, { model: 'gemma', system: 'Be brief.', utterances: 'plain' }, 'llm');
+  const llm = () => harness(llmNode, { model: 'gemma', system: 'Be brief.', utterances: 'plain', liveContext: false }, 'llm');
   /** A finished exchange, so there is history. */
   const exchange = (h: ReturnType<typeof llm>) => {
     h.send(0, 'turn', { type: 'turn.user', text: 'Hi there.', turnId: 't0' });

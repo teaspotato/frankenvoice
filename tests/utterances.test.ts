@@ -57,7 +57,7 @@ describe('tagged utterances: parsing', () => {
 });
 
 describe('tagged utterances: the LLM', () => {
-  const llm = (params: Record<string, unknown> = {}) => harness(llmNode, { model: 'gemma', system: 'Be brief.', ...params }, 'llm');
+  const llm = (params: Record<string, unknown> = {}) => harness(llmNode, { model: 'gemma', system: 'Be brief.', liveContext: false, ...params }, 'llm');
 
   it('prefills the first tag, sends the grammar, emits flags before words, and keeps the raw text in the history', () => {
     const h = llm();

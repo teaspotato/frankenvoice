@@ -70,6 +70,8 @@ export const fillerOpenerNode: NodeDef = {
         switch (msg.type) {
           case 'llm.start':
             end();
+            // The agent opening the call keeps nobody waiting: no filler.
+            if (msg.opening) return;
             cur = { rid: msg.rid as string, t0: ctx.now(), thinking: false, spoken: false };
             cur.timer = ctx.setTimer(Number(p.afterMs), check, 'filler');
             break;

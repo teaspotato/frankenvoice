@@ -164,7 +164,7 @@ describe('the pipeline in the server', () => {
     const c = defaultConfig();
     c.vad.variant = 'energy';
     c.backchannel.variant = 'off';
-    page.send(JSON.stringify({ type: 'start', graph: buildGraph(c) as unknown as Json, env: { userAgent: 'test' }, autosave: true, title: '' }));
+    page.send(JSON.stringify({ type: 'start', graph: buildGraph(c) as unknown as Json, env: { userAgent: 'test', timeZone: 'Asia/Tokyo', locale: 'ja-JP' }, autosave: true, title: '' }));
     await new Promise((r) => setTimeout(r, 2500));
     page.send(JSON.stringify({ type: 'stop' }));
     await ended;
@@ -185,13 +185,23 @@ describe('the pipeline in the server', () => {
     const types = new Set(traj.events.filter((e) => e.kind === 'msg').map((e) => (e.data as { type: string }).type));
     for (const t of ['asr.final', 'turn.user', 'llm.delta', 'tts.words', 'playback.start']) expect(types).toContain(t);
     // The agent opens once the ASR is connected.
-    const msgs = traj.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; why?: string });
+    const msgs = traj.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; why?: string; opening?: boolean; rid?: string; text?: string });
     const open = msgs.findIndex((m) => m.type === 'asr.open');
     expect(open).toBeGreaterThanOrEqual(0);
-    expect(msgs.findIndex((m) => m.type === 'bc.say' && m.why === 'greeting')).toBeGreaterThan(open);
-    // And its line opens the LLM transcript.
-    const reply = seen.llmBodies.find((b) => b.messages?.some((m) => m.role === 'user'))!;
-    expect(reply.messages!.filter((m) => m.role !== 'system')[0]).toMatchObject({ role: 'assistant', content: expect.stringContaining("What's on your mind?") });
+    expect(msgs.findIndex((m) => m.type === 'turn.open')).toBeGreaterThan(open);
+    // The LLM writes the opening: a reply to the opening prompt alone.
+    const opening = msgs.find((m) => m.type === 'llm.start' && m.opening)!;
+    expect(opening).toBeTruthy();
+    const said = msgs.find((m) => m.type === 'llm.end' && m.rid === opening.rid)!.text!;
+    const first = seen.llmBodies[0].messages!;
+    expect(first.map((m) => m.role)).toEqual(['system', 'user', 'assistant']);
+    expect(String(first[1].content)).toContain('The call has just connected');
+    // The system prompt carries the live context, in the page's time zone.
+    expect(String(first[0].content)).toMatch(/Live context:\n- The call started on \w+day, \d+ \w+ 20\d\d at \d\d:\d\d, the user's local time \(time zone Asia\/Tokyo, GMT\+09:00\)\.\n- The user's browser language is ja-JP\./);
+    // Later requests: the same system prompt; the history opens with the agent's words, without the prompt.
+    const reply = seen.llmBodies.find((b) => b.messages?.some((m) => m.role === 'user' && !String(m.content).includes('The call has just connected')))!;
+    expect(reply.messages![0]).toEqual(first[0]);
+    expect(reply.messages![1]).toMatchObject({ role: 'assistant', content: expect.stringContaining(said.trim().split(' ')[0]) });
     expect(traj.events.some((e) => e.kind === 'io.recv' && (e.data as { payload?: { type?: string } }).payload?.type === 'late')).toBe(got.lateSent > 0);
     expect(traj.events.filter((e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toEqual([]);
     // The server's recording replays exactly, like one made in the page.

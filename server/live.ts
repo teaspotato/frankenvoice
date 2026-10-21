@@ -97,8 +97,10 @@ class Page {
     /** The host (token or local), not a demo visitor. */
     readonly host: boolean,
   ) {
-    this.drivers = { ...base, mic: this.mic, speaker: this.speaker };
+    this.drivers = { ...base, mic: this.mic, speaker: this.speaker, clock: this.clock };
   }
+  /** The time zone and language the page sent with its start, for the clock. */
+  where: { timeZone?: string; locale?: string } = {};
   send(m: Json) {
     if (this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify(m));
   }
@@ -108,6 +110,16 @@ class Page {
   get open() {
     return this.ws.readyState === this.ws.OPEN;
   }
+
+  /** The wall clock, in the page's time zone (the server's when the page didn't say). */
+  private clock: LiveDriver = (_req, sink) => {
+    const timeZone = this.where.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const t = setTimeout(() => {
+      sink.recv({ epochMs: Date.now(), timeZone, ...(this.where.locale ? { locale: this.where.locale } : {}) });
+      sink.close();
+    }, 0);
+    return { send() {}, close: () => clearTimeout(t) };
+  };
 
   private mic: LiveDriver = (req, sink) => {
     if (!this.open) {
@@ -428,6 +440,8 @@ export class LiveHub {
     if (env && JSON.stringify(env).length > MAX_ENV_BYTES) return page.send({ type: 'notice', text: `the start's env is over ${MAX_ENV_BYTES} bytes` });
     if (m.title !== undefined && (typeof m.title !== 'string' || m.title.length > MAX_TITLE)) return page.send({ type: 'notice', text: `the start's title is not a string of up to ${MAX_TITLE} characters` });
     m = { ...m, env };
+    const str = (v: Json | undefined) => (typeof v === 'string' && v.length <= 100 ? v : undefined);
+    page.where = { timeZone: str(env?.timeZone), locale: str(env?.locale) };
     if (!page.host && this.o.demoGraph) m = { graph: this.o.demoGraph(), env: m.env, autosave: true, title: '' };
     this.request(page, true, () => this.runLive(page, m));
   }

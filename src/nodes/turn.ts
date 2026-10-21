@@ -114,7 +114,7 @@ interface DuplexParams {
   eotInstructions: string;
   backoffAfter: number;
   backoffLines: string;
-  greeting: string;
+  opening: string;
   backoffWords: number;
   backoffSilenceMs: number;
 }
@@ -473,11 +473,12 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
     { key: 'eotOptions', label: 'Done/pausing options', type: 'text', default: DEFAULT_EOT_OPTIONS, description: 'Sent to TypeSafe as the Choice criteria; the first option means done.', when: { eotCheck: ['typesafe'] } },
     { key: 'eotInstructions', label: 'Done/pausing question', type: 'text', default: DEFAULT_EOT_INSTRUCTIONS, when: { eotCheck: ['typesafe'] } },
     {
-      key: 'greeting',
-      label: 'Opening line',
-      type: 'string',
-      default: "Hi! What's on your mind?",
-      description: 'What the agent says first, as soon as the ASR is connected (so the user can answer). It opens the LLM transcript. Empty: wait for the user. Needs a TTS that plays canned lines (Kyutai).',
+      key: 'opening',
+      label: 'Agent opens the call',
+      type: 'select',
+      options: ['llm', 'off'],
+      default: 'llm',
+      description: "llm: as soon as the ASR is connected (so the user can answer), the LLM writes the agent's first words (turn.open), a reply like any other. off: wait for the user.",
     },
     {
       key: 'backoffAfter',
@@ -1236,7 +1237,8 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
             if (String(msg.heard ?? '').trim() && ++interrupts >= p.backoffAfter) enterBackoff();
           }
           // What the user heard before we stopped, for the LLM's history.
-          if (last) ctx.emit('turn', { type: 'turn.heard', turnId: last.id, ...(msg.rid ? { rid: msg.rid as string } : {}), text: (msg.heard as string) ?? '' });
+          // (The opening answers no turn: it is found by its reply.)
+          if (last || msg.rid) ctx.emit('turn', { type: 'turn.heard', turnId: last?.id ?? null, ...(msg.rid ? { rid: msg.rid as string } : {}), text: (msg.heard as string) ?? '' });
           if (aside?.cutting) finishAside('aside');
         }
         return;
@@ -1341,13 +1343,11 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
         return;
       }
       if (msg.type === 'asr.open') {
-        // The user can be heard now: the agent opens the conversation.
-        const line = p.greeting.trim();
-        if (greeted || !line) return;
+        // The user can be heard now: the agent opens the conversation, unless they already spoke.
+        if (greeted || p.opening !== 'llm' || last || state !== 'listening') return;
         greeted = true;
-        decide('greet', { why: 'ASR connected' });
-        ctx.emit('turn', { type: 'turn.greet', text: line });
-        ctx.emit('text', { type: 'bc.say', id: `${ctx.id}-greet`, line, take: line, tailMs: 150, why: 'greeting' });
+        decide('open', { why: 'ASR connected' });
+        ctx.emit('turn', { type: 'turn.open' });
         return;
       }
       const text = ((msg.text as string) ?? '').trim();
@@ -1394,8 +1394,6 @@ export const duplexTurnNode: NodeDef<DuplexParams> = {
       start() {
         // Render the back-off lines ahead, so one plays at once when needed.
         if (p.bargeIn && p.backoffAfter > 0 && yieldLines.length) ctx.emit('text', { type: 'bc.lines', lines: yieldLines.flatMap((l) => takes(l, 3)) });
-        const greeting = p.greeting.trim();
-        if (greeting) ctx.emit('text', { type: 'bc.lines', lines: [greeting] });
       },
       onInput(port, msg) {
         handle(port, msg);

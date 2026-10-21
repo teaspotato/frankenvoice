@@ -162,7 +162,7 @@ describe('the interjection gate', () => {
 });
 
 describe('the LLM on interjection checks', () => {
-  const params = { model: 'm', system: 'sys', utterances: 'plain' };
+  const params = { model: 'm', system: 'sys', utterances: 'plain', liveContext: false };
   const tok = (text: string) => ({ choices: [{ index: 0, delta: { content: text } }] });
   const messages = (r: Json) => (r as { body: { messages: { role: string; content: string }[] } }).body.messages.map((m) => m.content);
   const check = (text: string) => ({ type: 'interject.check', checkId: 'c0', text, prompt: '[cut in? else [listen]]', pass: '[listen]' });

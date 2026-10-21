@@ -126,7 +126,7 @@ describe('paced LLM', () => {
   const stop = (why: string) => ({ choices: [{ index: 0, delta: {}, finish_reason: why }] });
 
   it('writes a reply in granted chunks, continuing its text as the assistant turn', () => {
-    const h = harness(llmNode, { system: '', utterances: 'plain' });
+    const h = harness(llmNode, { system: '', utterances: 'plain', liveContext: false });
     h.send('sched', { type: 'sched.config', pace: true, firstTokens: 4 });
     h.send('turn', { type: 'turn.user', turnId: 'u0', text: 'Hi' });
     const body = (i: number) => (h.ios[i].request as { body: { max_tokens: number; messages: Json[] } }).body;
@@ -151,7 +151,7 @@ describe('paced LLM', () => {
   });
 
   it('caps a draft at the first burst and paces it once it is kept', () => {
-    const h = harness(llmNode, { system: '', utterances: 'plain' });
+    const h = harness(llmNode, { system: '', utterances: 'plain', liveContext: false });
     h.send('sched', { type: 'sched.config', pace: true, firstTokens: 2 });
     h.send('turn', { type: 'turn.draft', draftId: 'd0', text: 'Hi' });
     expect((h.ios[0].request as { body: { max_tokens: number } }).body.max_tokens).toBe(2);

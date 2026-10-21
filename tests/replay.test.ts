@@ -116,13 +116,31 @@ describe('record and replay', () => {
     const g = testGraph();
     Object.assign(g.nodes.find((n) => n.id === 'llm')!.params, { model: 'some/model' });
     const run = await recordLive(800, performance, g);
-    const opened = run.events.find((e) => e.kind === 'io.open' && e.node === 'llm')!;
-    expect((opened.data as { channel: string }).channel).toBe('openai');
+    const opened = run.events.find((e) => e.kind === 'io.open' && e.node === 'llm' && (e.data as { channel: string }).channel === 'openai')!;
     expect((opened.data as { request: { body: { model: string } } }).request.body.model).toBe('some/model');
     const deltas = run.events.filter((e) => e.kind === 'msg' && (e.data as { type: string }).type === 'llm.delta');
     expect(deltas.length).toBeGreaterThan(0);
     const { runtime, sim } = prepareReplay(run, { registry });
     sim.runFast();
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 10_000);
+
+  it('has the LLM open the call with the live context in its system prompt, and replays it exactly', async () => {
+    const c = testConfig();
+    c.turn.params['full-duplex'] = { yieldWithinMs: 0, opening: 'llm' };
+    const run = await recordLive(800, performance, buildGraph(c));
+    const msgs = run.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; opening?: boolean });
+    expect(msgs.findIndex((m) => m.type === 'turn.open')).toBeGreaterThan(msgs.findIndex((m) => m.type === 'asr.open'));
+    expect(msgs.some((m) => m.type === 'llm.start' && m.opening)).toBe(true);
+    const opens = run.events.filter((e) => e.kind === 'io.open' && e.node === 'llm').map((e) => e.data as { channel: string; request: { body?: { messages: { role: string; content: string }[] } } });
+    expect(opens[0].channel).toBe('clock');
+    const first = opens.find((o) => o.channel === 'openai')!.request.body!.messages;
+    expect(first.map((m) => m.role)).toEqual(['system', 'user', 'assistant']);
+    expect(first[0].content).toContain("- The call started on Wednesday, 21 October 2026 at 13:12, the user's local time (time zone Europe/Berlin, GMT+02:00).");
+    expect(count(run, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
+    const { runtime, sim } = prepareReplay(decodeBundle(encodeBundle(run)), { registry });
+    sim.runFast();
+    expect(count(runtime.trajectory, (e) => e.kind === 'io.diverge')).toBe(0);
     expect(runtime.trajectory.events).toEqual(run.events);
   }, 10_000);
 
@@ -150,7 +168,7 @@ describe('record and replay', () => {
     const msgs = run.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; gen?: boolean });
     expect(msgs.map((m) => m.type)).toContain('llm.bc');
     expect(msgs.some((m) => m.type === 'bc.say' && m.gen)).toBe(true);
-    const asks = run.events.filter((e) => e.kind === 'io.open' && e.node === 'llm' && (e.data as { request: { body: { id_slot?: number } } }).request.body.id_slot === 1);
+    const asks = run.events.filter((e) => e.kind === 'io.open' && e.node === 'llm' && (e.data as { request: { body?: { id_slot?: number } } }).request.body?.id_slot === 1);
     expect(asks.length).toBeGreaterThan(0);
     expect(msgs.some((m) => m.type === 'playback.cue')).toBe(true);
     expect(count(run, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);

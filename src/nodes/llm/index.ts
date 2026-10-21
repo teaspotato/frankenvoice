@@ -1,6 +1,7 @@
 import type { NodeDef } from "../../core/node";
 import type { Json, JsonObject, Msg } from "../../core/types";
 import { openaiCompatAdapter as adapter } from "./openai";
+import { clockInfo, contextBlock } from "./context";
 import type { ChatTurn, LlmStreamParser } from "./types";
 import {
   rawPrefix,
@@ -76,6 +77,9 @@ const CHECK_MAX_TOKENS = 300;
 const DEFAULT_SYSTEM =
   "You are a voice assistant in a live spoken conversation. Your words are converted to speech, so answer in short, natural spoken sentences. No markdown, lists, or emoji.";
 
+export const DEFAULT_OPEN_PROMPT =
+  "(The call has just connected and the user is listening. You speak first: greet them in a sentence or two, warm and natural, the way you would at this time of day. Don't say you're an AI and don't list what you can do.)";
+
 /**
  * Streams a reply for each user turn and keeps the conversation, over an
  * OpenAI-compatible endpoint (llama.cpp on the GPU box). The request (full
@@ -90,6 +94,14 @@ const DEFAULT_SYSTEM =
  * streams as usual. Any other turn, a new draft or a drop discards it.
  *
  * The first sign of reasoning in a reply (reasoning tokens) is emitted as `llm.thinking`, for the opener stage to fill the wait with.
+ *
+ * Live context: at start the node asks the `clock` channel for the wall clock and the user's time zone
+ * and language once, and adds when the call started to the end of the system prompt. It is written once,
+ * so every request of the session has the same prompt and the cache holds; a replay gets the recorded answer.
+ *
+ * A `turn.open` (the user can hear us, and nobody has spoken) has the model open the call: a reply
+ * to the opening prompt, as a user turn that only this request sees (`llm.start` with `opening`).
+ * The history keeps just the agent's words, as if it spoke first.
  *
  * An `interject.check` (the user's words so far, while they still talk) asks
  * whether to cut in: a request like a draft's, with the check's prompt after
@@ -163,6 +175,22 @@ export const llmNode: NodeDef = {
       default: DEFAULT_SYSTEM,
     },
     {
+      key: "liveContext",
+      label: "Live context",
+      type: "boolean",
+      default: true,
+      description:
+        "Add the date, time and time zone the call started at (from the user's browser) and their language to the end of the system prompt, once per session, so the cache holds.",
+    },
+    {
+      key: "openPrompt",
+      label: "Opening prompt",
+      type: "text",
+      default: DEFAULT_OPEN_PROMPT,
+      description:
+        "When turn-taking asks the agent to open the call, the model answers this, sent as the user's turn of that one request (the history keeps only the agent's words).",
+    },
+    {
       key: "utterances",
       label: "Utterances",
       type: "select",
@@ -198,21 +226,24 @@ export const llmNode: NodeDef = {
   ],
   channels: [
     { name: "openai", description: "Chat Completions SSE (parsed data lines)" },
+    {
+      name: "clock",
+      description:
+        "Once at start: the wall clock and the user's time zone and language",
+    },
   ],
   requires: () => ["llm"],
   create(ctx) {
     const p = ctx.params as JsonObject;
     /** Replies and drafts run on their slot; interjection checks on any. */
     const tagged = p.utterances === "tagged";
+    const baseSystem = tagged
+      ? `${String(p.system ?? "")}\n\n${String(p.tagPrompt ?? "")}`.trim()
+      : String(p.system ?? "");
     const reqParams: JsonObject = {
       ...p,
       idSlot: Number(p.slot ?? -1),
-      ...(tagged
-        ? {
-            system:
-              `${String(p.system ?? "")}\n\n${String(p.tagPrompt ?? "")}`.trim(),
-          }
-        : {}),
+      system: baseSystem,
     };
     const history: ChatTurn[] = [];
     let n = 0;
@@ -249,6 +280,8 @@ export const llmNode: NodeDef = {
       waiting?: boolean;
       /** The text so far ends in whitespace the continuation's prompt left out: drop it from the next delta. */
       trimNext?: boolean;
+      /** The agent opens the call: `user` is the opening prompt, which the history never keeps. */
+      opening?: boolean;
       /** An interjection check: its id, the pass reply, and the verdict once known. */
       checkId?: string;
       pass?: string;
@@ -625,6 +658,28 @@ export const llmNode: NodeDef = {
       send(r, [...history], reqParams, pace?.firstTokens);
     };
 
+    /** Nobody has spoken yet: the model opens the call. */
+    const openCall = () => {
+      if (history.length || active) return;
+      dropDraft("the agent opens the call");
+      const user: ChatTurn = {
+        role: "user",
+        text: String(p.openPrompt ?? "").trim(),
+      };
+      if (!user.text) return;
+      const r = reply(user, { opening: true });
+      ctx.emit("text", {
+        type: "llm.start",
+        rid: r.rid,
+        turnId: null,
+        opening: true,
+      });
+      ctx.setState("status", "generating");
+      active = r;
+      r.live = true;
+      send(r, [user], reqParams, pace?.firstTokens);
+    };
+
     /** The scheduler lets a paced reply write `tokens` more: continue its text. */
     const grant = (tokens: number) => {
       const r = active;
@@ -635,7 +690,7 @@ export const llmNode: NodeDef = {
       r.trimNext = prefix !== r.raw;
       send(
         r,
-        [...history, { role: "assistant", text: prefix }],
+        [...(r.opening ? [r.user] : history), { role: "assistant", text: prefix }],
         reqParams,
         tokens,
       );
@@ -738,6 +793,27 @@ export const llmNode: NodeDef = {
     };
 
     return {
+      start() {
+        if (p.liveContext === false) return;
+        // Once: the wall clock and the user's time zone, for the system prompt.
+        ctx.io.open(
+          "clock",
+          {},
+          {
+            onRecv(data) {
+              const c = clockInfo(data);
+              if (!c) return;
+              const block = contextBlock(c);
+              reqParams.system = `${baseSystem}\n\n${block}`.trim();
+              ctx.setState("context", block);
+            },
+            onClose(data) {
+              if ((data as JsonObject | null)?.error)
+                ctx.log("warn", "no live context", data);
+            },
+          },
+        );
+      },
       onInput(port, msg) {
         if (port === "bc") {
           if (msg.type === "bc.ask") askBc(msg);
@@ -812,12 +888,8 @@ export const llmNode: NodeDef = {
           );
           return;
         }
-        if (msg.type === "turn.greet") {
-          // The agent spoke first: its line opens the transcript, tagged like a reply when replies are.
-          const text = String(msg.text ?? "").trim();
-          if (text && !history.length)
-            history.push({ role: "assistant", text: tagged ? `[i1g1] ${text}` : text });
-          ctx.setState("turns", history.length);
+        if (msg.type === "turn.open") {
+          if (reqParams.model) openCall();
           return;
         }
         if (msg.type !== "turn.user") return;
