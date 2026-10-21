@@ -66,12 +66,6 @@ export interface InterjectCheck extends Span {
   taken?: boolean;
 }
 
-/** A filler the opener stage said while the model was thinking: from the reply's start to when it was said. */
-export interface Opener extends Span {
-  rid: string;
-  why?: string;
-}
-
 export interface AudioBlock {
   t: number;
   peaks: Float32Array;
@@ -140,7 +134,6 @@ export class TimelineModel {
   /** Cuts on the tape: words written but never heard, taken off it. */
   tapeCuts: (Marker & { unsaid: string[] })[] = [];
   drafts: Draft[] = [];
-  openers: Opener[] = [];
   /** TypeSafe's answers on whether the user's words so far end on something complete. */
   interjectGates: (Marker & { go: boolean; failed?: boolean; confidence?: number; ms: number })[] = [];
   interjectChecks: InterjectCheck[] = [];
@@ -465,11 +458,6 @@ export class TimelineModel {
       case 'llm.draft':
         this.drafts.push({ rid: d.rid, t0: e.t, text: d.text ?? '', seqs: [e.seq] });
         break;
-      case 'opener.say': {
-        const l = this.llm.find((x) => x.rid === d.rid);
-        this.openers.push({ rid: d.rid, t0: l?.t0 ?? e.t, t1: e.t, text: d.line ?? '', why: d.reason, seqs: [e.seq] });
-        break;
-      }
       case 'llm.thinking': {
         const l = this.llm.find((x) => x.rid === d.rid);
         if (l) {

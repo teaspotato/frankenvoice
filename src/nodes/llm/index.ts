@@ -17,7 +17,7 @@ const norm = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
 
 /**
  * The part of `heard` that is the start of `reply`: what was said before the
- * reply's own words (a filler from the opener stage) is cut off. Heard text is
+ * reply's own words (anything else said on the same audio) is cut off. Heard text is
  * whole words of what was spoken, so a suffix of it matches a prefix of the reply
  * (empty when none of the reply was heard).
  */
@@ -89,7 +89,7 @@ const DEFAULT_SYSTEM =
  * ordinary reply (llm.start with `draft`, then its deltas) and the rest
  * streams as usual. Any other turn, a new draft or a drop discards it.
  *
- * The first sign of reasoning in a reply (reasoning tokens) is emitted as `llm.thinking`, for the opener stage to fill the wait with.
+ * The first sign of reasoning in a reply (reasoning tokens) is emitted as `llm.thinking`.
  *
  * An `interject.check` (the user's words so far, while they still talk) asks
  * whether to cut in: a request like a draft's, with the check's prompt after
@@ -795,7 +795,7 @@ export const llmNode: NodeDef = {
               ? [first]
               : [];
           if (!at.length) return;
-          // Anything said before the reply's own words (an opener the model never knew of) is not part of it.
+          // Anything said before the reply's own words is not part of it.
           const heard = heardOfReply(
             ((msg.text as string) ?? "").trim(),
             at.map((i) => visibleText(history[i].text)).join(" "),

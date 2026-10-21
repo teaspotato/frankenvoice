@@ -9,7 +9,7 @@ import type { Json } from './core/types';
 import { registry } from './nodes';
 import { micProcessing } from './nodes/cleanup';
 
-export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'interject' | 'backchannel' | 'llm' | 'opener' | 'tts' | 'speaker' | 'sched';
+export type StageId = 'mic' | 'cleanup' | 'vad' | 'turnmodel' | 'asr' | 'turn' | 'interject' | 'backchannel' | 'llm' | 'tts' | 'speaker' | 'sched';
 
 export interface StageDef {
   id: StageId;
@@ -39,7 +39,6 @@ export const STAGES: StageDef[] = [
   { id: 'interject', label: 'Interjection', variants: { off: 'interject.off', typesafe: 'interject' } },
   { id: 'backchannel', label: 'Backchannels', variants: { on: 'backchannel', off: 'backchannel.off' } },
   { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
-  { id: 'opener', label: 'Opener', variants: { filler: 'opener.filler', typesafe: 'opener.choice', off: 'opener.off' } },
   { id: 'tts', label: 'TTS', variants: { 'kyutai-gpubox': 'tts.kyutai', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
   { id: 'sched', label: 'Scheduler', variants: { tick: 'sched' } },
@@ -92,7 +91,6 @@ const COLUMN: Record<StageId, [number, number]> = {
   interject: [630, 200],
   backchannel: [840, 20],
   llm: [840, 110],
-  opener: [840, 200],
   tts: [1050, 110],
   speaker: [1260, 110],
   sched: [1050, 200],
@@ -102,7 +100,7 @@ const e = (from: string, fp: string, to: string, tp: string): EdgeSpec => ({ fro
 
 /**
  * The fixed topology: mic → noise/echo cleanup → VAD + turn model + ASR → turn-taking → LLM → TTS → speaker,
- * the opener watching the LLM and speaking through TTS too, with playback fed back to turn-taking and what was played to the turn model (the agent's channel),
+ * with playback fed back to turn-taking and what was played to the turn model (the agent's channel),
  * and the tick scheduler pacing the LLM by the TTS queue and playback.
  */
 export function buildGraph(c: PipelineConfig): GraphSpec {
@@ -149,10 +147,6 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
       ? [e('backchannel', 'ask', 'llm', 'bc'), e('llm', 'text', 'backchannel', 'llm')]
       : []),
     e('llm', 'text', 'tts', 'text'),
-    e('llm', 'text', 'opener', 'text'),
-    // The opener may pick its line from the user's words.
-    e('turn', 'turn', 'opener', 'turn'),
-    e('opener', 'text', 'tts', 'text'),
     ...(registry[stageType(c, 'turn')].outputs.some((p) => p.name === 'text') ? [e('turn', 'text', 'tts', 'text')] : []),
     e('tts', 'audio', 'speaker', 'audio'),
     e('speaker', 'playback', 'turn', 'playback'),

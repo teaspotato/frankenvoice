@@ -66,12 +66,11 @@ describe('pipeline format', () => {
     expect(buildGraph(defaultConfig()).nodes.find((n) => n.id === 'tts')?.type).toBe('tts.kyutai');
   });
 
-  it('runs the opener stage between the LLM and TTS', () => {
+  it('has no opener stage: the LLM speaks through TTS directly', () => {
     const g = buildGraph(defaultConfig());
-    expect(g.nodes.find((n) => n.id === 'opener')?.type).toBe('opener.filler');
+    expect(g.nodes.some((n) => n.id === 'opener' || n.type.startsWith('opener.'))).toBe(false);
     const to = (from: string) => g.edges.filter((x) => x.from.node === from && x.from.port === 'text').map((x) => x.to.node);
-    expect(to('llm')).toEqual(['interject', 'backchannel', 'tts', 'opener', 'sched']);
-    expect(to('opener')).toEqual(['tts']);
+    expect(to('llm')).toEqual(['interject', 'backchannel', 'tts', 'sched']);
   });
 });
 

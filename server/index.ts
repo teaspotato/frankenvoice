@@ -58,8 +58,8 @@ const SETTINGS: SettingDef[] = [
     hint: 'e.g. http://127.0.0.1:8103/v1 (llama.cpp on the GPU box), or any local server: vLLM, Ollama, LM Studio',
   },
   { name: 'OPENAI_COMPAT_API_KEY', group: 'LLM (OpenAI-compatible)', label: 'API key (optional)', secret: true },
-  { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'API key', secret: true },
-  { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (opener, backchannels, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
+  { name: 'TYPESAFE_API_KEY', group: 'TypeSafe (backchannels, end of turn, interjection gate)', label: 'API key', secret: true },
+  { name: 'TYPESAFE_BASE_URL', group: 'TypeSafe (backchannels, end of turn, interjection gate)', label: 'Base URL', default: 'https://api.typesafe.ai' },
   { name: 'FV_SESSIONS_DIR', group: 'Storage', label: 'Sessions folder', default: 'sessions', hint: 'Relative to where the proxy runs' },
   {
     name: 'FV_MAX_SESSIONS',

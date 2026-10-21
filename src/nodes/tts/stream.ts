@@ -148,7 +148,7 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
         for (const m of q) ctx.emit('audio', m);
       }
     };
-    /** Opener lines (fillers), synthesized ahead so they play at once. */
+    /** Canned lines (backchannels, greetings), synthesized ahead so they play at once. */
     const canned = new Map<string, Float32Array[]>();
 
     const decoder = () => {
@@ -294,17 +294,6 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
         if (all) break;
       }
       if (end) r.io.send({ type: 'Close' });
-    };
-
-    /** Play a canned line's audio as the reply's next segment, without a request. */
-    const playCanned = (r: Reply, text: string) => {
-      const audio = canned.get(text);
-      if (!audio || r.segs.length) return false;
-      const s: Seg = { seg: r.segNo++, text, started: false };
-      emitAudio(r, s, new Float32Array());
-      for (const a of audio) emitAudio(r, s, a);
-      out(r, { type: 'tts.segment_end', rid: r.rid, seg: s.seg, canned: true });
-      return true;
     };
 
     /** A backchannel: a rendered line played as a cue, outside any reply. */
@@ -522,7 +511,6 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
             if (r.buf.trim()) send(r, true, false);
             r.flags = { interruptible: msg.interruptible !== false, gate: msg.gate !== false };
             break;
-          case 'opener.lines':
           case 'bc.lines':
             prerender(msg.lines as string[]);
             break;
@@ -555,14 +543,10 @@ export const kyutaiTtsNode: NodeDef<StreamParams> = {
             playCue(msg.id as string, text, Number(msg.tailMs ?? 0));
             break;
           }
-          case 'opener.say':
           case 'llm.delta': {
             if (!r || r.rid !== msg.rid) return;
-            const opener = msg.type === 'opener.say';
-            if (opener && !r.buf && playCanned(r, (msg.text as string).trim())) return;
             r.buf += msg.text as string;
-            // An opener is said as soon as it arrives, whatever its punctuation; the reply follows it.
-            send(r, opener, false);
+            send(r, false, false);
             break;
           }
           case 'llm.end':

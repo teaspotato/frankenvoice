@@ -18,7 +18,6 @@ export const LANES: Lane[] = [
   { id: 'turn', label: 'Turn', height: 52 },
   { id: 'interject', label: 'Interject', height: 32 },
   { id: 'llm', label: 'LLM', height: 60 },
-  { id: 'opener', label: 'Opener', height: 28 },
   { id: 'tts', label: 'TTS', height: 36 },
   { id: 'speaker', label: 'Playback', height: 48 },
 ];
@@ -36,8 +35,6 @@ const LEGEND: Record<string, string> = {
   interject:
     'Early interjection. Dots: TypeSafe judging the user\'s words so far (grey: still going; green: they just completed something). Outlined bar: an "interrupt?" check with the LLM on those words, until it decided (grey: let them go on) or was dropped. Accent diamond: the LLM wanted to cut in (its line next to it); a line from there to where it was taken at the user\'s pause (accent tick: it took the floor and played; red tick: turn-taking refused it; grey tick: taken, but the LLM could not keep it).',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
-  opener:
-    'Orange: the wait before a filler ("Let me see."), from the reply starting to the filler being said (diamond), because the model was still thinking. The LLM never knows of it.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the TTS server.',
   speaker:
     'Agent audio as scheduled to play. Shaded: one playback; a red line ends an interrupted one. Diamonds at the top: sentence starts. Amber band at the top: the agent cut off (or ducked) until what the user said over it was judged. Red dot on a stub: the page stopped playback on its own VAD (page gate). Accent boxes: backchannels said while the user talked; small grey dots near the bottom: backchannels held back (hover for why).',
@@ -866,31 +863,6 @@ export function Dashboard({
             ? `the LLM lets them go on (${ms} ms)`
             : `${c.status ?? 'asking…'}${c.why ? ` (${c.why})` : ''} after ${ms} ms`;
         hits.push({ lane: 'interject', x0, x1: Math.max(x1 + 4, c.takeAt !== undefined ? x(c.takeAt) + 3 : 0), y0: ly0 + h * 0.36, y1: ly1, text: `interrupt? check: ${outcome}\non: ${c.text}`, seqs: c.seqs });
-      });
-
-      // Opener: the wait a filler was said after, and a diamond when it was said
-      m.openers.forEach((o, i) => {
-        const end = o.t1 ?? head;
-        if (end < t0 || o.t0 > t1) return;
-        const [ly0, ly1] = laneY.opener;
-        const h = ly1 - ly0;
-        const x0 = x(o.t0);
-        const x1 = Math.max(x(end), x0 + 2);
-        g.globalAlpha = 0.25;
-        g.fillStyle = col.warn;
-        g.fillRect(x0, ly0 + h * 0.3, x1 - x0, h * 0.4);
-        g.globalAlpha = 1;
-        mark('opener', end, col.warn, 0.5, 'diamond', 4);
-        const next = m.openers[i + 1];
-        label(o.text, x1 + 6, Math.min(x1 + 200, next ? x(next.t0) - 3 : Infinity), ly0 + h * 0.5, col.warn);
-        const ms = (end - o.t0).toFixed(0);
-        hits.push({
-          lane: 'opener',
-          x0,
-          x1: x1 + 4,
-          text: `filler "${o.text}", said ${ms} ms after the reply started${o.why ? `\n${o.why}` : ''}`,
-          seqs: o.seqs,
-        });
       });
 
       // LLM: waiting for the first token, then generating; below, each chunk at its arrival
