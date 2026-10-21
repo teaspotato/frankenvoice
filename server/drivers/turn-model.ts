@@ -1,5 +1,5 @@
 // The ssl_turn turn-taking model on onnxruntime-node (CPU). A model is downloaded once (cached in
-// the models folder), compiled once, and kept across sessions; each session resets its stream.
+// the models folder), compiled once, and kept across sessions; each session streams on its own state.
 
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
@@ -24,10 +24,11 @@ type Msg = { type: string; [k: string]: Json };
 
 interface Model {
   load: TurnModelLoad;
+  /** The compiled model; each session forks its own stream from it. */
   stream: Promise<TurnStream>;
-  /** The session using it gets its messages. */
-  session?: (m: Msg) => void;
-  /** Inference and resets, one at a time. */
+  /** The sessions waiting for it get its load messages. */
+  sessions: Set<(m: Msg) => void>;
+  /** Inference, one block at a time across sessions. */
   chain: Promise<void>;
 }
 
@@ -73,10 +74,10 @@ function start(dir: string, r: TurnModelRequest): Model {
   const key = keyOf(r);
   const existing = models.get(key);
   if (existing) return existing;
-  const m: Model = { load: { state: 'loading' }, stream: null!, chain: Promise.resolve() };
+  const m: Model = { load: { state: 'loading' }, stream: null!, sessions: new Set(), chain: Promise.resolve() };
   const post = (msg: Msg) => {
     if (msg.type === 'progress' || msg.type === 'status') m.load = { state: 'loading', last: msg };
-    m.session?.(msg);
+    for (const f of m.sessions) f(msg);
   };
   m.stream = (async () => {
     const enc = await fetchCached(dir, r.encoderUrl, 'encoder', post);
@@ -113,45 +114,45 @@ export const turnModelDriver =
   (req, sink) => {
     const m = start(dir, req as unknown as TurnModelRequest);
     let closed = false;
-    let ready = false;
+    /** This session's stream, forked from the compiled model once it is ready. */
+    let s: TurnStream | null = null;
     let backlog = 0;
     const fail = (error: string) => {
       if (closed) return;
       closed = true;
-      if (m.session === onMsg) m.session = undefined;
+      m.sessions.delete(onMsg);
       sink.close({ error });
     };
-    const onMsg = (msg: Msg) => !closed && !ready && sink.recv(msg);
-    // A second session on the same model (a replay alongside) takes it over.
-    m.session = onMsg;
+    const onMsg = (msg: Msg) => !closed && !s && sink.recv(msg);
+    m.sessions.add(onMsg);
     if (m.load.state === 'ready') setTimeout(() => !closed && sink.recv({ type: 'status', text: 'preloaded' }), 0);
     else if (m.load.last) {
       const last = m.load.last;
-      setTimeout(() => !closed && !ready && sink.recv(last), 0);
+      setTimeout(() => !closed && !s && sink.recv(last), 0);
     }
     m.chain = m.chain.then(async () => {
-      let s: TurnStream;
+      let base: TurnStream;
       try {
-        s = await m.stream;
+        base = await m.stream;
       } catch {
         return fail(m.load.error ?? 'turn model failed');
       }
       if (closed) return;
-      s.reset();
-      ready = true;
+      m.sessions.delete(onMsg);
+      s = base.fork();
       sink.recv({ type: 'ready', ep: 'cpu', frames: (req as unknown as TurnModelRequest).frames, threads: 0 });
     });
     return {
       send(_data, bin) {
-        if (closed || !bin || !ready) return;
+        const own = s;
+        if (closed || !bin || !own) return;
         if (++backlog > MAX_BACKLOG) return fail(`the turn model can't keep up (over ${MAX_BACKLOG} blocks behind)`);
         const x = new Float32Array(bin.slice().buffer);
         m.chain = m.chain.then(async () => {
           if (closed) return;
-          const s = await m.stream;
           const t = performance.now();
           try {
-            const outs = await s.push(x.slice(0, x.length / 2), x.slice(x.length / 2));
+            const outs = await own.push(x.slice(0, x.length / 2), x.slice(x.length / 2));
             backlog--;
             if (outs.length && !closed) sink.recv({ type: 'frames', outs: outs as unknown as Json, ms: Math.round(performance.now() - t), backlog });
           } catch (e) {
@@ -161,7 +162,7 @@ export const turnModelDriver =
       },
       close() {
         closed = true;
-        if (m.session === onMsg) m.session = undefined;
+        m.sessions.delete(onMsg);
       },
     };
   };
