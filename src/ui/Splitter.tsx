@@ -11,6 +11,8 @@ export interface Layout {
   logOpen: boolean;
   /** Whether the side panel (stage settings, sessions) is shown. */
   sideOpen: boolean;
+  /** What the bottom panel shows: the event log, or the Tape inspector. */
+  logTab: 'events' | 'tape';
 }
 
 const LAYOUT_KEY = 'frankenvoice.layout';
@@ -20,6 +22,7 @@ export const DEFAULT_LAYOUT: Layout = {
   side: 330,
   logOpen: false,
   sideOpen: true,
+  logTab: 'events',
 };
 type Size = 'diagram' | 'log' | 'side';
 const MIN: Record<Size, number> = { diagram: 80, log: 60, side: 220 };

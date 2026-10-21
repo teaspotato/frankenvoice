@@ -3,6 +3,7 @@ import type { Json, JsonObject, Msg } from '../core/types';
 import {
   ACTIONS,
   AGENT_BACKCHANNELS,
+  actionOdds,
   EXAMPLE_TAPE,
   PROMPTS,
   WORD_S,
@@ -38,6 +39,7 @@ interface TapeParams {
   stableWords: boolean;
   slot: number;
   temperature: number;
+  nProbs: number;
   greeting: string;
 }
 
@@ -84,8 +86,9 @@ interface Call {
  * never heard leave the tape. Calls are skipped when the grammar would leave no choice (speaking with
  * a full TTS queue), while a call is still out, and in long silences (`idleCells`).
  *
- * Every cell is emitted as `tape.cell` (the line as written, the call's latency and timings), every
- * cut as `tape.cut`, so the dashboard shows the tape as it is written.
+ * Every cell is emitted as `tape.cell` (the line as written, the call's latency, timings, its xid and
+ * Gemma's odds for each action), every cut as `tape.cut`, so the dashboard and the Tape inspector show
+ * the tape as it is written.
  */
 export const tapeTurnNode: NodeDef<TapeParams> = {
   type: 'turn.tape',
@@ -139,6 +142,13 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     { key: 'stableWords', label: 'Commit stable partial words', type: 'boolean', default: true, description: 'Put ASR partial words on the tape once a later partial repeats them (else only finals).' },
     { key: 'slot', label: 'llama.cpp slot', type: 'number', default: 0, description: 'id_slot for the tape’s calls (its prompt cache). -1: any.' },
     { key: 'temperature', label: 'Temperature', type: 'number', default: 0 },
+    {
+      key: 'nProbs',
+      label: 'Odds (top tokens)',
+      type: 'number',
+      default: 8,
+      description: 'llama.cpp n_probs: the alternatives Gemma weighed for each token it wrote, for the Tape inspector (its odds for each action). 0: off.',
+    },
     {
       key: 'greeting',
       label: 'Opening line',
@@ -314,6 +324,7 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
         cache_prompt: true,
         stop: ['\n'],
         ...(p.slot >= 0 ? { id_slot: p.slot } : {}),
+        ...(p.nProbs > 0 ? { n_probs: p.nProbs } : {}),
       };
       const k: Call = { cell: c, state: c.state, allowed, maxWords, t0: ctx.now(), io: undefined as unknown as Call['io'], spec: sp };
       call = k;
@@ -336,10 +347,13 @@ export const tapeTurnNode: NodeDef<TapeParams> = {
     /** What a call wrote, or null (and why) if it failed. */
     const read = (k: Call, error: Json) => {
       const timings = (k.res?.timings ?? null) as JsonObject | null;
+      const odds = actionOdds(k.res, k.allowed);
       const stats: JsonObject = {
         ms: Math.round(ctx.now() - k.t0),
         maxWords: k.maxWords,
         allowed: k.allowed,
+        xid: k.io.xid,
+        ...(odds ? { odds } : {}),
         ...(timings ? { promptN: timings.prompt_n ?? null, promptMs: timings.prompt_ms ?? null, predictedN: timings.predicted_n ?? null, predictedMs: timings.predicted_ms ?? null } : {}),
       };
       ctx.setState('lastMs', stats.ms);
