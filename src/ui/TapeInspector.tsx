@@ -81,6 +81,7 @@ function Notes({ r }: { r: TapeRow }) {
   const out: ReactNode[] = [];
   if (r.forced) out.push(r.forced === 'idle' ? 'idle, no call' : `no call: ${r.forced}`);
   if (r.spec) out.push(r.spec === 'adopted' ? 'written ahead' : `written ahead, ${r.spec}`);
+  if (r.backstop) out.push(<span key="backstop" title="The user had been silent too long after words: the grammar allowed only respond">{r.backstop}</span>);
   if (r.late)
     out.push(
       <span key="late" className="warn" title="answered after its cell had ended">
@@ -418,8 +419,24 @@ function CallTime({ call, cellMs }: { call: TapeCall; cellMs: number }) {
   );
 }
 
+/**
+ * The odds the sampler chose from: each allowed action's first-token odds times e^bias, over the
+ * allowed actions (the grammar masks the rest). Only biases given as strings (" respond") map to actions.
+ */
+function afterBias(odds: Record<string, number>, bias: unknown): { odds: Record<string, number>; text: string } | null {
+  if (!Array.isArray(bias)) return null;
+  const by: Record<string, number> = {};
+  for (const b of bias) if (Array.isArray(b) && typeof b[0] === 'string' && typeof b[1] === 'number' && b[0].trim() in odds) by[b[0].trim()] = b[1];
+  if (!Object.keys(by).length) return null;
+  const w = Object.entries(odds).map(([a, p]) => [a, p * Math.exp(by[a] ?? 0)] as const);
+  const sum = w.reduce((x, [, v]) => x + v, 0);
+  if (!(sum > 0)) return null;
+  return { odds: Object.fromEntries(w.map(([a, v]) => [a, v / sum])), text: Object.entries(by).map(([a, b]) => `${b > 0 ? '+' : ''}${b} on ${a}`).join(', ') };
+}
+
 function CallDetail({ call, odds, allowed, chosen, cellMs }: { call: TapeCall; odds?: Record<string, number>; allowed?: string[]; chosen: string; cellMs: number }) {
   const [copied, setCopied] = useState(false);
+  const biased = odds ? afterBias(odds, call.body.logit_bias) : null;
   const res = call.response;
   const probs = res?.completion_probabilities ?? [];
   const first = probs[0]?.top_logprobs ?? [];
@@ -455,6 +472,15 @@ function CallDetail({ call, odds, allowed, chosen, cellMs }: { call: TapeCall; o
                 </div>
               ))}
           </div>
+          {biased && (
+            <p className="small">
+              <span className="muted">After the bias ({biased.text}), what it chose from: </span>
+              {Object.entries(biased.odds)
+                .sort((a, b) => b[1] - a[1])
+                .map(([a, p]) => `${a} ${pct(p)}`)
+                .join(' · ')}
+            </p>
+          )}
           {others.length > 0 && (
             <p className="small muted">
               Outside the grammar: {others.map((t) => `“${vis(t.token)}” ${pct(Math.exp(t.logprob))}`).join(' · ')}

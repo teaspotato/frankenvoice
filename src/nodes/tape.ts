@@ -256,6 +256,30 @@ export function promptHead(system: string, example: string, earlier = ''): strin
   );
 }
 
+/** A cell where nothing happened: the user silent with no words, the agent silent and listening. */
+const idleCell = (c: Cell) => c.state === 'silent' && !c.voice && !c.user.length && c.action === 'listen' && !c.say.length;
+
+/**
+ * The tape as Gemma reads it: each finished run of idle cells cut to its first `keep` lines. A tape
+ * full of listen lines makes Gemma copy them and stop answering (pilot/stall-replay: P(respond) after
+ * a finished question went 0.10, 0.06, 0.01 as idle lines piled up, and back to 0.6-0.86 trimmed to 2).
+ * The run leading up to the cell being decided stays whole. keep <= 0: every line.
+ */
+export function trimIdle(cells: Cell[], keep: number): Cell[] {
+  if (keep <= 0 || cells.length < 2) return cells;
+  const out: Cell[] = [];
+  let run: Cell[] = [];
+  for (const c of cells.slice(0, -1)) {
+    if (idleCell(c)) {
+      run.push(c);
+      continue;
+    }
+    out.push(...run.slice(0, keep), c);
+    run = [];
+  }
+  return [...out, ...run, cells[cells.length - 1]];
+}
+
 /** The whole prompt for the last cell: the head, every earlier line, then the open field. */
 export function tapePrompt(head: string, cells: Cell[]): string {
   return head + cells.slice(0, -1).map((c) => `${line(c)}\n`).join('') + prefix(cells[cells.length - 1]);

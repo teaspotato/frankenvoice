@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EXAMPLE_TAPE, PROMPTS, actionOdds, cutTape, grammar, headroom, line, newCell, parseAction, promptHead, tapePrompt, timed, type Cell, type TapeState } from '../src/nodes/tape';
+import { EXAMPLE_TAPE, PROMPTS, actionOdds, cutTape, grammar, headroom, line, newCell, parseAction, promptHead, tapePrompt, timed, trimIdle, type Cell, type TapeState } from '../src/nodes/tape';
 import { noPeriods, tapeTurnNode } from '../src/nodes/turn-tape';
 import { harness } from './node-harness';
 import type { Json, Msg } from '../src/core/types';
@@ -87,6 +87,15 @@ describe('the tape format', () => {
     const again = bargeIn();
     cutTape(again, sent, 0);
     expect(line(again[9])).toBe('  6.40 | user: (silent) | agent (silent): respond "[cut]"');
+  });
+
+  it('cuts each finished run of idle cells to its first lines, and keeps the run before the open cell', () => {
+    const idle = (n: number) => newCell(n, n * 0.64, 'silent');
+    const heard = (n: number, ...user: string[]) => newCell(n, n * 0.64, 'silent', user, true);
+    const answer = Object.assign(newCell(6, 3.84, 'silent'), { action: 'respond', say: ['Sure'] });
+    const tape = [heard(0, 'hi'), idle(1), idle(2), idle(3), idle(4), heard(5, 'so'), answer, idle(7), idle(8), idle(9), newCell(10, 6.4, 'silent')];
+    expect(trimIdle(tape, 2).map((c) => c.n)).toEqual([0, 1, 2, 5, 6, 7, 8, 9, 10]);
+    expect(trimIdle(tape, 0)).toBe(tape);
   });
 
   it('builds the prompt in Gemma 4 chat format, the live tape as the model’s own turn', () => {
@@ -193,6 +202,45 @@ describe('the tape stage', () => {
     expect((off.ios.at(-1)!.request as { body: Record<string, unknown> }).body).not.toHaveProperty('n_probs');
     off.answer(' listen');
     expect(off.cells().at(-1)).not.toHaveProperty('odds');
+  });
+
+  it('biases respond in silent cells, trims finished idle runs, and answers after a long silence', () => {
+    const h = run();
+    const body = () => (h.ios.at(-1)!.request as { body: Record<string, unknown> }).body;
+    h.send(100, 'transcript', { type: 'asr.final', text: 'hello', start: 0, end: 1 });
+    h.advance(640);
+    expect(body().logit_bias).toEqual([[' respond', 2.2]]);
+    h.answer(' respond "Hi"');
+    h.advance(1280);
+    // Speaking: no bias.
+    expect(body()).not.toHaveProperty('logit_bias');
+    h.answer(' finish');
+    for (let n = 3; n <= 6; n++) {
+      h.advance(n * 640);
+      h.answer(' listen');
+    }
+    h.send(6 * 640 + 100, 'transcript', { type: 'asr.final', text: 'tell me more', start: 0, end: 1 });
+    h.advance(7 * 640);
+    h.answer(' listen');
+    // The idle run 1.92 to 3.84 is finished: its first two lines stay.
+    h.advance(8 * 640);
+    expect(h.prompt().split('<channel|>')[1].split('\n').map((l) => l.slice(0, 6))).toEqual(['  0.64', '  1.28', '  1.92', '  2.56', '  4.48', '  5.12']);
+    h.answer(' listen');
+    // Words, then silence: after 3 s (5 cells) only respond is allowed.
+    for (let n = 9; n <= 11; n++) {
+      h.advance(n * 640);
+      expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " respond " say | " backchannel " bc');
+      h.answer(' listen');
+    }
+    h.advance(12 * 640);
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " respond " say');
+    expect(body()).not.toHaveProperty('logit_bias');
+    h.answer(' respond "Sure, what about"');
+    expect(h.cells().at(-1)).toMatchObject({ action: 'respond', backstop: 'answer after silence' });
+    // Off.
+    const off = run({ respondBias: 0, idleKeep: 0, answerAfterS: 0 });
+    off.advance(640);
+    expect((off.ios.at(-1)!.request as { body: Record<string, unknown> }).body).not.toHaveProperty('logit_bias');
   });
 
   it('skips the call while one is out, and while the TTS queue is full', () => {
