@@ -19,6 +19,19 @@ import type { Json, TrajEvent } from '../src/core/types';
 import { frame, unframe, type Header } from '../src/live-protocol';
 import { serverDrivers, sessionTitle, type Upstreams } from './drivers';
 
+/** The largest message a visitor (no host token) may send; bigger ones are dropped. */
+export const VISITOR_MAX_MESSAGE = 64 * 1024;
+/** The largest message the host may send (a replay's session bundle). */
+export const HOST_MAX_MESSAGE = 512 * 1024 * 1024;
+/** Room in a mic frame for its header, beyond the requested samples. */
+const MIC_HEADER_SLACK = 1024;
+/** A visitor's mic may send up to this many times real time, plus a burst of `MIC_BURST_S` seconds of audio. */
+const MIC_MAX_SPEED = 2;
+const MIC_BURST_S = 2;
+/** Caps on a start's `env` (as JSON) and `title`. */
+const MAX_ENV_BYTES = 16 * 1024;
+const MAX_TITLE = 200;
+
 export interface LiveOptions {
   upstreams: Upstreams;
   sessionsDir(): string;
@@ -68,6 +81,11 @@ function titleToName(title: string): string {
 class Page {
   run: Run | null = null;
   micSink: Delivery | undefined;
+  /** The open mic's frame size and rate, for checking the frames the page sends. */
+  micReq: { frameSamples: number; sampleRate: number } | undefined;
+  /** Seconds of mic audio this page may still send now (a token bucket refilled at `MIC_MAX_SPEED` x real time). */
+  private micBudget = MIC_BURST_S;
+  private micAt = 0;
   speakers = new Map<number, Delivery>();
   private speakerSeq = 0;
   /** The server's drivers plus this page's mic and speaker. */
@@ -97,6 +115,13 @@ class Page {
       return { send() {}, close() {} };
     }
     this.micSink = sink;
+    const r = (req ?? {}) as { frameSamples?: unknown; sampleRate?: unknown };
+    this.micReq = {
+      frameSamples: typeof r.frameSamples === 'number' && r.frameSamples > 0 ? r.frameSamples : 512,
+      sampleRate: typeof r.sampleRate === 'number' && r.sampleRate > 0 ? r.sampleRate : 16000,
+    };
+    this.micBudget = MIC_BURST_S;
+    this.micAt = performance.now();
     this.send({ type: 'mic.open', request: req });
     return {
       send() {},
@@ -106,6 +131,23 @@ class Page {
       },
     };
   };
+
+  /**
+   * Whether a mic frame of `bytes` (whole message) may go to the run: no bigger than the requested frame, and for a
+   * visitor no faster than `MIC_MAX_SPEED` x real time.
+   */
+  micFrameOk(bytes: number, samples: number): boolean {
+    const r = this.micReq;
+    if (!r || bytes > r.frameSamples * 4 + MIC_HEADER_SLACK) return false;
+    if (this.host) return true;
+    const now = performance.now();
+    this.micBudget = Math.min(MIC_BURST_S, this.micBudget + ((now - this.micAt) / 1000) * MIC_MAX_SPEED);
+    this.micAt = now;
+    const s = samples / r.sampleRate;
+    if (s > this.micBudget) return false;
+    this.micBudget -= s;
+    return true;
+  }
 
   /** Renders the speaker's schedule in the page; each command carries the session clock when sent. */
   private speaker: LiveDriver = (_req, sink, env) => {
@@ -191,9 +233,15 @@ export class LiveHub {
       alive = false;
       ws.ping();
     }, this.o.heartbeatMs ?? 10_000);
+    let dropped = 0;
     ws.on('message', (data: Buffer, binary) => {
+      // ws caps a message at the server's maxPayload; a visitor's are held to much less.
+      if (data.byteLength > (host ? HOST_MAX_MESSAGE : VISITOR_MAX_MESSAGE)) {
+        if (!dropped++) this.log(`dropped a ${data.byteLength} byte message from a ${host ? 'host' : 'visitor'} page`);
+        return;
+      }
       try {
-        if (binary) this.onBinary(page, unframe(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)));
+        if (binary) this.onBinary(page, unframe(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)), data.byteLength);
         else this.onMessage(page, JSON.parse(data.toString('utf8')) as { type: string; [k: string]: Json });
       } catch (e) {
         this.log(`bad message from the page: ${String(e)}`);
@@ -234,9 +282,11 @@ export class LiveHub {
     }
   }
 
-  private onBinary(page: Page, { header, payload }: { header: Header; payload: Uint8Array }) {
-    if (header.k === 'mic') page.micSink?.recv({ frame: header.frame, ctxTime: header.ctxTime }, payload.slice());
-    else if (header.k === 'replay') {
+  private onBinary(page: Page, { header, payload }: { header: Header; payload: Uint8Array }, bytes: number) {
+    if (header.k === 'mic') {
+      if (!page.micSink || !page.micFrameOk(bytes, payload.byteLength / 4)) return;
+      page.micSink.recv({ frame: header.frame, ctxTime: header.ctxTime }, payload.slice());
+    } else if (header.k === 'replay') {
       if (!page.host) return page.send({ type: 'notice', text: 'replays on the GPU box are for the host only' });
       this.startReplay(page, header, payload);
     }
@@ -310,7 +360,13 @@ export class LiveHub {
       if (!q.page.open) continue;
       q.page.send({ type: 'queue', position: 0, started: true });
       this.log('the next page in line starts');
-      q.go();
+      // One bad start must not stop the line, nor the finish of the run that made room for it.
+      try {
+        q.go();
+      } catch (e) {
+        this.log(`a queued start failed: ${String(e)}`);
+        q.page.send({ type: 'notice', text: `could not start: ${String(e)}` });
+      }
     }
     this.tellQueue();
     this.broadcastUsers();
@@ -368,6 +424,10 @@ export class LiveHub {
   }
 
   private startLive(page: Page, m: { graph: GraphSpec; env?: Record<string, Json>; autosave?: boolean; title?: string }) {
+    const env = m.env && typeof m.env === 'object' && !Array.isArray(m.env) ? m.env : undefined;
+    if (env && JSON.stringify(env).length > MAX_ENV_BYTES) return page.send({ type: 'notice', text: `the start's env is over ${MAX_ENV_BYTES} bytes` });
+    if (m.title !== undefined && (typeof m.title !== 'string' || m.title.length > MAX_TITLE)) return page.send({ type: 'notice', text: `the start's title is not a string of up to ${MAX_TITLE} characters` });
+    m = { ...m, env };
     if (!page.host && this.o.demoGraph) m = { graph: this.o.demoGraph(), env: m.env, autosave: true, title: '' };
     this.request(page, true, () => this.runLive(page, m));
   }
@@ -379,80 +439,119 @@ export class LiveHub {
     } catch (e) {
       return page.send({ type: 'notice', text: `bad graph: ${String(e)}` });
     }
-    if (page.host) this.o.hostGraph?.(graph);
-    const scheduler = new LiveScheduler();
-    const rt = new Runtime({
-      graph,
-      registry,
-      scheduler,
-      world: new LiveWorld(page.drivers, scheduler),
-      mode: 'live',
-      env: { ...m.env, server: `node ${process.version}` },
-    });
-    const s = this.stream(page, rt, () => scheduler.now(), () => false);
-    let stopping: Promise<void> | undefined;
     const limit = this.maxSessionMs;
-    const timer =
-      limit > 0
-        ? setTimeout(() => {
-            page.send({ type: 'notice', text: `the session reached the ${Math.round(limit / 1000)} s limit and was stopped` });
-            this.log(`live session ${rt.trajectory.meta.id} hit the time limit`);
-            void run.stop();
-          }, limit)
-        : undefined;
-    const run: Run = {
-      rt,
-      now: () => scheduler.now(),
-      autosave: m.autosave !== false,
-      title: m.title ?? '',
-      box: true,
-      endsAt: limit > 0 ? Date.now() + limit : undefined,
-      detach: s.detach,
-      stop: () =>
-        (stopping ??= (async () => {
-          clearTimeout(timer);
-          try {
-            rt.stop();
-          } finally {
-            await this.finish(page, run);
-          }
-        })()),
-    };
-    page.run = run;
-    if (limit > 0) page.send({ type: 'limit', leftMs: limit });
-    this.broadcastUsers();
-    this.tellQueue(true);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let rt: Runtime | undefined;
+    let run: Run | undefined;
+    try {
+      const scheduler = new LiveScheduler();
+      const r = (rt = new Runtime({
+        graph,
+        registry,
+        scheduler,
+        world: new LiveWorld(page.drivers, scheduler),
+        mode: 'live',
+        env: { ...m.env, server: `node ${process.version}` },
+      }));
+      const s = this.stream(page, r, () => scheduler.now(), () => false);
+      let stopping: Promise<void> | undefined;
+      const self: Run = (run = {
+        rt: r,
+        now: () => scheduler.now(),
+        autosave: m.autosave !== false,
+        title: m.title ?? '',
+        box: true,
+        endsAt: limit > 0 ? Date.now() + limit : undefined,
+        detach: s.detach,
+        stop: () =>
+          (stopping ??= (async () => {
+            clearTimeout(timer);
+            try {
+              r.stop();
+            } finally {
+              await this.finish(page, self);
+            }
+          })()),
+      });
+      timer =
+        limit > 0
+          ? setTimeout(() => {
+              page.send({ type: 'notice', text: `the session reached the ${Math.round(limit / 1000)} s limit and was stopped` });
+              this.log(`live session ${r.trajectory.meta.id} hit the time limit`);
+              void self.stop();
+            }, limit)
+          : undefined;
+      page.run = self;
+      if (limit > 0) page.send({ type: 'limit', leftMs: limit });
+      this.broadcastUsers();
+      this.tellQueue(true);
+      r.start();
+    } catch (e) {
+      // The start failed: free the box, tell the page, and let the next in line start.
+      clearTimeout(timer);
+      this.abort(page, rt, run, `could not start the session: ${String(e)}`);
+      return;
+    }
+    // Only a graph that started becomes the demo graph.
+    if (page.host) this.o.hostGraph?.(graph);
     this.log(`live session ${rt.trajectory.meta.id} started`);
-    rt.start();
+  }
+
+  /** A run that failed to start: stop what started, end it on the page (unsaved), free its slot and start the next. */
+  private abort(page: Page, rt: Runtime | undefined, run: Run | undefined, text: string) {
+    this.log(text);
+    try {
+      if (rt?.isRunning) rt.stop();
+    } catch (e) {
+      this.log(`stopping the failed run: ${String(e)}`);
+    }
+    if (run) {
+      run.detach();
+      if (page.run === run) page.run = null;
+      page.micSink = undefined;
+      page.micReq = undefined;
+      // The page ends a run on its bundle; this one is not saved.
+      if (rt) {
+        page.send({ type: 'ended', id: rt.trajectory.meta.id });
+        try {
+          page.sendBin({ k: 'bundle' }, encodeBundle(rt.trajectory));
+        } catch (e) {
+          this.log(`could not bundle the failed run: ${String(e)}`);
+        }
+      }
+    }
+    page.send({ type: 'notice', text });
+    this.broadcastUsers();
+    this.next();
   }
 
   private startReplay(page: Page, h: Header, bundle: Uint8Array) {
-    const liveChannels = (h.liveChannels as string[]) ?? [];
+    const liveChannels = Array.isArray(h.liveChannels) ? (h.liveChannels as string[]) : [];
     this.request(page, liveChannels.length > 0, () => this.runReplay(page, h, bundle, liveChannels));
   }
 
   private runReplay(page: Page, h: Header, bundle: Uint8Array, liveChannels: string[]) {
     let source: Trajectory;
+    let rt: Runtime;
+    let sim: SimScheduler;
     try {
       source = decodeBundle(bundle);
+      const outputChannels = Object.values(registry).flatMap((d) => (d.channels ?? []).filter((c) => c.output).map((c) => c.name));
+      const graph = h.graph ? checkGraph(h.graph as unknown as GraphSpec) : source.meta.graph;
+      // The runtime starts on the sim's clock, maybe after a timer: catch an unknown node now.
+      for (const n of graph.nodes) if (!registry[n.type]) throw new Error(`unknown node type "${n.type}" (node ${n.id})`);
+      ({ runtime: rt, sim } = prepareReplay(source, {
+        registry,
+        graph,
+        drivers: page.drivers,
+        liveChannels,
+        monitorChannels: h.audible ? outputChannels : [],
+      }));
     } catch (e) {
-      return page.send({ type: 'notice', text: `replay: ${String(e)}` });
+      return this.abort(page, undefined, undefined, `replay: ${String(e)}`);
     }
-    const outputChannels = Object.values(registry).flatMap((d) => (d.channels ?? []).filter((c) => c.output).map((c) => c.name));
-    const { runtime: rt, sim } = prepareReplay(source, {
-      registry,
-      graph: h.graph ? checkGraph(h.graph as unknown as GraphSpec) : source.meta.graph,
-      drivers: page.drivers,
-      liveChannels,
-      monitorChannels: h.audible ? outputChannels : [],
-    });
     const s = this.stream(page, rt, () => sim.now(), () => sim.isPaused);
     let stoppedAt: number | undefined;
-    const done = sim.runRealtime(1).then(async () => {
-      stoppedAt = rt.isRunning ? sim.now() : undefined;
-      if (rt.isRunning) rt.stop();
-      await this.finish(page, run, stoppedAt);
-    });
     const run: Run = {
       rt,
       sim,
@@ -467,6 +566,19 @@ export class LiveHub {
       },
     };
     page.run = run;
+    // A start that throws on the first tick rejects the run: end it like any other, so the slot frees.
+    const done = sim
+      .runRealtime(1)
+      .catch((e) => page.send({ type: 'notice', text: `replay: ${String(e)}` }))
+      .then(async () => {
+        stoppedAt = rt.isRunning ? sim.now() : undefined;
+        try {
+          if (rt.isRunning) rt.stop();
+        } finally {
+          await this.finish(page, run, stoppedAt);
+        }
+      })
+      .catch((e) => this.log(`replay ended badly: ${String(e)}`));
     this.broadcastUsers();
     this.log(`replay of ${source.meta.id} started (live: ${liveChannels.join(',') || 'none'})`);
   }
@@ -476,6 +588,7 @@ export class LiveHub {
     run.detach();
     if (page.run === run) page.run = null;
     page.micSink = undefined;
+    page.micReq = undefined;
     this.next();
     const traj = run.rt.trajectory;
     const bytes = encodeBundle(traj);

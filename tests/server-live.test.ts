@@ -330,6 +330,114 @@ describe('the pipeline in the server', () => {
     for (const p of [b, c3]) p.ws.close();
   }, 20_000);
 
+  it('frees the box when a start throws: the next in line starts, and the run before it is still saved', async () => {
+    const c = defaultConfig();
+    c.vad.variant = 'energy';
+    c.backchannel.variant = 'off';
+    const good = buildGraph(c);
+    // Passes checkGraph; Runtime.start throws on the unknown node type.
+    const bad = { ...good, nodes: [...good.nodes, { id: 'bogus', type: 'no-such-node', params: {} }] };
+    const start = (g: unknown) => JSON.stringify({ type: 'start', graph: g as Json, env: {}, autosave: true, title: '' });
+    const open = async () => {
+      const ws = new WebSocket(`ws://127.0.0.1:${livePort}/api/live`);
+      const msgs: { type: string; [k: string]: Json }[] = [];
+      const bins: string[] = [];
+      ws.on('message', (data: Buffer, binary) => {
+        if (binary) return void bins.push(unframe(new Uint8Array(data)).header.k);
+        const m = JSON.parse(data.toString()) as { type: string; [k: string]: Json };
+        msgs.push(m);
+        if (m.type === 'mic.open') ws.send(JSON.stringify({ type: 'mic.ready', label: 'fake', contextSampleRate: 16000, settings: {} }));
+      });
+      await new Promise((r) => ws.once('open', r));
+      const of = (t: string) => msgs.filter((m) => m.type === t);
+      return { ws, of, bins };
+    };
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const savedBefore = readdirSync(sessions).filter((f) => f.endsWith('.fvs')).length;
+    const [a, b, d] = [await open(), await open(), await open()];
+    a.ws.send(start(good));
+    await wait(200);
+    b.ws.send(start(bad));
+    d.ws.send(start(good));
+    await wait(200);
+    expect(b.of('queue').map((m) => m.position)).toEqual([1]);
+    expect(d.of('queue').map((m) => m.position)).toEqual([2]);
+    // The first ends: the bad start is next in line, inside the first run's finish.
+    a.ws.send(JSON.stringify({ type: 'stop' }));
+    await wait(800);
+    expect(a.of('saved')).toHaveLength(1);
+    expect(b.of('notice').map((m) => m.text)).toContainEqual(expect.stringMatching(/could not start the session: .*unknown node type "no-such-node"/));
+    expect(b.of('ended')).toHaveLength(1);
+    expect(b.bins).toContain('bundle');
+    expect(b.of('saved')).toHaveLength(0);
+    // The slot went to the next in line.
+    expect(d.of('session')).toHaveLength(1);
+    expect(d.of('queue').at(-1)).toMatchObject({ position: 0, started: true });
+    expect(d.of('users').at(-1)).toMatchObject({ sessions: 1, queued: 0 });
+    d.ws.send(JSON.stringify({ type: 'stop' }));
+    await wait(500);
+    expect(d.of('saved')).toHaveLength(1);
+    // A bad start with the box free frees it too: the same page starts again.
+    b.ws.send(start(bad));
+    await wait(200);
+    expect(b.of('notice')).toHaveLength(2);
+    expect(b.of('users').at(-1)).toMatchObject({ sessions: 0 });
+    b.ws.send(start(good));
+    await wait(300);
+    expect(b.of('session')).toHaveLength(3);
+    b.ws.send(JSON.stringify({ type: 'stop' }));
+    await wait(500);
+    expect(b.of('saved')).toHaveLength(1);
+    expect(readdirSync(sessions).filter((f) => f.endsWith('.fvs'))).toHaveLength(savedBefore + 3);
+    for (const p of [a, b, d]) p.ws.close();
+  }, 20_000);
+
+  it("drops a visitor's oversized messages and mic frames, and mic audio faster than twice real time", async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${livePort}/api/live?visitor`);
+    let micBytes = 0;
+    let pongs = 0;
+    let req: { frameSamples: number; sampleRate: number } | undefined;
+    ws.on('message', (data: Buffer, binary) => {
+      if (binary) {
+        const { header: h, payload } = unframe(new Uint8Array(data));
+        if (h.k === 'track' && h.name === 'mic.audio') micBytes += payload.byteLength;
+        return;
+      }
+      const m = JSON.parse(data.toString()) as { type: string; [k: string]: Json };
+      if (m.type === 'pong') pongs++;
+      if (m.type === 'mic.open') {
+        req = m.request as typeof req;
+        ws.send(JSON.stringify({ type: 'mic.ready', label: 'fake', contextSampleRate: 16000, settings: {} }));
+      }
+    });
+    await new Promise((r) => ws.once('open', r));
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    ws.send(JSON.stringify({ type: 'start', graph: {}, env: {}, autosave: false, title: '' }));
+    await wait(300);
+    const { frameSamples, sampleRate } = req!;
+    const mic = (n: number, samples: number) => ws.send(frame({ k: 'mic', frame: n, ctxTime: 0 }, new Uint8Array(new Float32Array(samples).buffer)));
+    // Bigger than the frame the mic asked for, then bigger than any visitor message, then one that fits.
+    mic(0, frameSamples * 4);
+    mic(1, 40_000);
+    mic(2, frameSamples);
+    ws.send(JSON.stringify({ type: 'ping', id: 1, t: 0 }));
+    await wait(300);
+    expect(micBytes).toBe(frameSamples * 4);
+    expect(pongs).toBe(1);
+    // A burst of 10 s of audio at once: about 2 s of it gets through.
+    micBytes = 0;
+    const n = Math.ceil((10 * sampleRate) / frameSamples);
+    for (let i = 0; i < n; i++) mic(3 + i, frameSamples);
+    await wait(300);
+    const seconds = micBytes / 4 / sampleRate;
+    expect(seconds).toBeGreaterThan(1.5);
+    expect(seconds).toBeLessThan(3.5);
+    const saved = new Promise((r) => ws.on('message', (d: Buffer, bin) => !bin && JSON.parse(d.toString()).type === 'saved' && r(null)));
+    ws.send(JSON.stringify({ type: 'stop' }));
+    await saved;
+    ws.close();
+  }, 20_000);
+
   it('drops a page that stopped answering, and stops a session at the time limit', async () => {
     const c = defaultConfig();
     c.vad.variant = 'energy';

@@ -8,7 +8,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve, sep } from 'node:path';
 import { WebSocketServer } from 'ws';
-import { LiveHub } from './live';
+import { HOST_MAX_MESSAGE, LiveHub, VISITOR_MAX_MESSAGE } from './live';
 import type { UpstreamName, Upstreams } from './drivers';
 import { checkGraph, type GraphSpec } from '../src/core/graph';
 import { buildGraph, defaultConfig } from '../src/pipeline';
@@ -358,12 +358,15 @@ const live = new LiveHub({ upstreams: upstream, sessionsDir, modelsDir: MODELS_D
     void writeFile(DEMO_GRAPH_FILE, JSON.stringify(g)).catch((e) => console.error('[server] could not save the demo pipeline:', e));
   },
 });
-const wss = new WebSocketServer({ noServer: true });
+// ws buffers a whole message before handing it over, so the cap must hold at the socket: a visitor sends mic frames
+// and controls (small), the host also replay bundles (large).
+const hostWss = new WebSocketServer({ noServer: true, maxPayload: HOST_MAX_MESSAGE });
+const visitorWss = new WebSocketServer({ noServer: true, maxPayload: VISITOR_MAX_MESSAGE });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', 'http://local');
   if (url.pathname !== '/api/live' || !allowed(req, url.pathname)) return socket.destroy();
   const host = isHost(req);
-  wss.handleUpgrade(req, socket, head, (ws) => live.handle(ws, { host }));
+  (host ? hostWss : visitorWss).handleUpgrade(req, socket, head, (ws) => live.handle(ws, { host }));
 });
 
 // Last resort: one bad request must not stop the proxy, which would drop every connection of a live session.
