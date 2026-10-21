@@ -164,6 +164,8 @@ describe('the pipeline in the server', () => {
     const c = defaultConfig();
     c.vad.variant = 'energy';
     c.backchannel.variant = 'off';
+    // System 2 without an agent process.
+    c.workers.variant = 'mock';
     page.send(JSON.stringify({ type: 'start', graph: buildGraph(c) as unknown as Json, env: { userAgent: 'test' }, autosave: true, title: '' }));
     await new Promise((r) => setTimeout(r, 2500));
     page.send(JSON.stringify({ type: 'stop' }));
@@ -184,14 +186,18 @@ describe('the pipeline in the server', () => {
     const traj = decodeBundle(bundle!);
     const types = new Set(traj.events.filter((e) => e.kind === 'msg').map((e) => (e.data as { type: string }).type));
     for (const t of ['asr.final', 'turn.user', 'llm.delta', 'tts.words', 'playback.start']) expect(types).toContain(t);
-    // The agent opens once the ASR is connected.
-    const msgs = traj.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; why?: string });
+    // The voice agent opens once the ASR is connected: the session's start is the first line of its log, and it speaks before the user has said anything.
+    const msgs = traj.events.filter((e) => e.kind === 'msg').map((e) => e.data as { type: string; kind?: string });
     const open = msgs.findIndex((m) => m.type === 'asr.open');
     expect(open).toBeGreaterThanOrEqual(0);
-    expect(msgs.findIndex((m) => m.type === 'bc.say' && m.why === 'greeting')).toBeGreaterThan(open);
-    // And its line opens the LLM transcript.
-    const reply = seen.llmBodies.find((b) => b.messages?.some((m) => m.role === 'user'))!;
-    expect(reply.messages!.filter((m) => m.role !== 'system')[0]).toMatchObject({ role: 'assistant', content: expect.stringContaining("What's on your mind?") });
+    expect(msgs.findIndex((m) => m.type === 'agent.event' && m.kind === 'start')).toBeGreaterThan(open);
+    expect(msgs.findIndex((m) => m.type === 'llm.start')).toBeLessThan(msgs.findIndex((m) => m.type === 'turn.user'));
+    const first = seen.llmBodies.find((b) => b.messages?.some((m) => m.role === 'user'))!;
+    expect(first.messages!.filter((m) => m.role !== 'system')[0]).toMatchObject({ role: 'user', content: expect.stringContaining('session start') });
+    // Its opening decision stays on the log, before the user's first words.
+    const later = seen.llmBodies.filter((b) => b.messages?.some((m) => /\ds user: /.test(String(m.content))));
+    expect(later.length).toBeGreaterThan(0);
+    expect(later[0].messages!.filter((m) => m.role !== 'system')[1]).toMatchObject({ role: 'assistant', content: expect.stringContaining('[i1g0] Reply number') });
     expect(traj.events.some((e) => e.kind === 'io.recv' && (e.data as { payload?: { type?: string } }).payload?.type === 'late')).toBe(got.lateSent > 0);
     expect(traj.events.filter((e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toEqual([]);
     // The server's recording replays exactly, like one made in the page.

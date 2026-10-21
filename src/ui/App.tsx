@@ -721,7 +721,7 @@ export function App() {
     if (reveal && id && !layout.sideOpen) setLayout({ ...layout, sideOpen: true });
   };
   const stageOf = (lane: string | null): StageId | null =>
-    lane === null ? null : STAGES.some((s) => s.id === lane) ? (lane as StageId) : 'tts';
+    lane === null ? null : STAGES.some((s) => s.id === lane) ? (lane as StageId) : lane === 'agent' ? 'llm' : 'tts';
 
   const mmss = (until: number) => {
     const s = Math.max(0, Math.round((until - clockNow) / 1000));

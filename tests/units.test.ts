@@ -61,13 +61,19 @@ describe('pipeline format', () => {
     expect(() => decodeBundle(encodeBundle(traj({ ...g, formatVersion: 7 })))).toThrow(/recorded with pipeline format 7/);
   });
 
-  it('runs on the GPU box by default, with only TypeSafe going out', () => {
-    expect(requiredUpstreams(defaultConfig()).sort()).toEqual(['gpubox', 'llm', 'typesafe']);
+  it('runs on the GPU box by default, with System 2 on ACP and TypeSafe going out', () => {
+    expect(requiredUpstreams(defaultConfig()).sort()).toEqual(['acp', 'gpubox', 'llm', 'typesafe']);
+    const c = defaultConfig();
+    c.llm.variant = 'api';
+    // The reply LLM hands out no work: System 2 isn't needed.
+    expect(requiredUpstreams(c).sort()).toEqual(['gpubox', 'llm', 'typesafe']);
     expect(buildGraph(defaultConfig()).nodes.find((n) => n.id === 'tts')?.type).toBe('tts.kyutai');
   });
 
   it('has no opener stage: the LLM speaks through TTS directly', () => {
-    const g = buildGraph(defaultConfig());
+    const c = defaultConfig();
+    c.llm.variant = 'api';
+    const g = buildGraph(c);
     expect(g.nodes.some((n) => n.id === 'opener' || n.type.startsWith('opener.'))).toBe(false);
     const to = (from: string) => g.edges.filter((x) => x.from.node === from && x.from.port === 'text').map((x) => x.to.node);
     expect(to('llm')).toEqual(['interject', 'backchannel', 'tts', 'sched']);

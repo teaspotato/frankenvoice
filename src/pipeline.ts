@@ -38,7 +38,7 @@ export const STAGES: StageDef[] = [
   { id: 'turn', label: 'Turn-taking', variants: { 'full-duplex': 'turn.duplex', 'half-duplex': 'turn.half-duplex', tape: 'turn.tape' } },
   { id: 'interject', label: 'Interjection', variants: { off: 'interject.off', typesafe: 'interject' } },
   { id: 'backchannel', label: 'Backchannels', variants: { on: 'backchannel', off: 'backchannel.off' } },
-  { id: 'llm', label: 'LLM', variants: { api: 'llm', echo: 'llm.echo' } },
+  { id: 'llm', label: 'LLM', variants: { agent: 'agent.loop', api: 'llm', echo: 'llm.echo' } },
   { id: 'workers', label: 'System 2', variants: { acp: 'workers', mock: 'workers.mock', off: 'workers.off' } },
   { id: 'tts', label: 'TTS', variants: { 'kyutai-gpubox': 'tts.kyutai', tone: 'tts.tone' } },
   { id: 'speaker', label: 'Speaker', variants: { speaker: 'speaker' } },
@@ -107,6 +107,11 @@ const e = (from: string, fp: string, to: string, tp: string): EdgeSpec => ({ fro
  */
 export function buildGraph(c: PipelineConfig): GraphSpec {
   const cleanupType = stageType(c, 'cleanup');
+  const llm = registry[stageType(c, 'llm')];
+  /** The voice agent on its own clock (agent.loop): it hears the session start, silences and its own playback. */
+  const agent = llm.outputs.some((p) => p.name === 'agent');
+  /** The tape (turn.tape) speaks for the agent itself: the LLM stage gets no turns. */
+  const tape = stageType(c, 'turn') === 'turn.tape';
   const nodes: NodeSpec[] = STAGES.map((s) => ({
     id: s.id,
     type: stageType(c, s.id),
@@ -114,12 +119,13 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
       s.id === 'mic'
         ? // The cleanup stage decides what the browser does at capture.
           { ...stageParams(c, 'mic'), ...micProcessing(cleanupType, resolveParams(registry[cleanupType], stageParams(c, 'cleanup'))) }
-        : stageParams(c, s.id),
+        : s.id === 'turn' && agent && !tape && 'greeting' in resolveParams(registry[stageType(c, 'turn')], {})
+          ? // The voice agent opens the call itself.
+            { ...stageParams(c, 'turn'), greeting: '' }
+          : stageParams(c, s.id),
     ui: { x: COLUMN[s.id][0], y: COLUMN[s.id][1] },
   }));
   const wantsReference = registry[cleanupType].inputs.some((p) => p.name === 'ref');
-  /** The tape (turn.tape) speaks for the agent itself: the LLM stage gets no turns. */
-  const tape = stageType(c, 'turn') === 'turn.tape';
   const edges = [
     e('mic', 'audio', 'cleanup', 'audio'),
     e('cleanup', 'audio', 'vad', 'audio'),
@@ -150,6 +156,18 @@ export function buildGraph(c: PipelineConfig): GraphSpec {
       : []),
     e('llm', 'text', 'tts', 'text'),
     ...(registry[stageType(c, 'turn')].outputs.some((p) => p.name === 'text') ? [e('turn', 'text', 'tts', 'text')] : []),
+    // The voice agent: the session's start, the user's voice and its own playback (for silences), unless the tape speaks;
+    // its passes free the floor, and it can stop its own speech the user's words overtook.
+    ...(agent && !tape
+      ? [
+          e('asr', 'transcript', 'llm', 'transcript'),
+          e('vad', 'vad', 'llm', 'vad'),
+          e('speaker', 'playback', 'llm', 'playback'),
+          ...(registry[stageType(c, 'turn')].inputs.some((p) => p.name === 'agent') ? [e('llm', 'agent', 'turn', 'agent')] : []),
+          e('llm', 'control', 'tts', 'control'),
+          e('llm', 'control', 'speaker', 'control'),
+        ]
+      : []),
     // System 2: the voice agent hands tasks to workers and hears back from them.
     ...(registry[stageType(c, 'llm')].outputs.some((p) => p.name === 'workers')
       ? [e('llm', 'workers', 'workers', 'workers'), e('workers', 'updates', 'llm', 'updates')]

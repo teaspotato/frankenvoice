@@ -66,6 +66,12 @@ export class ActivityTracker {
       case 'llm.draft_end':
         if (d.status === 'dropped') this.set('llm', null);
         break;
+      case 'agent.think':
+        this.set('llm', 'thinking');
+        break;
+      case 'agent.decide':
+        this.set('llm', null);
+        break;
       case 'llm.start':
         this.set('llm', 'generating');
         this.stream(key, rid, true);

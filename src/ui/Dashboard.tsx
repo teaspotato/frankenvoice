@@ -18,6 +18,7 @@ export const LANES: Lane[] = [
   { id: 'turn', label: 'Turn', height: 52 },
   { id: 'interject', label: 'Interject', height: 32 },
   { id: 'llm', label: 'LLM', height: 60 },
+  { id: 'agent', label: 'Agent log', height: 64 },
   { id: 'workers', label: 'System 2', height: 52 },
   { id: 'tts', label: 'TTS', height: 36 },
   { id: 'speaker', label: 'Playback', height: 48 },
@@ -36,6 +37,8 @@ const LEGEND: Record<string, string> = {
   interject:
     'Early interjection. Dots: TypeSafe judging the user\'s words so far (grey: still going; green: they just completed something). Outlined bar: an "interrupt?" check with the LLM on those words, until it decided (grey: let them go on) or was dropped. Accent diamond: the LLM wanted to cut in (its line next to it); a line from there to where it was taken at the user\'s pause (accent tick: it took the floor and played; red tick: turn-taking refused it; grey tick: taken, but the LLM could not keep it).',
   llm: 'Top: waiting for the first token (light), then generating (solid), labelled with TTFT (from the committed turn), chunks and chars/s; dashed outlines are drafts started on the words before the turn was committed (kept or dropped); a grey tick is when the model started reasoning. Bottom: a dot for each streamed chunk at the moment it arrived, with its text from there to the next chunk.',
+  agent:
+    'The voice agent on its own clock (LLM agent). Top: events on its log, as they came (blue: the user finished; red: the user cut in; green: System 2 news; amber: System 2 progress; grey: a silence or its own wake-up; accent: the session start); a ring around the ones that woke it. Middle: think steps, light until the first token, then solid, labelled with what woke it and the latency (red outline: the user\'s words overtook it). Bottom: what it decided: accent diamond = it spoke (the words next to it), purple = handed a task to System 2 or told a worker something, grey dot = wait or silent, amber = went quiet. Hover for the lines.',
   workers:
     'System 2: the workers the voice agent handed tasks to, each an agent session over ACP; workers that overlap get their own row. Bar: the worker from start to its result (green), a question for the user (amber), error (red) or stop (grey); a dark tick where its session was ready, grey ticks where it started reasoning; darker blocks are its tool calls (red: failed). Dots: plan updates (amber), its in-between text (blue), refused permissions (red); diamonds: messages from the voice agent.',
   tts: 'One bar per sentence, from its request until its audio finished arriving. Diamonds at the bottom: requests sent to the TTS server.',
@@ -910,6 +913,57 @@ export function Dashboard({
             text: `+${(c.t - l.t0).toFixed(0)} ms  ${JSON.stringify(c.text)}\n${so}`,
             seqs: [c.seq],
           });
+        });
+      }
+
+      // The voice agent's log: events in (top), think steps (middle), decisions out (bottom)
+      {
+        const [ly0, ly1] = laneY.agent;
+        const h = ly1 - ly0;
+        const evColor: Record<string, string> = { user: col.asr, cut: col.danger, news: col.ok, progress: col.warn, silence: col.muted, wake: col.muted, start: col.accent, note: col.muted };
+        for (const ev of m.agentEvents) {
+          if (ev.t < t0 || ev.t > t1) continue;
+          mark('agent', ev.t, evColor[ev.kind] ?? col.muted, 0.18, 'dot', 3);
+          if (ev.wake) {
+            g.strokeStyle = col.text;
+            g.beginPath();
+            g.arc(x(ev.t), ly0 + h * 0.18, 5, 0, Math.PI * 2);
+            g.stroke();
+          }
+          hits.push({ lane: 'agent', x0: x(ev.t) - 5, x1: x(ev.t) + 5, y0: ly0, y1: ly0 + h * 0.34, text: `${ev.line}${ev.wake ? `\n(woke it: ${ev.wake})` : ''}`, seqs: [ev.seq] });
+        }
+        m.agentSteps.forEach((s, i) => {
+          const end = s.t1 ?? head;
+          if (end < t0 || s.t0 > t1) return;
+          const first = s.firstMs != null ? s.t0 + s.firstMs : end;
+          const x0 = x(s.t0);
+          const x1 = Math.max(x(end), x0 + 2);
+          g.globalAlpha = 0.18;
+          g.fillStyle = col.llm;
+          g.fillRect(x0, ly0 + h * 0.38, Math.max(1, x(first) - x0), h * 0.24);
+          g.globalAlpha = 0.45;
+          g.fillRect(x(first), ly0 + h * 0.38, Math.max(0, x1 - x(first)), h * 0.24);
+          g.globalAlpha = 1;
+          if (s.status === 'overtaken' || s.status === 'error') {
+            g.strokeStyle = col.danger;
+            g.strokeRect(x0 + 0.5, ly0 + h * 0.38 + 0.5, x1 - x0 - 1, h * 0.24 - 1);
+          }
+          const lat = s.ms !== undefined ? `${s.firstMs != null ? `${s.firstMs}/` : ''}${s.ms} ms` : '…';
+          label(`${s.wake} · ${lat}`, x0, x1, ly0 + h * 0.5, col.text);
+          // Decisions out, at the step's end.
+          const said = s.actions.filter((a) => typeof a.say === 'string').map((a) => String(a.say)).join(' ');
+          const work = s.actions.some((a) => a.think !== undefined || a.tell !== undefined || a.stop !== undefined);
+          const quiet = s.actions.some((a) => a.quiet);
+          if (s.t1 !== undefined) {
+            if (said) mark('agent', s.t1, col.accent, 0.82, 'diamond', 4);
+            if (work) mark('agent', s.t1 + (said ? 30 : 0), col.llm, 0.82, 'diamond', 4);
+            if (quiet) mark('agent', s.t1, col.warn, 0.82, 'dot', 3);
+            if (!said && !work && !quiet) mark('agent', s.t1, col.muted, 0.82, 'dot', 2);
+            const next = m.agentSteps[i + 1];
+            label(said, x(s.t1) + 6, Math.min(x(s.t1) + 260, next ? x(next.t0) - 3 : Infinity), ly0 + h * 0.82, col.accent);
+          }
+          const why = s.status === 'overtaken' ? ' (overtaken by the user)' : s.status === 'error' ? ' (failed)' : '';
+          hits.push({ lane: 'agent', x0, x1: Math.max(x1, x(end) + 8), y0: ly0 + h * 0.34, y1: ly1, text: `step ${s.n}, woken by ${s.wake}: ${lat}${why}\n${s.text || '(nothing yet)'}`, seqs: s.seqs });
         });
       }
 

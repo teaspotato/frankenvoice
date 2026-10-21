@@ -28,6 +28,27 @@ export interface AsrResult {
   seqs: number[];
 }
 
+/** A line on the voice agent's log (agent.loop): what happened, and whether it woke the agent. */
+export interface AgentEvent {
+  t: number;
+  kind: string;
+  line: string;
+  wake: string | null;
+  seq: number;
+}
+
+/** One think step of the voice agent: from its request to its decision. */
+export interface AgentStep extends Span {
+  n: number;
+  wake: string;
+  /** done, error or overtaken (the user's words came first). */
+  status?: string;
+  firstMs?: number | null;
+  ms?: number;
+  /** What it decided, line by line ({say}, {think, worker}, {wait}, …). */
+  actions: Record<string, Json>[];
+}
+
 /** One tool call a worker made, from start to finish. */
 export interface WorkerStep {
   id: string;
@@ -165,6 +186,8 @@ export class TimelineModel {
   interjectGates: (Marker & { go: boolean; failed?: boolean; confidence?: number; ms: number })[] = [];
   interjectChecks: InterjectCheck[] = [];
   workers: WorkerSpan[] = [];
+  agentEvents: AgentEvent[] = [];
+  agentSteps: AgentStep[] = [];
   ttsRequests: { t: number; seq: number }[] = [];
   tts: (Span & { rid: string; seg: number })[] = [];
   playback: (Span & { rid: string; interrupted?: boolean; heard?: string })[] = [];
@@ -463,6 +486,24 @@ export class TimelineModel {
       case 'tape.cut':
         this.tapeCuts.push({ t: e.t, text: d.heard ?? '', unsaid: d.unsaid ?? [], seq: e.seq });
         break;
+      case 'agent.event':
+        this.agentEvents.push({ t: e.t, kind: d.kind ?? '', line: d.line ?? '', wake: d.wake ?? null, seq: e.seq });
+        break;
+      case 'agent.think':
+        this.agentSteps.push({ n: d.n, wake: d.wake ?? '', t0: e.t, text: '', actions: [], seqs: [e.seq] });
+        break;
+      case 'agent.decide': {
+        const s = this.agentSteps.findLast((x) => x.n === d.n);
+        if (!s) break;
+        s.t1 = e.t;
+        s.status = d.status;
+        s.text = d.text ?? '';
+        s.firstMs = d.firstMs ?? null;
+        s.ms = d.ms;
+        s.actions = Array.isArray(d.actions) ? d.actions : [];
+        s.seqs.push(e.seq);
+        break;
+      }
       case 'worker.started':
         this.workers.push({ id: d.workerId, t0: e.t, text: d.task ?? '', status: 'starting', row: this.freeRow(e.t), steps: [], thinking: [], marks: [], seqs: [e.seq] });
         break;

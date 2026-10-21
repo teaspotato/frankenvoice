@@ -9,7 +9,7 @@ import { buildGraph } from '../src/pipeline';
 import type { Trajectory } from '../src/core/trajectory';
 import { GRAPH_FORMAT, GRAPH_FORMAT_VERSION, type GraphSpec } from '../src/core/graph';
 import type { NodeDef } from '../src/core/node';
-import { testConfig, fakeDrivers } from './fake-drivers';
+import { agentConfig, testConfig, fakeDrivers } from './fake-drivers';
 
 function testGraph(): GraphSpec {
   const g = buildGraph(testConfig());
@@ -175,6 +175,23 @@ describe('record and replay', () => {
     expect(msgs.some((m) => m.type === 'llm.start' && m.node === 'llm')).toBe(false);
     expect(msgs.some((m) => m.type === 'playback.start')).toBe(true);
     expect(run.events.some((e) => e.kind === 'io.open' && e.node === 'turn' && (e.data as { channel: string }).channel === 'llama-completion')).toBe(true);
+    expect(count(run, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
+    const { runtime, sim } = prepareReplay(decodeBundle(encodeBundle(run)), { registry });
+    sim.runFast();
+    expect(count(runtime.trajectory, (e) => e.kind === 'io.diverge')).toBe(0);
+    expect(runtime.trajectory.events).toEqual(run.events);
+  }, 15_000);
+
+  it('runs the voice agent on its own clock with System 2 (the default pipeline), and replays it exactly', async () => {
+    const run = await recordLive(2500, performance, buildGraph(agentConfig()));
+    const msgs = run.events.filter((e) => e.kind === 'msg').map((e) => ({ node: e.node, ...(e.data as { type: string; kind?: string; wake?: string }) }));
+    // It opens the call by itself, before the user has said anything.
+    expect(msgs.findIndex((m) => m.type === 'agent.event' && m.kind === 'start')).toBeGreaterThanOrEqual(0);
+    expect(msgs.findIndex((m) => m.type === 'llm.start' && m.node === 'llm')).toBeLessThan(msgs.findIndex((m) => m.type === 'turn.user'));
+    // A question goes to a worker, and the result comes back as news it acts on.
+    expect(msgs.some((m) => m.type === 'worker.start')).toBe(true);
+    expect(msgs.some((m) => m.type === 'agent.think' && m.wake === 'news')).toBe(true);
+    expect(msgs.some((m) => m.type === 'playback.start')).toBe(true);
     expect(count(run, (e) => e.kind === 'log' && (e.data as { level: string }).level === 'error')).toBe(0);
     const { runtime, sim } = prepareReplay(decodeBundle(encodeBundle(run)), { registry });
     sim.runFast();
