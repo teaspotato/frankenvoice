@@ -33,7 +33,7 @@ import { StagePanel } from './StagePanel';
 import { Dashboard } from './Dashboard';
 import { EventLog } from './EventLog';
 import { TapeInspector } from './TapeInspector';
-import { Splitter, useLayout } from './Splitter';
+import { Splitter, useLayout, type Layout } from './Splitter';
 import { ActivityTracker, NO_ACTIVITY, type Activity } from './activity';
 
 const CONFIG_KEY = 'frankenvoice.pipeline';
@@ -721,16 +721,17 @@ export function App() {
     setSelected(id);
     // The tape stage's settings, and what it is doing in the Tape inspector below.
     const tape = id === 'turn' && stageType(config, 'turn') === 'turn.tape';
-    if (reveal && id && (!layout.sideOpen || (tape && (!layout.logOpen || layout.logTab !== 'tape'))))
-      setLayout({ ...layout, sideOpen: true, ...(tape ? { logOpen: true, logTab: 'tape' as const } : {}) });
+    if (reveal && id && (!layout.sideOpen || (tape && (!layout.logOpen || layout.logTab !== 'tape')))) setLayout({ ...(tape ? tapeOpen(layout) : layout), sideOpen: true });
   };
+  /** The Tape tab, opened tall enough for its chart and some rows. */
+  const tapeOpen = (l: Layout): Layout => ({ ...l, logOpen: true, logTab: 'tape', log: Math.max(l.log, Math.min(460, window.innerHeight - 260)) });
   const logTabs = (
     <span className="log-tabs">
       {(['events', 'tape'] as const).map((tab) => (
         <button
           key={tab}
           className={`link${layout.logTab === tab ? ' on' : ''}`}
-          onClick={() => setLayout({ ...layout, logTab: tab, logOpen: true })}
+          onClick={() => setLayout(tab === 'tape' ? tapeOpen(layout) : { ...layout, logTab: tab, logOpen: true })}
           title={tab === 'tape' ? 'The tape stage (turn.tape): every line Gemma sees, what it wrote and how sure it was, and each call’s prompt' : 'Every event of the session'}
         >
           {tab === 'events' ? 'Events' : 'Tape'}

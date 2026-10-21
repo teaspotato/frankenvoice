@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Trajectory, TRAJECTORY_FORMAT } from '../src/core/trajectory';
 import type { EventKind, Json } from '../src/core/types';
-import { TapeModel, openLine, splitPrompt } from '../src/ui/tape-model';
+import { TapeModel, groupRows, lineTime, openLine, seriesOdds, splitPrompt } from '../src/ui/tape-model';
 
 function session() {
   const traj = new Trajectory({
@@ -10,7 +10,7 @@ function session() {
     id: 't',
     createdAt: '',
     mode: 'live',
-    graph: { nodes: [{ id: 'turn', type: 'turn.tape', params: {} }], edges: [] } as never,
+    graph: { nodes: [{ id: 'turn', type: 'turn.tape', params: { cellMs: 500, timeScale: 2 } }], edges: [] } as never,
     graphHash: '',
   });
   let seq = 0;
@@ -97,5 +97,30 @@ describe('the Tape inspector model', () => {
     expect(m.node).toBeNull();
     expect(m.update()).toBe(false);
     expect(m.rows).toEqual([]);
+  });
+
+  it('keeps the tape in cell order when a late answer comes after the cells decided without it', () => {
+    const { cell, model } = session();
+    expect([model.cellMs, model.cellS]).toEqual([500, 1]);
+    cell(100, 1, 'listen', [], { ms: 200 });
+    cell(900, 3, 'listen', [], { forced: 'a call is still out' });
+    cell(950, 2, 'respond', ['Hi'], { ms: 1300, late: true });
+    model.update();
+    expect(model.rows.map((r) => r.n)).toEqual([1, 2, 3]);
+    expect(lineTime(model.rows[1].line)).toBe(1.28);
+  });
+
+  it('folds runs of idle cells, and groups the odds by way of acting', () => {
+    const { cell, model } = session();
+    cell(0, 1, 'listen', [], { ms: 200 });
+    for (let n = 2; n <= 5; n++) cell(n * 640, n, 'listen', [], { forced: 'idle' });
+    cell(6 * 640, 6, 'listen', [], { forced: 'TTS queue full' });
+    cell(7 * 640, 7, 'listen', [], { forced: 'idle' });
+    cell(8 * 640, 8, 'listen', [], { forced: 'idle' });
+    model.update();
+    const items = groupRows(model.rows);
+    expect(items.map((i) => (i.kind === 'idle' ? `idle ${i.rows.length}` : i.row.n))).toEqual([1, 'idle 4', 6, 7, 8]);
+    expect(seriesOdds({ listen: 0.6, resume: 0.1, respond: 0.3 })).toEqual({ respond: 0.4 });
+    expect(seriesOdds({ continue: 0.9, finish: 0.1 })).toEqual({ finish: 0.1 });
   });
 });

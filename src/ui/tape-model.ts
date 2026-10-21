@@ -95,11 +95,19 @@ export class TapeModel {
   pending: TapeCall | null = null;
   /** The node's latest state (state, floor, calling, ahead, lastMs, userSpeaking). */
   state: Record<string, Json> = {};
+  /** A cell's length in real time (the call's budget), and in tape seconds. */
+  readonly cellMs: number = 640;
+  readonly cellS: number = 0.64;
   private next = 0;
   private calling: Json = false;
 
   constructor(readonly traj: Trajectory) {
-    this.node = traj.meta.graph.nodes.find((n) => n.type === 'turn.tape')?.id ?? null;
+    const spec = traj.meta.graph.nodes.find((n) => n.type === 'turn.tape');
+    this.node = spec?.id ?? null;
+    if (spec) {
+      this.cellMs = Math.max(50, Number(spec.params.cellMs) || 640);
+      this.cellS = (this.cellMs * (Number(spec.params.timeScale) || 1)) / 1000;
+    }
   }
 
   /** Consume new events; true if anything changed. */
@@ -160,7 +168,10 @@ export class TapeModel {
           if (d[k] !== undefined && d[k] !== null) (row as unknown as Record<string, unknown>)[k] = d[k];
         // Recorded before cells carried their call's xid: the last call that asked for this line.
         if (!row.xid && row.ms !== undefined) row.xid = this.callFor(row.line);
-        this.rows.push(row);
+        // In tape order: a late answer lands after cells that were decided without it.
+        let i = this.rows.length;
+        while (i > 0 && this.rows[i - 1].n > row.n) i--;
+        this.rows.splice(i, 0, row);
         // Written ahead and now real: it leaves the cells ahead.
         this.ahead = this.ahead.filter((a) => a.n > row.n);
         return true;
@@ -218,6 +229,51 @@ export class TapeModel {
     return x?.xid ? this.calls.get(x.xid) : undefined;
   }
 }
+
+/** Actions that leave things as they are: listen, or go on speaking. */
+export const HOLD = new Set(['listen', 'continue']);
+
+/** The ways Gemma can act, as the odds chart groups them: respond and resume both start an answer. */
+export type SeriesKey = 'respond' | 'backchannel' | 'finish';
+export const SERIES_KEYS: SeriesKey[] = ['respond', 'backchannel', 'finish'];
+export const SERIES: Record<string, SeriesKey | undefined> = { respond: 'respond', resume: 'respond', backchannel: 'backchannel', finish: 'finish' };
+
+/** Gemma's odds of each way of acting in one cell; a way the cell's state doesn't allow is absent. */
+export function seriesOdds(odds: Record<string, number>): Partial<Record<SeriesKey, number>> {
+  const out: Partial<Record<SeriesKey, number>> = {};
+  for (const [a, p] of Object.entries(odds)) {
+    const k = SERIES[a];
+    if (k) out[k] = (out[k] ?? 0) + p;
+  }
+  return out;
+}
+
+/** A cell where nothing happened and nothing was asked: no call, nobody talking, the agent holding. */
+export const isIdle = (r: TapeRow) => r.forced === 'idle' && HOLD.has(r.action) && !r.user.length && !r.voice && !r.say.length;
+
+/** The tape as the table lists it: a run of at least `min` idle cells is one item. */
+export type TapeItem = { kind: 'row'; row: TapeRow } | { kind: 'idle'; rows: TapeRow[] };
+export function groupRows(rows: TapeRow[], min = 3): TapeItem[] {
+  const out: TapeItem[] = [];
+  let run: TapeRow[] = [];
+  const flush = () => {
+    if (run.length >= min) out.push({ kind: 'idle', rows: run });
+    else for (const row of run) out.push({ kind: 'row', row });
+    run = [];
+  };
+  for (const r of rows) {
+    if (isIdle(r)) run.push(r);
+    else {
+      flush();
+      out.push({ kind: 'row', row: r });
+    }
+  }
+  flush();
+  return out;
+}
+
+/** A line's tape time (s): the number it starts with. */
+export const lineTime = (line: string) => Number.parseFloat(line);
 
 /** A prompt split into its fixed head (instructions, example) and the live tape. */
 export function splitPrompt(prompt: string): { head: string; tape: string } {
