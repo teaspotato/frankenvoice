@@ -78,15 +78,45 @@ export const line = (c: Cell) => `${prefix(c)} ${agentText(c)}`;
 /** GBNF for one cell's action: the state's actions, at most `n` (>= 1) words. */
 export function grammar(allowed: string[], n: number): string {
   const alts = allowed.map((a) =>
-    a === 'listen' ? '" listen"' : a === 'backchannel' ? '" backchannel " bc' : a === 'finish' ? '" finish" (" " say)?' : `" ${a} " say`,
+    a === 'listen' ? '" listen"' : a === 'backchannel' ? '" backchannel " bc' : a === 'finish' ? '" finish" (" " end)?' : `" ${a} " say`,
   );
   const rep = n > 1 ? `{0,${n - 1}}` : '{0,0}';
+  const fin = allowed.includes('finish');
   return [
     `root ::= ${alts.join(' | ')}`,
     `say ::= "\\"" word (" " word)${rep} "\\""`,
+    // The last words of an answer end a sentence: without this Gemma finished mid-phrase ("you in the")
+    ...(fin ? [`end ::= "\\"" (word " ")${rep} last "\\""`] : []),
     "word ::= [A-Za-z0-9$%&'] [A-Za-z0-9$%&'-]{0,18} [,.?!;:]?",
+    ...(fin ? ["last ::= [A-Za-z0-9$%&'] [A-Za-z0-9$%&'-]{0,18} [.?!]"] : []),
     `bc ::= ${AGENT_BACKCHANNELS.map((b) => `"\\"${b}\\""`).join(' | ')}`,
   ].join('\n');
+}
+
+/** One token's alternatives as llama.cpp's `/completion` returns them with `n_probs` (before sampling). */
+interface TopToken {
+  token: string;
+  logprob: number;
+}
+
+/**
+ * Gemma's odds for each allowed action: the probability of the token it starts with, among the first
+ * written token's top alternatives (`n_probs`, taken before logit bias and grammar). An action whose
+ * first token isn't among them gets 0. Null when the answer carries no probabilities.
+ */
+export function actionOdds(res: { completion_probabilities?: unknown } | undefined, allowed: string[]): Record<string, number> | null {
+  const first = Array.isArray(res?.completion_probabilities) ? (res.completion_probabilities[0] as { top_logprobs?: TopToken[] }) : null;
+  const top = first?.top_logprobs;
+  if (!Array.isArray(top)) return null;
+  const odds: Record<string, number> = {};
+  for (const a of allowed) {
+    const word = ` ${a}`;
+    // The longest top token the action's word starts with (" respond", or " back" for " backchannel").
+    let best: TopToken | null = null;
+    for (const t of top) if (t.token.trim() && word.startsWith(t.token) && (!best || t.token.length > best.token.length)) best = t;
+    odds[a] = best ? Math.round(Math.exp(best.logprob) * 1e4) / 1e4 : 0;
+  }
+  return odds;
 }
 
 export function parseAction(text: string): { action: string; words: string[] } | null {
@@ -228,6 +258,30 @@ export function promptHead(system: string, example: string, earlier = ''): strin
     `Now the live call.${before}Continue the tape with the agent's action on each new line.<turn|>\n` +
     '<|turn>model\n<|channel>thought\n<channel|>'
   );
+}
+
+/** A cell where nothing happened: the user silent with no words, the agent silent and listening. */
+const idleCell = (c: Cell) => c.state === 'silent' && !c.voice && !c.user.length && c.action === 'listen' && !c.say.length;
+
+/**
+ * The tape as Gemma reads it: each finished run of idle cells cut to its first `keep` lines. A tape
+ * full of listen lines makes Gemma copy them and stop answering (pilot/stall-replay: P(respond) after
+ * a finished question went 0.10, 0.06, 0.01 as idle lines piled up, and back to 0.6-0.86 trimmed to 2).
+ * The run leading up to the cell being decided stays whole. keep <= 0: every line.
+ */
+export function trimIdle(cells: Cell[], keep: number): Cell[] {
+  if (keep <= 0 || cells.length < 2) return cells;
+  const out: Cell[] = [];
+  let run: Cell[] = [];
+  for (const c of cells.slice(0, -1)) {
+    if (idleCell(c)) {
+      run.push(c);
+      continue;
+    }
+    out.push(...run.slice(0, keep), c);
+    run = [];
+  }
+  return [...out, ...run, cells[cells.length - 1]];
 }
 
 /** The whole prompt for the last cell: the head, every earlier line, then the open field. */

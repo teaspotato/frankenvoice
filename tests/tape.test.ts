@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EXAMPLE_TAPE, PROMPTS, cutTape, grammar, headroom, line, newCell, parseAction, promptHead, tapePrompt, timed, type Cell, type TapeState } from '../src/nodes/tape';
+import { EXAMPLE_TAPE, PROMPTS, actionOdds, cutTape, grammar, headroom, line, newCell, parseAction, promptHead, tapePrompt, timed, trimIdle, type Cell, type TapeState } from '../src/nodes/tape';
 import { noPeriods, tapeTurnNode } from '../src/nodes/turn-tape';
 import { harness } from './node-harness';
 import type { Json, Msg } from '../src/core/types';
@@ -46,8 +46,17 @@ describe('the tape format', () => {
         'bc ::= "\\"mhm\\"" | "\\"yeah\\"" | "\\"right\\"" | "\\"okay\\"" | "\\"uh-huh\\"" | "\\"I see\\""',
       ].join('\n'),
     );
-    expect(grammar(['continue', 'finish'], 1).split('\n').slice(0, 2)).toEqual(['root ::= " continue " say | " finish" (" " say)?', 'say ::= "\\"" word (" " word){0,0} "\\""']);
+    expect(grammar(['continue', 'finish'], 1).split('\n').slice(0, 2)).toEqual(['root ::= " continue " say | " finish" (" " end)?', 'say ::= "\\"" word (" " word){0,0} "\\""']);
     expect(grammar(['listen', 'respond', 'backchannel'], 2).split('\n')[0]).toBe('root ::= " listen" | " respond " say | " backchannel " bc');
+  });
+
+  it("reads Gemma's odds for each action from the first token's alternatives", () => {
+    const top = (pairs: [string, number][]) => ({ completion_probabilities: [{ token: pairs[0][0], logprob: Math.log(pairs[0][1]), top_logprobs: pairs.map(([token, p]) => ({ token, logprob: Math.log(p) })) }] });
+    // " backchannel" starts with the token " back"; "\n" belongs to no action.
+    expect(actionOdds(top([[' listen', 0.7], [' respond', 0.2], [' back', 0.05], ['\n', 0.05]]), ['listen', 'respond', 'backchannel'])).toEqual({ listen: 0.7, respond: 0.2, backchannel: 0.05 });
+    // An action outside the top alternatives gets 0.
+    expect(actionOdds(top([[' continue', 0.99]]), ['continue', 'finish'])).toEqual({ continue: 0.99, finish: 0 });
+    expect(actionOdds({ content: ' listen' } as never, ['listen'])).toBeNull();
   });
 
   it('reads what Gemma wrote', () => {
@@ -80,6 +89,15 @@ describe('the tape format', () => {
     expect(line(again[9])).toBe('  6.40 | user: (silent) | agent (silent): respond "[cut]"');
   });
 
+  it('cuts each finished run of idle cells to its first lines, and keeps the run before the open cell', () => {
+    const idle = (n: number) => newCell(n, n * 0.64, 'silent');
+    const heard = (n: number, ...user: string[]) => newCell(n, n * 0.64, 'silent', user, true);
+    const answer = Object.assign(newCell(6, 3.84, 'silent'), { action: 'respond', say: ['Sure'] });
+    const tape = [heard(0, 'hi'), idle(1), idle(2), idle(3), idle(4), heard(5, 'so'), answer, idle(7), idle(8), idle(9), newCell(10, 6.4, 'silent')];
+    expect(trimIdle(tape, 2).map((c) => c.n)).toEqual([0, 1, 2, 5, 6, 7, 8, 9, 10]);
+    expect(trimIdle(tape, 0)).toBe(tape);
+  });
+
   it('builds the prompt in Gemma 4 chat format, the live tape as the model’s own turn', () => {
     const cells = bargeIn();
     const sent = cells.flatMap((c) => (c.action === 'listen' ? [] : c.say.map((word) => ({ n: c.n, word }))));
@@ -105,10 +123,10 @@ describe('the tape format', () => {
 
 describe('the tape stage', () => {
   const run = (params: Record<string, unknown> = {}) => {
-    const h = harness(tapeTurnNode, { cellMs: 640, greeting: '', specCells: 0, ...params });
-    const answer = (content: string) => {
+    const h = harness(tapeTurnNode, { cellMs: 640, greeting: '', specCells: 0, draftGate: false, ...params });
+    const answer = (content: string, extra: Record<string, number> = {}) => {
       const io = h.ios.at(-1)!;
-      io.h.onRecv?.({ content, timings: { prompt_n: 20 } }, undefined);
+      io.h.onRecv?.({ content, timings: { prompt_n: 20 }, ...extra }, undefined);
       io.h.onClose?.(null);
     };
     const prompt = () => ((h.ios.at(-1)!.request as { body: { prompt: string } }).body.prompt);
@@ -142,7 +160,7 @@ describe('the tape stage', () => {
     expect(h.of('llm.delta').map((m) => m.text)).toEqual(['You soak it ']);
     h.advance(2560);
     expect(h.prompt()).toContain('  1.92 | user: (silent) | agent (silent): respond "You soak it"\n  2.56 | user: (silent) | agent (speaking):');
-    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " continue " say | " finish" (" " say)?');
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " continue " say | " finish" (" " end)?');
     h.answer(' continue "in warm water"');
     const rid = h.of('llm.start')[0].rid as string;
     h.send(2700, 'playback', { type: 'playback.start', rid, at: 2700 });
@@ -166,6 +184,159 @@ describe('the tape stage', () => {
     }
     expect(h.prompt().endsWith('  6.40 | user: (silent) | agent (silent):')).toBe(true);
     expect(h.prompt()).toContain('  5.76 | user: (silent) | agent (cut off): listen');
+  });
+
+  it("asks for the token odds and reports each action's on the cell", () => {
+    const h = run();
+    h.send(100, 'transcript', { type: 'asr.final', text: 'is it open?', start: 0, end: 1 });
+    h.advance(640);
+    expect((h.ios.at(-1)!.request as { body: { n_probs: number } }).body.n_probs).toBe(8);
+    const io = h.ios.at(-1)!;
+    const tok = (token: string, p: number) => ({ token, logprob: Math.log(p) });
+    io.h.onRecv?.({ content: ' listen', completion_probabilities: [{ ...tok(' listen', 0.6), top_logprobs: [tok(' listen', 0.6), tok(' respond', 0.4)] }] }, undefined);
+    io.h.onClose?.(null);
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', xid: '1', odds: { listen: 0.6, respond: 0.4, backchannel: 0 } });
+    // Off: no n_probs, no odds.
+    const off = run({ nProbs: 0 });
+    off.advance(640);
+    expect((off.ios.at(-1)!.request as { body: Record<string, unknown> }).body).not.toHaveProperty('n_probs');
+    off.answer(' listen');
+    expect(off.cells().at(-1)).not.toHaveProperty('odds');
+  });
+
+  it('biases respond in silent cells, trims finished idle runs, and answers after a long silence', () => {
+    const h = run();
+    const body = () => (h.ios.at(-1)!.request as { body: Record<string, unknown> }).body;
+    h.send(100, 'transcript', { type: 'asr.final', text: 'hello', start: 0, end: 1 });
+    h.advance(640);
+    expect(body().logit_bias).toEqual([[' respond', 2.2]]);
+    h.answer(' respond "Hi"');
+    h.advance(1280);
+    // Speaking: no bias.
+    expect(body()).not.toHaveProperty('logit_bias');
+    h.answer(' finish');
+    for (let n = 3; n <= 6; n++) {
+      h.advance(n * 640);
+      // Silent, but its answer is done and nothing new was said: no bias (it made Gemma answer itself).
+      expect(body()).not.toHaveProperty('logit_bias');
+      h.answer(' listen');
+    }
+    h.send(6 * 640 + 100, 'transcript', { type: 'asr.final', text: 'tell me more', start: 0, end: 1 });
+    h.advance(7 * 640);
+    h.answer(' listen');
+    // The idle run 1.92 to 3.84 is finished: its first two lines stay.
+    h.advance(8 * 640);
+    expect(h.prompt().split('<channel|>')[1].split('\n').map((l) => l.slice(0, 6))).toEqual(['  0.64', '  1.28', '  1.92', '  2.56', '  4.48', '  5.12']);
+    h.answer(' listen');
+    // Words, then silence: after 3 s (5 cells) only respond is allowed.
+    for (let n = 9; n <= 11; n++) {
+      h.advance(n * 640);
+      expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " respond " say | " backchannel " bc');
+      h.answer(' listen');
+    }
+    h.advance(12 * 640);
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " respond " say');
+    expect(body()).not.toHaveProperty('logit_bias');
+    h.answer(' respond "Sure, what about"');
+    expect(h.cells().at(-1)).toMatchObject({ action: 'respond', backstop: 'answer after silence' });
+    // Off.
+    const off = run({ respondBias: 0, idleKeep: 0, answerAfterS: 0, respondToWords: false });
+    off.advance(640);
+    expect((off.ios.at(-1)!.request as { body: Record<string, unknown> }).body).not.toHaveProperty('logit_bias');
+  });
+
+  it('responds only to new words, and finishes on a sentence end', () => {
+    const h = run();
+    h.advance(640);
+    // Nothing said yet: no respond.
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " backchannel " bc');
+    h.answer(' listen');
+    h.send(700, 'transcript', { type: 'asr.final', text: 'hello', start: 0, end: 1 });
+    h.advance(1280);
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " respond " say | " backchannel " bc');
+
+    h.answer(' respond "Hi there."');
+    h.advance(1920);
+    h.answer(' finish');
+    // Its answer is done and nothing new was said: no respond again (it answered itself).
+    h.advance(2560);
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " backchannel " bc');
+  });
+
+  it('drafts, then gates: listens before the earliest gate, Gemma chooses in between, responds by the latest', () => {
+    const h = run({ draftGate: true, specCells: 4 });
+    h.send(50, 'vad', { type: 'vad.speech_start', at: 0 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'how are you?', start: 0, end: 1 });
+    h.send(400, 'vad', { type: 'vad.speech_end', at: 0 });
+    // The cell with the words is too soon: no call for it; the first call is for the next one.
+    expect(h.ios).toHaveLength(1);
+    expect(h.prompt().endsWith('  0.64 | user: "how are you?" (talking) | agent (silent): listen\n  1.28 | user: (silent) | agent (silent):')).toBe(true);
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " listen" | " respond " say | " backchannel " bc');
+    h.answer(' listen');
+    // 1.28 s of silence: only respond, drafted ahead and held.
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " respond " say');
+    h.answer(' respond "Fine, thanks."');
+    expect(h.of('llm.start')[0]).toMatchObject({ held: true });
+    h.advance(640);
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', forced: 'gate: too soon', spec: 'adopted' });
+    h.advance(1280);
+    expect(h.of('llm.release')).toHaveLength(0);
+    h.advance(1920);
+    expect(h.cells().at(-1)).toMatchObject({ action: 'respond', backstop: 'gate: answer now', spec: 'adopted' });
+    expect(h.of('llm.release')).toHaveLength(1);
+  });
+
+  it('lets the probe decide when to answer: a draft in each owed silent cell, played once the score reaches probeAt', () => {
+    const h = run({ draftGate: true, probeAt: 0.5 });
+    const body = () => (h.ios.at(-1)!.request as { body: Record<string, unknown> }).body;
+    h.send(50, 'vad', { type: 'vad.speech_start', at: 0 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'so I was', start: 0, end: 1 });
+    h.send(400, 'vad', { type: 'vad.speech_end', at: 0 });
+    h.advance(640);
+    // The earliest gate still holds the words' own cell.
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', forced: 'gate: too soon' });
+    h.advance(1280);
+    expect(body()).toMatchObject({ probe: true });
+    expect(body().logit_bias).toBeUndefined();
+    expect(h.grammarOf().split('\n')[0]).toBe('root ::= " respond " say');
+    h.answer(' respond "Go on."', { probe: 0.1 });
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', probe: 0.1, probeHeld: 'Go on.' });
+    // Past the latest gate, the probe still decides.
+    h.advance(1920);
+    expect(body()).toMatchObject({ probe: true });
+    h.answer(' respond "Go on."', { probe: 0.3 });
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', probe: 0.3 });
+    expect(h.of('llm.start')).toHaveLength(0);
+    h.advance(2560);
+    h.answer(' respond "Sorry, go on."', { probe: 0.8 });
+    expect(h.cells().at(-1)).toMatchObject({ action: 'respond', probe: 0.8 });
+    expect(h.cells().at(-1)?.probeHeld).toBeUndefined();
+    expect(h.of('llm.delta').map((m) => m.text)).toEqual(['Sorry, go on. ']);
+  });
+
+  it('without a probe score, the latest gate decides; the backstop answers whatever the probe says', () => {
+    const h = run({ draftGate: true, probeAt: 0.5 });
+    h.send(300, 'transcript', { type: 'asr.final', text: 'hi there', start: 0, end: 1 });
+    h.advance(1280);
+    h.answer(' respond "Hi!"');
+    expect(h.cells().at(-1)).toMatchObject({ action: 'listen', probe: null, probeHeld: 'Hi!' });
+    h.advance(1920);
+    h.answer(' respond "Hi!"');
+    expect(h.cells().at(-1)).toMatchObject({ action: 'respond', probe: null });
+
+    const g = run({ probeAt: 0.5, answerAfterS: 3 });
+    const body = () => (g.ios.at(-1)!.request as { body: Record<string, unknown> }).body;
+    g.send(300, 'transcript', { type: 'asr.final', text: 'and um', start: 0, end: 1 });
+    for (let t = 640; t <= 3200; t += 640) {
+      g.advance(t);
+      g.answer(' respond "Yes?"', { probe: 0.1 });
+      expect(g.cells().at(-1)).toMatchObject({ action: 'listen' });
+    }
+    // 3 s of silence after the words (5 cells): only respond, no probe asked.
+    g.advance(3840);
+    expect(body().probe).toBeUndefined();
+    g.answer(' respond "Yes?"');
+    expect(g.cells().at(-1)).toMatchObject({ action: 'respond', backstop: 'answer after silence' });
   });
 
   it('skips the call while one is out, and while the TTS queue is full', () => {

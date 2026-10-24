@@ -32,7 +32,8 @@ import { PipelineView } from './PipelineView';
 import { StagePanel } from './StagePanel';
 import { Dashboard } from './Dashboard';
 import { EventLog } from './EventLog';
-import { Splitter, useLayout } from './Splitter';
+import { TapeInspector } from './TapeInspector';
+import { Splitter, useLayout, type Layout } from './Splitter';
 import { ActivityTracker, NO_ACTIVITY, type Activity } from './activity';
 
 const CONFIG_KEY = 'frankenvoice.pipeline';
@@ -718,8 +719,26 @@ export function App() {
   /** Selecting a stage shows its settings, so it opens a collapsed side panel. */
   const selectStage = (id: StageId | null, reveal = true) => {
     setSelected(id);
-    if (reveal && id && !layout.sideOpen) setLayout({ ...layout, sideOpen: true });
+    // The tape stage's settings, and what it is doing in the Tape inspector below.
+    const tape = id === 'turn' && stageType(config, 'turn') === 'turn.tape';
+    if (reveal && id && (!layout.sideOpen || (tape && (!layout.logOpen || layout.logTab !== 'tape')))) setLayout({ ...(tape ? tapeOpen(layout) : layout), sideOpen: true });
   };
+  /** The Tape tab, opened tall enough for its chart and some rows. */
+  const tapeOpen = (l: Layout): Layout => ({ ...l, logOpen: true, logTab: 'tape', log: Math.max(l.log, Math.min(460, window.innerHeight - 260)) });
+  const logTabs = (
+    <span className="log-tabs">
+      {(['events', 'tape'] as const).map((tab) => (
+        <button
+          key={tab}
+          className={`link${layout.logTab === tab ? ' on' : ''}`}
+          onClick={() => setLayout(tab === 'tape' ? tapeOpen(layout) : { ...layout, logTab: tab, logOpen: true })}
+          title={tab === 'tape' ? 'The tape stage (turn.tape): every line Gemma sees, what it wrote and how sure it was, and each call’s prompt' : 'Every event of the session'}
+        >
+          {tab === 'events' ? 'Events' : 'Tape'}
+        </button>
+      ))}
+    </span>
+  );
   const stageOf = (lane: string | null): StageId | null =>
     lane === null ? null : STAGES.some((s) => s.id === lane) ? (lane as StageId) : 'tts';
 
@@ -954,7 +973,19 @@ export function App() {
 
       <section className="log">
         {layout.logOpen && <Splitter layout={layout} onChange={setLayout} field="log" axis="y" sign={-1} max={() => window.innerHeight - 260} />}
-        <EventLog trajectory={current?.traj} live={!!running} focus={focus} open={layout.logOpen} onToggle={() => setLayout({ ...layout, logOpen: !layout.logOpen })} />
+        {layout.logTab === 'tape' ? (
+          <TapeInspector
+            trajectory={current?.traj}
+            live={!!running}
+            open={layout.logOpen}
+            onToggle={() => setLayout({ ...layout, logOpen: !layout.logOpen })}
+            now={() => nowRef.current()}
+            tabs={logTabs}
+            focus={focus}
+          />
+        ) : (
+          <EventLog trajectory={current?.traj} live={!!running} focus={focus} open={layout.logOpen} onToggle={() => setLayout({ ...layout, logOpen: !layout.logOpen })} tabs={logTabs} />
+        )}
       </section>
     </div>
   );

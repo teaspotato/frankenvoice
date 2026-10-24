@@ -1,0 +1,286 @@
+diff --git a/include/llama.h b/include/llama.h
+index 3af6e22..ed3a233 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -746,6 +746,13 @@ extern "C" {
+                          int32_t   il_start,
+                          int32_t   il_end);
+ 
++    // Set (or clear, with cb == NULL) the callback the scheduler calls for each graph node, at runtime.
++    // Same as llama_context_params.cb_eval, for the next decode on.
++    LLAMA_API void llama_set_eval_callback(
++            struct llama_context * ctx,
++            ggml_backend_sched_eval_callback cb,
++                              void * user_data);
++
+     //
+     // Memory
+     //
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..ab4b18f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4366,6 +4366,17 @@ int32_t llama_set_adapters_lora(
+     return 0;
+ }
+ 
++void llama_context::set_eval_callback(ggml_backend_sched_eval_callback cb, void * user_data) {
++    cparams.cb_eval           = cb;
++    cparams.cb_eval_user_data = user_data;
++    // a reused graph keeps the scheduler as it is, so set it there too
++    ggml_backend_sched_set_eval_callback(sched.get(), cb, user_data);
++}
++
++void llama_set_eval_callback(llama_context * ctx, ggml_backend_sched_eval_callback cb, void * user_data) {
++    ctx->set_eval_callback(cb, user_data);
++}
++
+ int32_t llama_set_adapter_cvec(
+         llama_context * ctx,
+           const float * data,
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..d450cfc 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -135,6 +135,8 @@ struct llama_context {
+                 int32_t   il_start,
+                 int32_t   il_end);
+ 
++    void set_eval_callback(ggml_backend_sched_eval_callback cb, void * user_data);
++
+     // process a single ubatch with a specific graph type
+     // if memory_context is provided, it will be applied first to the context's memory
+     // ret contains the status of the graph computation
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b2116b1..e47711a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -351,6 +351,9 @@ struct server_slot {
+     std::vector<common_adapter_lora_info> lora;
+     int32_t alora_invocation_start = -1;
+ 
++    // score of the linear probe at the prompt's last token (task_params::probe), NAN if none
++    float probe = NAN;
++
+     // sampling
+     json json_schema;
+ 
+@@ -396,6 +399,7 @@ struct server_slot {
+         generated_tokens.clear();
+         generated_token_probs.clear();
+         json_schema = json();
++        probe = NAN;
+ 
+         task_prev = std::move(task);
+         task.reset();
+@@ -938,6 +942,58 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
+ // server_context_impl (private implementation)
+ //
+ 
++// A linear probe on the residual stream: p = sigmoid(w . l_out[layer] + b), from LLAMA_PROBE_FILE
++// (int32 layer, int32 n_embd, f32 b, f32 w[n_embd]). While a decode runs with the callback set, it scores
++// every row of the layer's output in order, so row i of a single-sequence batch is token i.
++struct server_probe {
++    int32_t layer = -1;
++    float bias = 0.0f;
++    std::vector<float> w;
++    std::string name; // "l_out-<layer>"
++    std::vector<float> scores;
++    std::vector<float> rows; // host copy of the layer output
++
++    bool load(const char * path, int32_t n_embd) {
++        FILE * f = fopen(path, "rb");
++        if (!f) {
++            return false;
++        }
++        int32_t n = 0;
++        bool ok = fread(&layer, sizeof(layer), 1, f) == 1 && fread(&n, sizeof(n), 1, f) == 1 &&
++                  fread(&bias, sizeof(bias), 1, f) == 1 && n == n_embd;
++        if (ok) {
++            w.resize(n);
++            ok = fread(w.data(), sizeof(float), n, f) == (size_t) n;
++        }
++        fclose(f);
++        name = "l_out-" + std::to_string(layer);
++        return ok;
++    }
++
++    static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
++        auto * p = (server_probe *) user_data;
++        if (strcmp(t->name, p->name.c_str()) != 0) {
++            return ask ? false : true;
++        }
++        if (ask) {
++            return t->type == GGML_TYPE_F32 && t->ne[0] == (int64_t) p->w.size();
++        }
++        const int64_t n_embd = t->ne[0];
++        const int64_t n_rows = ggml_nrows(t);
++        p->rows.resize(n_embd * n_rows);
++        ggml_backend_tensor_get(t, p->rows.data(), 0, p->rows.size() * sizeof(float));
++        for (int64_t r = 0; r < n_rows; r++) {
++            const float * x = p->rows.data() + r * n_embd;
++            double s = p->bias;
++            for (int64_t i = 0; i < n_embd; i++) {
++                s += (double) p->w[i] * x[i];
++            }
++            p->scores.push_back((float) (1.0 / (1.0 + std::exp(-s))));
++        }
++        return true;
++    }
++};
++
+ struct server_context_impl {
+     friend struct server_context;
+ 
+@@ -993,6 +1049,8 @@ private:
+ 
+     llama_context * ctx_tgt = nullptr;
+ 
++    server_probe probe; // layer < 0: none loaded
++
+     server_batch batch;
+ 
+     llama_model   * model_dft = nullptr;
+@@ -1231,6 +1289,14 @@ private:
+ 
+         vocab = llama_model_get_vocab(model_tgt);
+ 
++        if (const char * pf = getenv("LLAMA_PROBE_FILE"); pf && *pf) {
++            if (!probe.load(pf, llama_model_n_embd(model_tgt))) {
++                SRV_ERR("failed to load probe '%s' (int32 layer, int32 n_embd = %d, f32 b, f32 w[n_embd])\n", pf, llama_model_n_embd(model_tgt));
++                return false;
++            }
++            SRV_INF("probe '%s' on %s\n", pf, probe.name.c_str());
++        }
++
+         try {
+             decision.init(model_tgt);
+         } catch (const std::exception & e) {
+@@ -2261,6 +2327,7 @@ private:
+         res->stopping_word         = slot.stopping_word;
+         res->stop                  = slot.stop;
+         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
++        res->probe                 = slot.probe;
+ 
+         res->verbose           = slot.task->params.verbose;
+         res->stream            = slot.task->params.stream;
+@@ -4281,16 +4348,53 @@ private:
+             has_output |= batch.tokens[i].output;
+         }
+ 
++        // the probe scores the prompt's last token of the slots that asked for it, while the eval callback
++        // is set for this decode only; rows map to batch entries only when the batch holds one sequence
++        std::vector<server_slot *> probed;
++        if (probe.layer >= 0) {
++            for (auto & slot : slots) {
++                if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task && slot.task->params.probe &&
++                    slot.i_batch >= off && slot.i_batch < off + batch.view.size()) {
++                    probed.push_back(&slot);
++                }
++            }
++            bool one_seq = true;
++            for (int i = off; i < off + batch.view.size(); ++i) {
++                one_seq &= batch.tokens[i].id_slot == batch.tokens[off].id_slot && batch.tokens[i].i_embd < 0;
++            }
++            if (!probed.empty() && !one_seq) {
++                SRV_WRN("%s", "probe skipped: the batch mixes sequences\n");
++                probed.clear();
++            }
++            if (!probed.empty()) {
++                probe.scores.clear();
++                llama_set_eval_callback(ctx_tgt, server_probe::cb_eval, &probe);
++            }
++        }
++
+         // yield to the queue, so we can still handle metrics tasks while decoding
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
+         queue_tasks.yield_to_queue([&]() {
+             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+-            if (ret == 0 && has_output) {
++            if (ret == 0 && (has_output || !probed.empty())) {
+                 llama_synchronize(ctx_tgt);
+             }
++            if (!probed.empty()) {
++                llama_set_eval_callback(ctx_tgt, nullptr, nullptr);
++            }
+         });
+ 
++        if (ret == 0) {
++            for (auto * slot : probed) {
++                if (probe.scores.size() == (size_t) batch.view.size()) {
++                    slot->probe = probe.scores[slot->i_batch - off];
++                } else {
++                    SLT_WRN(*slot, "probe: %zu rows for %d tokens\n", probe.scores.size(), batch.view.size());
++                }
++            }
++        }
++
+         if (ret != 0) {
+             {
+                 std::string err;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 54e126a..e441df5 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -34,6 +34,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     add((new field_bool("return_tokens", params.return_tokens))
+         ->set_desc("Return the raw generated token ids in the `tokens` field"));
+ 
++    add((new field_bool("probe", params.probe))
++        ->set_desc("Return `probe`: the score of the server's linear probe (env LLAMA_PROBE_FILE) on the residual stream at the prompt's last token"));
++
+     add((new field_bool("return_progress", params.return_progress))
+         ->set_desc("Include prompt processing progress events in stream mode"));
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 3f30da2..0453897 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -10,6 +10,7 @@
+ #include "speculative.h"
+ #include "server-common.h"
+ 
++#include <cmath>
+ #include <sstream>
+ 
+ //
+@@ -351,6 +352,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
+     if (!stream && !probs_output.empty()) {
+         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
+     }
++    if (!std::isnan(probe)) {
++        res["probe"] = probe;
++    }
+     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
+ }
+ 
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index e7bb043..8ae967d 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <cmath>
++
+ #include "common.h"
+ #include "llama.h"
+ 
+@@ -54,6 +56,7 @@ struct task_params {
+     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+     bool return_tokens   = false;
+     bool return_progress = false;
++    bool probe           = false; // return the linear probe's score at the prompt's last token (--probe)
+ 
+     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
+ 
+@@ -387,6 +390,8 @@ struct server_task_result_cmpl_final : server_task_result {
+     std::vector<completion_token_output> probs_output;
+     std::vector<std::string>  response_fields;
+ 
++    float probe = NAN; // see task_params::probe
++
+     task_params generation_params;
+ 
+     // response formatting
